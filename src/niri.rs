@@ -2561,6 +2561,7 @@ impl Niri {
                 reference_luminance,
             )),
             windows_scrgb: false,
+            windows_bt2100: false,
         }
     }
 
@@ -2841,6 +2842,7 @@ impl Niri {
                 Feature::ExtendedTargetVolume,
                 Feature::SetLuminances,
                 Feature::WindowsScrgb,
+                Feature::WindowsBt2100,
             ],
             [RenderIntent::Perceptual],
             move |_client| advertise_color_management,
