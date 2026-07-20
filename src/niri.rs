@@ -2057,7 +2057,7 @@ impl State {
             != old_config.animations.window_resize.custom_shader
         {
             let src = config.animations.window_resize.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
+            crate::with_primary_renderer_any!(self.backend, |renderer| {
                 shaders::set_custom_resize_program(renderer, src);
             });
             shaders_changed = true;
@@ -2067,7 +2067,7 @@ impl State {
             != old_config.animations.window_close.custom_shader
         {
             let src = config.animations.window_close.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
+            crate::with_primary_renderer_any!(self.backend, |renderer| {
                 shaders::set_custom_close_program(renderer, src);
             });
             shaders_changed = true;
@@ -2077,7 +2077,7 @@ impl State {
             != old_config.animations.window_open.custom_shader
         {
             let src = config.animations.window_open.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
+            crate::with_primary_renderer_any!(self.backend, |renderer| {
                 shaders::set_custom_open_program(renderer, src);
             });
             shaders_changed = true;
