@@ -767,6 +767,7 @@ mod tests {
                 max-bpc 10
                 hdr mode="on" {
                     reference-luminance 203
+                    peak-luminance 800
                 }
                 variable-refresh-rate on-demand=true
                 allow-tearing true
@@ -1205,6 +1206,11 @@ mod tests {
                                 reference_luminance: Some(
                                     FloatOrInt(
                                         203.0,
+                                    ),
+                                ),
+                                peak_luminance: Some(
+                                    FloatOrInt(
+                                        800.0,
                                     ),
                                 ),
                             },
