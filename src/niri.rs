@@ -590,6 +590,11 @@ pub enum RedrawState {
     Queued,
     /// We submitted a frame to the KMS and waiting for it to be presented.
     WaitingForVBlank { redraw_needed: bool },
+    /// Rendering is complete, but KMS submission is deferred until the GPU fence signals.
+    WaitingForFrameCompletion {
+        tokens: Vec<RegistrationToken>,
+        redraw_needed: bool,
+    },
     /// We did not submit anything to KMS and made a timer to fire at the estimated VBlank.
     WaitingForEstimatedVBlank(RegistrationToken),
     /// A redraw is queued on top of the above.
@@ -744,6 +749,12 @@ impl RedrawState {
             RedrawState::WaitingForVBlank { .. } => RedrawState::WaitingForVBlank {
                 redraw_needed: true,
             },
+            RedrawState::WaitingForFrameCompletion { tokens, .. } => {
+                RedrawState::WaitingForFrameCompletion {
+                    tokens,
+                    redraw_needed: true,
+                }
+            }
         }
     }
 }
@@ -3779,6 +3790,11 @@ impl Niri {
             RedrawState::Idle => (),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => (),
+            RedrawState::WaitingForFrameCompletion { tokens, .. } => {
+                for token in tokens {
+                    self.event_loop.remove(token);
+                }
+            }
             RedrawState::WaitingForEstimatedVBlank(token) => self.event_loop.remove(token),
             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.event_loop.remove(token),
         }
