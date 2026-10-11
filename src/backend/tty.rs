@@ -374,6 +374,10 @@ impl OutputDevice {
     }
 }
 
+/// Per-output state of a DRM-backed output.
+///
+/// Virtual outputs created by `create_virtual_output` don't have this, so code iterating over
+/// outputs must handle its absence.
 #[derive(Debug, Clone, Copy)]
 struct TtyOutputState {
     node: DrmNode,
@@ -1629,7 +1633,9 @@ impl Tty {
             .global_space
             .outputs()
             .find(|output| {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                    return false;
+                };
                 tty_state.node == node && tty_state.crtc == crtc
             })
             .cloned();
@@ -1709,7 +1715,9 @@ impl Tty {
             .global_space
             .outputs()
             .find(|output| {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                    return false;
+                };
                 tty_state.node == node && tty_state.crtc == crtc
             })
             .cloned()
@@ -2121,7 +2129,12 @@ impl Tty {
     }
 
     pub fn get_gamma_size(&self, output: &Output) -> anyhow::Result<u32> {
-        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        // Virtual outputs have no CRTC, so gamma control doesn't apply to them. Returning zero
+        // tells the caller that gamma is unsupported.
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            return Ok(0);
+        };
+
         let crtc = tty_state.crtc;
 
         let device = self
@@ -2139,7 +2152,13 @@ impl Tty {
     }
 
     pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> anyhow::Result<()> {
-        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            bail!(
+                "output {} is virtual, gamma control is not supported",
+                output.name()
+            );
+        };
+
         let crtc = tty_state.crtc;
 
         let device = self
@@ -2238,7 +2257,9 @@ impl Tty {
                     .global_space
                     .outputs()
                     .find(|output| {
-                        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                            return false;
+                        };
                         tty_state.node == *node && tty_state.crtc == crtc
                     })
                     .map(logical_output);
@@ -2277,7 +2298,22 @@ impl Tty {
             }
         }
 
+        // Virtual outputs aren't backed by a DRM connector, so they have to be carried over
+        // from the previous map.
+        let virtual_ids: Vec<OutputId> = self
+            .virtual_outputs
+            .outputs
+            .values()
+            .map(|(_, output_id)| *output_id)
+            .collect();
+
         let mut guard = self.ipc_outputs.lock().unwrap();
+        for id in virtual_ids {
+            if let Some(ipc_output) = guard.remove(&id) {
+                ipc_outputs.insert(id, ipc_output);
+            }
+        }
+
         *guard = ipc_outputs;
         niri.ipc_outputs_changed = true;
     }
@@ -2455,9 +2491,14 @@ impl Tty {
         if output_state.frame_clock.vrr() == enable_vrr {
             return;
         }
+
+        // Virtual outputs have no CRTC to configure.
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            return;
+        };
+
         for (&node, device) in self.devices.iter_mut() {
             for (&crtc, surface) in device.surfaces.iter_mut() {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
                 if tty_state.node == node && tty_state.crtc == crtc {
                     let word = if enable_vrr { "enabling" } else { "disabling" };
                     if let Err(err) = surface.compositor.use_vrr(enable_vrr) {
@@ -2637,7 +2678,9 @@ impl Tty {
                     .global_space
                     .outputs()
                     .find(|output| {
-                        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                            return false;
+                        };
                         tty_state.node == node && tty_state.crtc == crtc
                     })
                     .cloned();
