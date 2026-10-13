@@ -31,7 +31,9 @@ use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 
 use crate::backend::IpcOutputMap;
-use crate::handlers::image_copy_capture::{source_output, source_window};
+use crate::handlers::image_copy_capture::{
+    dynamic_cast_target, source_dynamic_cast, source_output, source_window, DynamicCastTarget,
+};
 use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
@@ -923,14 +925,38 @@ impl State {
             .iter()
             .map(|s| (s.session_id, s.stream_id, s.session.source(), s.credentials));
         for (session_id, stream_id, source, credentials) in output_sessions.chain(cursor_sessions) {
-            let target = if let Some(output) = source_output(&source) {
-                niri_ipc::CastTarget::Output {
-                    name: output.name(),
+            let (target, is_dynamic_target) = if source_dynamic_cast(&source) {
+                // Dynamic casts report the target they currently follow.
+                match dynamic_cast_target(&self.niri) {
+                    Some(DynamicCastTarget::Output(output)) => (
+                        niri_ipc::CastTarget::Output {
+                            name: output.name(),
+                        },
+                        true,
+                    ),
+                    Some(DynamicCastTarget::Window { mapped, .. }) => (
+                        niri_ipc::CastTarget::Window {
+                            id: mapped.id().get(),
+                        },
+                        true,
+                    ),
+                    // Nothing picked yet: report no target at all.
+                    None => continue,
                 }
+            } else if let Some(output) = source_output(&source) {
+                (
+                    niri_ipc::CastTarget::Output {
+                        name: output.name(),
+                    },
+                    false,
+                )
             } else if let Some((mapped, _)) = source_window(&self.niri, &source) {
-                niri_ipc::CastTarget::Window {
-                    id: mapped.id().get(),
-                }
+                (
+                    niri_ipc::CastTarget::Window {
+                        id: mapped.id().get(),
+                    },
+                    false,
+                )
             } else {
                 continue;
             };
@@ -944,7 +970,7 @@ impl State {
                     stream_id,
                     kind: niri_ipc::CastKind::ExtImageCopyCapture,
                     target,
-                    is_dynamic_target: false,
+                    is_dynamic_target,
                     is_active: true,
                     pid: credentials.map(|creds| creds.pid),
                     pw_node_id: None,

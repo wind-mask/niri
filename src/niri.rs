@@ -465,6 +465,12 @@ pub struct Niri {
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
 
+    /// Last dynamic screencast target selected with the `set-dynamic-cast-*` actions.
+    ///
+    /// Dynamic screencasts that we don't drive ourselves (image-copy-capture ones, where the
+    /// client captures the frames) resolve their target through this.
+    pub dynamic_cast_target: CastTarget,
+
     #[cfg(test)]
     pub test_action_count: usize,
 }
@@ -917,6 +923,17 @@ impl State {
         sessions.retain_mut(|s| {
             let source = s.session.source();
 
+            if image_copy_capture_impl::source_dynamic_cast(&source) {
+                // Dynamic casts stay alive while their target isn't picked (or is gone), so that
+                // clients can keep their stream around.
+                image_copy_capture_impl::refresh_dynamic_cast_constraints(
+                    &mut self.backend,
+                    &self.niri,
+                    s,
+                );
+                return true;
+            }
+
             let Some(output) = live_output(&self.niri, &source) else {
                 let Some((mapped, o)) = image_copy_capture_impl::source_window(&self.niri, &source)
                 else {
@@ -982,7 +999,8 @@ impl State {
         let mut cursor_sessions = mem::take(&mut self.niri.image_copy_cursor_sessions);
         cursor_sessions.retain(|s| {
             let source = s.session.source();
-            live_output(&self.niri, &source).is_some()
+            image_copy_capture_impl::source_dynamic_cast(&source)
+                || live_output(&self.niri, &source).is_some()
                 || image_copy_capture_impl::source_window(&self.niri, &source).is_some()
         });
         // This shouldn't be possible since sessions are only added from the
@@ -2348,7 +2366,9 @@ impl State {
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
-    pub fn set_dynamic_cast_target(&mut self, _target: CastTarget) {}
+    pub fn set_dynamic_cast_target(&mut self, target: CastTarget) {
+        self.dynamic_cast_target = target;
+    }
 
     #[cfg(feature = "dbus")]
     pub fn on_screen_shot_msg(
@@ -2942,6 +2962,8 @@ impl Niri {
 
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
+
+            dynamic_cast_target: CastTarget::Nothing,
 
             #[cfg(test)]
             test_action_count: 0,
@@ -5805,7 +5827,7 @@ impl Niri {
                 continue;
             }
 
-            let Some(s_output) = image_copy_capture_impl::source_output(&s.session.source()) else {
+            let Some(s_output) = image_copy_capture_impl::session_output_cast(self, s) else {
                 continue;
             };
             if s_output != *output {
@@ -5865,9 +5887,8 @@ impl Niri {
                 continue;
             }
 
-            let source = s.session.source();
             let Some((mapped, Some(win_output))) =
-                image_copy_capture_impl::source_window(self, &source)
+                image_copy_capture_impl::session_window_cast(self, s)
             else {
                 continue;
             };
@@ -5933,6 +5954,71 @@ impl Niri {
                 constraints.size,
                 shm_format,
                 &elements,
+                states,
+                target_presentation_time,
+            );
+        }
+
+        // Dynamic casts with nothing picked yet capture an empty (black) frame. Render it here:
+        // with no elements the render pass just clears the buffer, which is both the wanted
+        // picture and what keeps the client's buffer from holding stale contents.
+        let placeholder_physical = Size::<i32, Physical>::from((mode.size.w, mode.size.h));
+        let placeholder_size = Size::<i32, BufferCoords>::from((mode.size.w, mode.size.h));
+        let empty: &[OutputRenderElements<GlesRenderer>] = &[];
+        for s in &mut sessions {
+            if s.pending_frame.is_none() {
+                continue;
+            }
+
+            let source = s.session.source();
+            if !image_copy_capture_impl::source_dynamic_cast(&source)
+                || image_copy_capture_impl::dynamic_cast_target(self).is_some()
+            {
+                continue;
+            }
+
+            // The placeholder matches one specific output's size; only that output renders it.
+            let Some(constraints) = s.session.current_constraints() else {
+                continue;
+            };
+            if Size::<i32, BufferCoords>::from((constraints.size.w, constraints.size.h))
+                != placeholder_size
+            {
+                continue;
+            }
+
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            reset_damage_tracker_if_changed(
+                &mut s.damage_tracker,
+                placeholder_physical,
+                scale,
+                Transform::Normal,
+            );
+
+            let (damage, states) = s.damage_tracker.damage_output(1, empty).unwrap();
+            let Some(damage) = damage else {
+                // No damage, capture the frame later.
+                continue;
+            };
+
+            let damage: Vec<Rectangle<i32, BufferCoords>> = damage
+                .iter()
+                .map(|dmg| {
+                    Rectangle::new(
+                        (dmg.loc.x, dmg.loc.y).into(),
+                        (dmg.size.w, dmg.size.h).into(),
+                    )
+                })
+                .collect();
+
+            self.capture_image_copy_frame(
+                renderer,
+                s,
+                damage,
+                Transform::Normal,
+                placeholder_size,
+                wl_shm::Format::Xrgb8888,
+                empty,
                 states,
                 target_presentation_time,
             );
@@ -6118,7 +6204,7 @@ impl Niri {
 
             let Some(output) = image_copy_capture_impl::source_output(&source) else {
                 let Some((mapped, Some(output))) =
-                    image_copy_capture_impl::source_window(self, &source)
+                    image_copy_capture_impl::source_window_cast(self, &source)
                 else {
                     s.session.set_cursor_pos(None);
                     continue;

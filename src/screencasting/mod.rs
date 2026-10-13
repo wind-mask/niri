@@ -260,6 +260,10 @@ impl State {
     pub fn set_dynamic_cast_target(&mut self, target: CastTarget) {
         let _span = tracy_client::span!("State::set_dynamic_cast_target");
 
+        // Remember the target for dynamic casts that clients capture themselves
+        // (image-copy-capture); they resolve it on demand when capturing frames.
+        self.niri.dynamic_cast_target = target.clone();
+
         let mut refresh = None;
         match &target {
             // Leave refresh as is when clearing. Chances are, the next refresh will match it,
