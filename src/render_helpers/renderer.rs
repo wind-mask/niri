@@ -5,6 +5,7 @@ use smithay::backend::renderer::{
 };
 
 use crate::backend::tty::{TtyFrame, TtyRenderer};
+use crate::render_helpers::superres::PassSource;
 
 /// Trait with our main renderer requirements to save on the typing.
 pub trait NiriRenderer:
@@ -17,7 +18,7 @@ pub trait NiriRenderer:
     + AsGlesRenderer
 {
     // Associated types to work around the instability of associated type bounds.
-    type NiriTextureId: Texture + Clone + Send + 'static;
+    type NiriTextureId: Texture + Clone + Send + 'static + PassSource;
     type NiriError: std::error::Error
         + Send
         + Sync
@@ -28,7 +29,7 @@ pub trait NiriRenderer:
 impl<R> NiriRenderer for R
 where
     R: ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlesRenderer,
-    R::TextureId: Texture + Clone + Send + 'static,
+    R::TextureId: Texture + Clone + Send + 'static + PassSource,
     R::Error:
         std::error::Error + Send + Sync + From<<GlesRenderer as RendererSuper>::Error> + 'static,
 {

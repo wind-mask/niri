@@ -34,10 +34,9 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::superres::{SuperResElement, SuperResolutionPipeline};
+use crate::render_helpers::superres::SuperResolutionPipeline;
 use crate::render_helpers::surface::{
-    push_elements_from_surface_tree, push_superres_elements_from_surface_tree,
-    render_snapshot_from_surface_tree,
+    push_elements_from_surface_tree, render_snapshot_from_surface_tree,
 };
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
@@ -673,19 +672,26 @@ impl LayoutElement for Mapped {
             // Super resolution only replaces how the client buffer is sampled. The window's
             // display geometry, its input handling and everything else stays the same. It applies
             // to every render target, so that screen captures show what is on the screen.
-            match self.superres.filter(&self.rules.upscaling) {
-                Some(filter) => {
-                    let mut push = |elem: SuperResElement<R>| push(elem.into());
-                    push_superres_elements_from_surface_tree(
+            match self.superres.kernel(&self.rules.upscaling) {
+                Some(kernel) => {
+                    // Collect the surface elements first, because running the offscreen pass needs
+                    // the renderer again.
+                    let mut elements = Vec::new();
+                    push_elements_from_surface_tree(
                         ctx.renderer,
                         surface,
                         location,
                         scale,
                         alpha,
                         Kind::ScanoutCandidate,
-                        filter,
-                        &mut push,
-                    )
+                        &mut |elem| elements.push(elem),
+                    );
+
+                    for elem in elements {
+                        let renderer = ctx.renderer.as_gles_renderer();
+                        let elem = self.superres.element(renderer, elem, kernel, scale);
+                        push(elem.into());
+                    }
                 }
                 None => {
                     let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
