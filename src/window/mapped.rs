@@ -1,9 +1,9 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
-use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
+use niri_config::{Color, Config, CornerRadius, GradientInterpolation, UpscalingMode, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Element as _, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
@@ -34,6 +34,9 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::superres::{
+    MagnifiedGeometry, SuperResElement, SuperResolutionPipeline,
+};
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
 };
@@ -106,6 +109,11 @@ pub struct Mapped {
     /// Buffer to draw instead of the window when it should be blocked out.
     block_out_buffer: RefCell<SolidColorBuffer>,
 
+    /// Super resolution state.
+    ///
+    /// The effect is disabled unless the window rules enable it.
+    superres: SuperResolutionPipeline,
+
     /// The blur config, passed for background effect rendering.
     blur_config: niri_config::Blur,
 
@@ -129,6 +137,12 @@ pub struct Mapped {
 
     /// State of an ongoing interactive resize.
     interactive_resize: Option<InteractiveResize>,
+
+    /// The output scale and transform that the layout last asked this window's surfaces to use.
+    ///
+    /// These are the values *before* the client-scale window rule is applied, so that a rule
+    /// change can send the client a new scale even though the output's scale did not change.
+    sent_scale_transform: Cell<(output::Scale, Transform)>,
 
     /// Last time interactive resize was started.
     ///
@@ -292,6 +306,7 @@ impl Mapped {
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
+            superres: SuperResolutionPipeline::new(),
             blur_config: config.blur,
             animate_next_configure: false,
             animate_serials: Vec::new(),
@@ -300,6 +315,7 @@ impl Mapped {
             transaction_for_next_configure: None,
             pending_transactions: Vec::new(),
             interactive_resize: None,
+            sent_scale_transform: Cell::new((output::Scale::Integer(1), Transform::Normal)),
             last_interactive_resize_start: Cell::new(None),
             is_windowed_fullscreen: false,
             is_pending_windowed_fullscreen: false,
@@ -329,6 +345,18 @@ impl Mapped {
             return false;
         }
 
+        // If the magnify upscaling mode was turned off, stop magnifying right away instead of
+        // waiting for the next size request.
+        if new_rules.upscaling.mode() != self.rules.upscaling.mode() {
+            let size = self.window.geometry().size;
+            self.superres.set_magnify_target(self.id.get(), size, None);
+        }
+
+        // The scale that the client is told to render at changed without the output's scale
+        // changing, so the layout will not send it again on its own.
+        let client_scale_changed =
+            new_rules.upscaling.client_scale() != self.rules.upscaling.client_scale();
+
         // If the opacity window rule no longer makes the window semitransparent, reset the ignore
         // flag to reduce surprises down the line.
         if !new_rules.opacity.is_some_and(|o| o < 1.) {
@@ -336,6 +364,11 @@ impl Mapped {
         }
 
         self.rules = new_rules;
+
+        if client_scale_changed {
+            let (scale, transform) = self.sent_scale_transform.get();
+            self.set_preferred_scale_transform(scale, transform);
+        }
         true
     }
 
@@ -557,6 +590,15 @@ impl Mapped {
         );
     }
 
+    /// Returns the geometry for the magnify upscaling mode, if this window is in it.
+    ///
+    /// This is what both drawing and input use to agree on where the window's content ends up.
+    pub fn magnify_geometry(&self) -> Option<MagnifiedGeometry> {
+        let target = self.superres.magnify_target()?;
+        let source = self.window.geometry().size;
+        MagnifiedGeometry::new(source.to_f64(), target.to_f64())
+    }
+
     pub fn get_focus_timestamp(&self) -> Option<Duration> {
         self.focus_timestamp
     }
@@ -634,12 +676,33 @@ impl LayoutElement for Mapped {
         self.window.geometry().size
     }
 
+    fn visual_size(&self) -> Size<i32, Logical> {
+        // In the magnify mode the window occupies the area the layout gave it, even though the
+        // client only ever renders the content size that was asked of it. When there is nothing to
+        // magnify (no target, or content that does not fit), the window is drawn at its own size.
+        self.magnify_geometry()
+            .map(|geometry| geometry.target.to_i32_round())
+            .unwrap_or_else(|| self.size())
+    }
+
     fn buf_loc(&self) -> Point<i32, Logical> {
         Point::from((0, 0)) - self.window.geometry().loc
     }
 
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
-        let surface_local = point + self.window.geometry().loc.to_f64();
+        let Some(magnify) = self.magnify_geometry() else {
+            let surface_local = point + self.window.geometry().loc.to_f64();
+            return self.window.is_in_input_region(&surface_local);
+        };
+
+        // The point is relative to the area the window was given, which is bigger than its
+        // content. Map it back into the client's own coordinates. The letterbox bars are not part
+        // of the window and must not take input.
+        let Some(surface_point) = magnify.to_source(point) else {
+            return false;
+        };
+
+        let surface_local = surface_point + self.window.geometry().loc.to_f64();
         self.window.is_in_input_region(&surface_local)
     }
 
@@ -660,16 +723,66 @@ impl LayoutElement for Mapped {
         } else {
             let buf_pos = location - self.window.geometry().loc.to_f64();
             let surface = self.toplevel().wl_surface();
-            let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
-            push_elements_from_surface_tree(
-                ctx.renderer,
-                surface,
-                buf_pos.to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::ScanoutCandidate,
-                &mut push,
-            )
+            // The window's visual location, which is what magnified content is positioned against.
+            let window_location = location;
+            let location = buf_pos.to_physical_precise_round(scale);
+            let magnify = self.magnify_geometry();
+
+            // Super resolution only replaces how the client buffer is sampled. The window's
+            // display geometry, its input handling and everything else stays the same. It applies
+            // to every render target, so that screen captures show what is on the screen.
+            match self.superres.kernel(&self.rules.upscaling, self.id.get()) {
+                Some(kernel) => {
+                    // Collect the surface elements first, because running the offscreen pass needs
+                    // the renderer again.
+                    let mut elements = Vec::new();
+                    push_elements_from_surface_tree(
+                        ctx.renderer,
+                        surface,
+                        location,
+                        scale,
+                        alpha,
+                        Kind::ScanoutCandidate,
+                        &mut |elem| elements.push(elem),
+                    );
+
+                    let view_rect = self.superres.view_rect();
+                    for elem in elements {
+                        let renderer = ctx.renderer.as_gles_renderer();
+                        let raw_rect = elem.geometry(scale).to_f64().to_logical(scale);
+                        let magnify = magnify.map(|magnify| {
+                            magnify_element_rect(&magnify, window_location, raw_rect)
+                        });
+                        let elem_rect = match magnify {
+                            Some(rect) => Rectangle::new(rect.loc - window_location, rect.size),
+                            None => Rectangle::new(raw_rect.loc - window_location, raw_rect.size),
+                        };
+                        let on_screen = view_rect.is_none_or(|view| view.overlaps(elem_rect));
+                        let elem = self.superres.element(
+                            renderer,
+                            elem,
+                            kernel,
+                            scale,
+                            self.id.get(),
+                            magnify,
+                            on_screen,
+                        );
+                        push(elem.into());
+                    }
+                }
+                None => {
+                    let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
+                    push_elements_from_surface_tree(
+                        ctx.renderer,
+                        surface,
+                        location,
+                        scale,
+                        alpha,
+                        Kind::ScanoutCandidate,
+                        &mut push,
+                    )
+                }
+            }
         }
     }
 
@@ -687,6 +800,7 @@ impl LayoutElement for Mapped {
         }
 
         let surface = self.toplevel().wl_surface();
+        let magnify = self.magnify_geometry();
         for (popup, offset) in PopupManager::popups_for_surface(surface) {
             let popup_rules = match popup {
                 PopupKind::Xdg(_) => self.rules.popups,
@@ -699,6 +813,17 @@ impl LayoutElement for Mapped {
             let popup_geo = popup.geometry();
             let surface_loc = location + (offset - popup.geometry().loc).to_f64();
 
+            // Pop-ups live in the same coordinate space as the window's own content, so they are
+            // magnified along with it. They are drawn with the renderer's own sampling rather than
+            // with the configured kernel, which is fine for menus and tooltips.
+            let mut push_popup = |elem: WaylandSurfaceRenderElement<R>| match magnify {
+                Some(magnify) => {
+                    let rect = elem.geometry(scale).to_f64().to_logical(scale);
+                    let rect = magnify_element_rect(&magnify, location, rect);
+                    push(SuperResElement::plain(elem).with_magnify(rect).into());
+                }
+                None => push(elem.into()),
+            };
             push_elements_from_surface_tree(
                 ctx.renderer,
                 surface,
@@ -706,10 +831,17 @@ impl LayoutElement for Mapped {
                 scale,
                 alpha,
                 Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
+                &mut push_popup,
             );
 
-            let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
+            let geometry = match magnify {
+                Some(magnify) => {
+                    let rect = Rectangle::new(offset.to_f64(), popup_geo.size.to_f64());
+                    let rect = magnify.to_target(rect);
+                    Rectangle::new(location + rect.loc, rect.size)
+                }
+                None => Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64()),
+            };
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
             let surface_anim_scale = Scale::from(1.);
             let mut effect = popup_rules.background_effect;
@@ -769,11 +901,36 @@ impl LayoutElement for Mapped {
 
     fn request_size(
         &mut self,
-        size: Size<i32, Logical>,
+        mut size: Size<i32, Logical>,
         mode: SizingMode,
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        // In the magnify upscaling mode, niri draws the window's content scaled into the area the
+        // layout asked for, so the client is asked for the content size instead of the area. That
+        // size is either the client's own size or the `virtual-size` a rule configured, and nothing
+        // has to be restored when this is unset, since the client was never resized.
+        //
+        // A content size that fits in the area is the whole point: it is what makes the effect
+        // magnify (and the window occupy the area). One that does not fit in both dimensions would
+        // only make the window overflow the area, so the client is given the area's size instead.
+        let virtual_size = self.rules.upscaling.virtual_size();
+        let content_size = virtual_size
+            .map(|(width, height)| Size::from((width, height)))
+            .unwrap_or(self.window.geometry().size);
+        let magnify = self.rules.upscaling.mode() == UpscalingMode::Magnify
+            && content_size.w > 0
+            && content_size.h > 0
+            // Without a virtual size, only fullscreen has anything to magnify: the layout sizes a
+            // tiled window to its own content, so it is never bigger than the area it is given.
+            && (mode.is_fullscreen() || virtual_size.is_some())
+            && (content_size.w < size.w || content_size.h < size.h);
+        self.superres
+            .set_magnify_target(self.id.get(), content_size, magnify.then_some(size));
+        if magnify {
+            size = content_size;
+        }
+
         // Going into real fullscreen resets windowed fullscreen.
         if mode == SizingMode::Fullscreen {
             self.is_pending_windowed_fullscreen = false;
@@ -920,6 +1077,15 @@ impl LayoutElement for Mapped {
     }
 
     fn set_preferred_scale_transform(&self, scale: output::Scale, transform: Transform) {
+        // Remember the output's scale and transform as the layout sent them, so that a client-scale
+        // rule change can send the client a new scale even though the output's scale did not
+        // change.
+        self.sent_scale_transform.set((scale, transform));
+
+        // A window rule can override the scale that this window's client renders at, which is what
+        // makes it render fewer pixels for super resolution to magnify.
+        let scale = self.rules.client_scale(scale);
+
         self.window.with_surfaces(|surface, data| {
             send_scale_transform(surface, data, scale, transform);
         });
@@ -972,6 +1138,10 @@ impl LayoutElement for Mapped {
                 existing.states.states.extend(data.states.states);
             }
         }
+    }
+
+    fn set_render_view_rect(&self, view_rect: Option<Rectangle<f64, Logical>>) {
+        self.superres.set_view_rect(view_rect);
     }
 
     fn is_urgent(&self) -> bool {
@@ -1223,6 +1393,15 @@ impl LayoutElement for Mapped {
     }
 
     fn expected_size(&self) -> Option<Size<i32, Logical>> {
+        // In the magnify mode the window occupies the area the layout gave it rather than the
+        // content size its client renders at, which is what the callers of this function care about
+        // (interactive resizes and the size to restore when unfloating). Fullscreen windows have no
+        // expected size, which the logic below handles.
+        if !self.sizing_mode().is_fullscreen() {
+            if let Some(geometry) = self.magnify_geometry() {
+                return Some(geometry.target.to_i32_round());
+            }
+        }
         // We can only use current size if it's not maximized or fullscreen.
         let current_size = (self.sizing_mode().is_normal()).then(|| self.window.geometry().size);
 
@@ -1428,4 +1607,19 @@ impl LayoutElement for Mapped {
             }
         });
     }
+}
+
+/// Maps an element's rectangle into the area that magnified content is drawn in.
+///
+/// `origin` is the window's visual location on the output, and `rect` is the element's rectangle in
+/// output coordinates, as the surface tree walker produced it. Everything the window draws, which
+/// includes its subsurfaces and pop-ups, goes through this.
+fn magnify_element_rect(
+    magnify: &MagnifiedGeometry,
+    origin: Point<f64, Logical>,
+    rect: Rectangle<f64, Logical>,
+) -> Rectangle<f64, Logical> {
+    let relative = Rectangle::new(rect.loc - origin, rect.size);
+    let mapped = magnify.to_target(relative);
+    Rectangle::new(origin + mapped.loc, mapped.size)
 }

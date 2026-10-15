@@ -60,7 +60,8 @@ pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, 
 pub use crate::utils::FloatOrInt;
 use crate::utils::{expand_home_path, Flag, MergeWith as _};
 pub use crate::window_rule::{
-    FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, WindowRule,
+    FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, Upscaling,
+    UpscalingAlgorithm, UpscalingMode, UpscalingRule, WindowRule, WindowSize,
 };
 pub use crate::workspace::{Workspace, WorkspaceLayoutPart};
 
@@ -672,6 +673,141 @@ mod tests {
     }
 
     #[test]
+    fn parse_upscaling() {
+        let parsed = do_parse(
+            r#"
+            window-rule {
+                upscaling {
+                    mode "filter"
+                    algorithm "bicubic"
+                    client-scale 1.5
+                }
+            }
+            window-rule {
+                upscaling {
+                    algorithm "fsr1"
+                    sharpness 0.4
+                    virtual-size 320 240
+                }
+            }
+            window-rule {
+                upscaling {
+                    mode "off"
+                }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            parsed
+                .window_rules
+                .iter()
+                .map(|rule| rule.upscaling)
+                .collect::<Vec<_>>(),
+            vec![
+                UpscalingRule {
+                    mode: Some(UpscalingMode::Filter),
+                    algorithm: Some(UpscalingAlgorithm::Bicubic),
+                    sharpness: None,
+                    client_scale: Some(FloatOrInt(1.5)),
+                    virtual_size: None,
+                },
+                UpscalingRule {
+                    mode: None,
+                    algorithm: Some(UpscalingAlgorithm::Fsr1),
+                    sharpness: Some(FloatOrInt(0.4)),
+                    client_scale: None,
+                    virtual_size: Some(WindowSize {
+                        width: 320,
+                        height: 240,
+                    }),
+                },
+                UpscalingRule {
+                    mode: Some(UpscalingMode::Off),
+                    algorithm: None,
+                    sharpness: None,
+                    client_scale: None,
+                    virtual_size: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn upscaling_merge() {
+        let mut resolved = Upscaling::default();
+        assert!(!resolved.enabled());
+
+        // Setting an algorithm without a mode enables the effect.
+        resolved.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: Some(UpscalingAlgorithm::Bicubic),
+            sharpness: None,
+            client_scale: None,
+            virtual_size: None,
+        });
+        assert!(resolved.enabled());
+        assert_eq!(resolved.mode(), UpscalingMode::Filter);
+        assert_eq!(resolved.algorithm(), UpscalingAlgorithm::Bicubic);
+
+        // A later rule can override the algorithm.
+        resolved.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: Some(UpscalingAlgorithm::Bilinear),
+            sharpness: None,
+            client_scale: None,
+            virtual_size: None,
+        });
+        assert!(resolved.enabled());
+        assert_eq!(resolved.algorithm(), UpscalingAlgorithm::Bilinear);
+
+        // ...and turn the effect off again.
+        resolved.merge_with(&UpscalingRule {
+            mode: Some(UpscalingMode::Off),
+            algorithm: None,
+            sharpness: None,
+            client_scale: None,
+            virtual_size: None,
+        });
+        assert!(!resolved.enabled());
+
+        // The client scale is independent of the effect itself, and a rule can reset it to the
+        // output's scale with zero.
+        resolved.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: None,
+            sharpness: None,
+            client_scale: Some(FloatOrInt(1.)),
+            virtual_size: None,
+        });
+        assert_eq!(resolved.client_scale(), Some(1.));
+        resolved.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: None,
+            sharpness: None,
+            client_scale: Some(FloatOrInt(0.)),
+            virtual_size: None,
+        });
+        assert_eq!(resolved.client_scale(), None);
+
+        // A virtual size only does something in the magnify mode, so setting it turns that on.
+        let mut magnified = Upscaling::default();
+        magnified.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: None,
+            sharpness: None,
+            client_scale: None,
+            virtual_size: Some(WindowSize {
+                width: 320,
+                height: 240,
+            }),
+        });
+        assert!(magnified.enabled());
+        assert_eq!(magnified.mode(), UpscalingMode::Magnify);
+        assert_eq!(magnified.virtual_size(), Some((320, 240)));
+    }
+
+    #[test]
     fn parse() {
         let parsed = do_parse(
             r##"
@@ -925,6 +1061,11 @@ mod tests {
                 }
 
                 pinch-sensitivity 1.2
+
+                upscaling {
+                    mode "filter"
+                    algorithm "bicubic"
+                }
             }
 
             layer-rule {
@@ -1931,6 +2072,17 @@ mod tests {
                             noise: None,
                             saturation: None,
                         },
+                    },
+                    upscaling: UpscalingRule {
+                        mode: Some(
+                            Filter,
+                        ),
+                        algorithm: Some(
+                            Bicubic,
+                        ),
+                        sharpness: None,
+                        client_scale: None,
+                        virtual_size: None,
                     },
                 },
             ],
