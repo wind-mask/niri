@@ -1,3 +1,4 @@
+use knuffel::errors::DecodeError;
 use niri_ipc::ColumnDisplay;
 
 use crate::appearance::{
@@ -7,6 +8,91 @@ use crate::appearance::{
 use crate::layout::DefaultPresetSize;
 use crate::utils::{MergeWith, RegexEq};
 use crate::FloatOrInt;
+
+/// Size that a window's client is told to render at, in logical pixels.
+///
+/// This is what the `virtual-size` upscaling rule takes: the width and the height, like
+/// `virtual-size 1280 720`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSize {
+    pub width: i32,
+    pub height: i32,
+}
+
+impl<S> knuffel::Decode<S> for WindowSize
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        // Check for unexpected type name.
+        if let Some(type_name) = &node.type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+
+        let decode_dimension = |ctx: &mut knuffel::decode::Context<S>,
+                                val: &knuffel::ast::Value<S>| {
+            // Check for unexpected type name.
+            if let Some(typ) = &val.type_name {
+                ctx.emit_error(DecodeError::TypeName {
+                    span: typ.span().clone(),
+                    found: Some((**typ).clone()),
+                    expected: knuffel::errors::ExpectedType::no_type(),
+                    rust_type: "int",
+                });
+            }
+
+            let dimension: i32 = match *val.literal {
+                knuffel::ast::Literal::Int(ref x) => match x.try_into() {
+                    Ok(x) => x,
+                    Err(err) => {
+                        ctx.emit_error(DecodeError::conversion(&val.literal, err));
+                        0
+                    }
+                },
+                _ => {
+                    ctx.emit_error(DecodeError::scalar_kind(
+                        knuffel::decode::Kind::Int,
+                        &val.literal,
+                    ));
+                    0
+                }
+            };
+
+            if dimension <= 0 {
+                ctx.emit_error(DecodeError::conversion(&val.literal, "size must be > 0"));
+            }
+
+            dimension
+        };
+
+        let mut args = node.arguments.iter();
+        let width = args
+            .next()
+            .ok_or_else(|| DecodeError::missing(node, "width is required"))?;
+        let width = decode_dimension(ctx, width);
+        let height = args
+            .next()
+            .ok_or_else(|| DecodeError::missing(node, "height is required"))?;
+        let height = decode_dimension(ctx, height);
+
+        for arg in args {
+            ctx.emit_error(DecodeError::unexpected(
+                &arg.literal,
+                "argument",
+                "unexpected argument",
+            ));
+        }
+
+        Ok(Self { width, height })
+    }
+}
 
 /// Super resolution rules for a window.
 ///
@@ -24,15 +110,19 @@ pub struct UpscalingRule {
     /// - `"off"`: don't apply super resolution. This is the default.
     /// - `"filter"`: keep the window's display geometry, but replace the sampling used to magnify
     ///   its buffer.
-    /// - `"magnify"`: magnify the window's content to a larger display area. Not implemented yet;
-    ///   currently behaves like `"filter"`.
+    /// - `"magnify"`: magnify the window's content to a larger display area. Put the window in
+    ///   fullscreen and niri fills the output with its content instead, without resizing the
+    ///   client, keeping the aspect ratio and mapping input back into the client's coordinates.
+    ///   With `virtual-size`, this happens wherever the window is, and the client always renders
+    ///   the configured size.
     #[knuffel(child, unwrap(argument))]
     pub mode: Option<UpscalingMode>,
 
     /// Resampling algorithm to use.
     ///
-    /// `"fsr1"` runs FSR1 (EASU then RCAS) and uses `sharpness`. Algorithms other than
-    /// `"bilinear"`, `"bicubic"` and `"fsr1"` are not implemented yet and currently fall back to
+    /// `"fsr1"` runs FSR1 (EASU then RCAS) and uses `sharpness`, and `"cunny2"` runs a CuNNy
+    /// network, which reconstructs the image instead of resampling it and is meant for
+    /// illustrations and text. `"anime4k"` is not implemented yet and currently falls back to
     /// `"bicubic"`.
     #[knuffel(child, unwrap(argument))]
     pub algorithm: Option<UpscalingAlgorithm>,
@@ -43,6 +133,44 @@ pub struct UpscalingRule {
     /// it, and 2 is a quarter. Defaults to 0.2, which is what AMD's FSR1 sample uses.
     #[knuffel(child, unwrap(argument))]
     pub sharpness: Option<FloatOrInt<0, 2>>,
+
+    /// Scale to advertise to this window's client.
+    ///
+    /// By default, niri tells every client the scale of the output it is on, and clients that
+    /// support fractional scaling render that many pixels per logical pixel. Setting this
+    /// overrides the value for this window's client, so it renders at a different pixel density: a
+    /// value below the output's scale makes the client render fewer pixels than the area it is
+    /// displayed in has, which is exactly what super resolution magnifies.
+    ///
+    /// For example, with `client-scale 1.0` on an output with `scale 1.5`, the client renders one
+    /// pixel per logical pixel, and niri magnifies it 1.5× while drawing it (with super
+    /// resolution, if it is enabled for this window). This is meant for games and similar
+    /// windows that would otherwise render at the output's full resolution.
+    ///
+    /// Note that this is a lie the client cannot tell apart from a smaller output scale, so
+    /// everything the client draws itself, including its decorations and text, is sized for it
+    /// too.
+    ///
+    /// Zero means "use the output's scale", which is the default.
+    #[knuffel(child, unwrap(argument))]
+    pub client_scale: Option<FloatOrInt<0, 10>>,
+
+    /// Size to tell this window's client to render at, in logical pixels.
+    ///
+    /// Two arguments, the width and the height, like `virtual-size 1280 720`. The client is
+    /// configured with this size instead of the area the layout gives the window, so it renders at
+    /// a resolution of your choosing while niri draws its content into that area. This is the
+    /// other half of "a game that renders at a lower resolution than the screen":
+    /// `client-scale` decides how many pixels the client renders per logical pixel, and this
+    /// decides the logical size it renders at.
+    ///
+    /// Setting it turns on the magnify mode, since that is the only mode where it does anything.
+    ///
+    /// The size is only used when it fits in the area the layout gives the window. A virtual size
+    /// that is bigger than the area in both dimensions would only make the window overflow it, so
+    /// such a window is left alone, and its client is given the area's size like any other window.
+    #[knuffel(child)]
+    pub virtual_size: Option<WindowSize>,
 }
 
 /// Resolved super resolution rules.
@@ -56,6 +184,12 @@ pub struct Upscaling {
 
     /// Sharpening strength, in FSR1 RCAS stops. `None` means unset.
     pub sharpness: Option<f64>,
+
+    /// Scale to advertise to the window's client. `None` means unset.
+    pub client_scale: Option<f64>,
+
+    /// Size to tell the window's client to render at. `None` means unset.
+    pub virtual_size: Option<WindowSize>,
 }
 
 impl Upscaling {
@@ -64,13 +198,21 @@ impl Upscaling {
         match self.mode {
             Some(UpscalingMode::Off) => false,
             Some(UpscalingMode::Filter | UpscalingMode::Magnify) => true,
-            None => self.algorithm.is_some(),
+            None => self.algorithm.is_some() || self.virtual_size.is_some(),
         }
     }
 
-    /// Returns the mode to use, defaulting to `Off`.
+    /// Returns the mode to use, defaulting to `filter`.
     pub fn mode(&self) -> UpscalingMode {
-        self.mode.unwrap_or_default()
+        match self.mode {
+            Some(mode) => mode,
+            // A virtual size does nothing outside of the magnify mode, so setting it turns that on,
+            // the same way setting an algorithm turns on the filter mode.
+            None if self.virtual_size.is_some() => UpscalingMode::Magnify,
+            // Otherwise the mode defaults to `filter`, which is what setting only an algorithm
+            // gets, and what `UpscalingMode::default()` is.
+            None => UpscalingMode::default(),
+        }
     }
 
     /// Returns the algorithm to use, defaulting to bilinear.
@@ -81,6 +223,18 @@ impl Upscaling {
     /// Returns the sharpness to use, defaulting to what AMD's FSR1 sample uses.
     pub fn sharpness(&self) -> f64 {
         self.sharpness.unwrap_or(0.2)
+    }
+
+    /// Returns the scale to advertise to this window's client, if a rule overrides it.
+    ///
+    /// Zero (and unset) mean that the client should use the scale of the output it is on.
+    pub fn client_scale(&self) -> Option<f64> {
+        self.client_scale.filter(|scale| *scale > 0.)
+    }
+
+    /// Returns the size to tell this window's client to render at, if a rule sets one.
+    pub fn virtual_size(&self) -> Option<(i32, i32)> {
+        self.virtual_size.map(|size| (size.width, size.height))
     }
 }
 
@@ -96,6 +250,14 @@ impl MergeWith<UpscalingRule> for Upscaling {
 
         if let Some(x) = part.sharpness {
             self.sharpness = Some(x.0);
+        }
+
+        if let Some(x) = part.client_scale {
+            self.client_scale = Some(x.0);
+        }
+
+        if let Some(x) = part.virtual_size {
+            self.virtual_size = Some(x);
         }
     }
 }
@@ -135,7 +297,9 @@ pub enum UpscalingAlgorithm {
 
     /// CuNNy2 neural network.
     ///
-    /// Not implemented yet.
+    /// A network trained on illustrations, which reconstructs the image instead of resampling it.
+    /// It runs at the client buffer's resolution, so its cost follows the client's resolution
+    /// rather than the output's, and it does not sharpen.
     Cunny2,
 
     /// Anime4K neural network.

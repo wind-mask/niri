@@ -7,6 +7,7 @@ use niri_config::{
     ResolvedPopupsRules, ShadowRule, TabIndicatorRule, Upscaling,
 };
 use niri_ipc::ColumnDisplay;
+use smithay::output::Scale as OutputScale;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Logical, Size};
 use smithay::wayland::compositor::with_states;
@@ -398,6 +399,24 @@ impl ResolvedWindowRules {
 
         // We open fixed-height windows as floating.
         min_size.h > 0 && min_size.h == max_size.h
+    }
+
+    /// Returns the scale to advertise to this window's client.
+    ///
+    /// This is normally the scale of the output the window is on, but a rule can override it for
+    /// one window, which makes its client render at a different pixel density. A scale below the
+    /// output's makes the client render fewer pixels than its display area has, which is what super
+    /// resolution magnifies.
+    ///
+    /// Zero (and unset) in the rule means the output's scale.
+    pub fn client_scale(&self, output_scale: OutputScale) -> OutputScale {
+        match self.upscaling.client_scale() {
+            // The fractional-scale protocol can only express scales as N/120, and Smithay rounds
+            // the value while sending it. `Scale::Fractional` advertises `ceil()` to clients that
+            // do not support fractional scaling, the same way niri advertises output scales.
+            Some(scale) => OutputScale::Fractional(scale),
+            None => output_scale,
+        }
     }
 }
 

@@ -1490,6 +1490,8 @@ mod tests {
             mode: Some(UpscalingMode::Filter),
             algorithm: None,
             sharpness: None,
+            client_scale: None,
+            virtual_size: None,
         };
         assert_eq!(
             pipeline.kernel(&rules),
@@ -1504,6 +1506,8 @@ mod tests {
             mode: None,
             algorithm: Some(UpscalingAlgorithm::Bicubic),
             sharpness: None,
+            client_scale: None,
+            virtual_size: None,
         };
         assert_eq!(
             pipeline.kernel(&rules),
@@ -1518,6 +1522,8 @@ mod tests {
             mode: None,
             algorithm: Some(UpscalingAlgorithm::Fsr1),
             sharpness: Some(1.0),
+            client_scale: None,
+            virtual_size: None,
         };
         assert_eq!(
             pipeline.kernel(&rules),
@@ -1532,6 +1538,8 @@ mod tests {
             mode: Some(UpscalingMode::Off),
             algorithm: Some(UpscalingAlgorithm::Bicubic),
             sharpness: None,
+            client_scale: None,
+            virtual_size: None,
         };
         assert_eq!(pipeline.kernel(&rules), None);
     }
