@@ -19,8 +19,9 @@
 //! back to the renderer's own sampling instead of failing the frame.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::CStr;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -38,7 +39,7 @@ use smithay::backend::renderer::multigpu::MultiTexture;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::{
     buffer_y_inverted, Bind as _, Color32F, ContextId, Frame as _, ImportAll, Offscreen as _,
-    Renderer, Texture,
+    Renderer, Texture, TextureFilter,
 };
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -59,34 +60,34 @@ pub enum ResampleFilter {
     Bicubic,
 }
 
-/// Geometry for the `magnify` upscaling mode, in the output's logical coordinate space.
+/// The mapping between a magnified window's content and the area it is displayed in.
 ///
-/// The window's own content has size `source` and is fitted (`contain`, centered) into `target`,
-/// which is the area the layout gave the window. Everything in `content` is relative to the origin
-/// of `target`.
+/// This is what the `magnify` mode does: the client keeps its own size, and niri draws its content
+/// scaled up to fill the area that the layout asked for. Drawing and input have to agree on where
+/// the content ends up, so both go through this.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MagnifiedGeometry {
-    /// The window's own content size.
+    /// The client's own logical size, that is, its content as the client thinks of it.
     pub source: Size<f64, Logical>,
-    /// The area that the window is magnified into.
+    /// The area that the window occupies on the output.
     pub target: Size<f64, Logical>,
-    /// Where the scaled content lands inside `target`.
+    /// Where the content is drawn inside the target, centered.
     pub content: Rectangle<f64, Logical>,
-    /// Uniform scale factor from `source` to `content.size`.
+    /// How much the content is scaled up.
     pub scale: f64,
 }
 
 impl MagnifiedGeometry {
-    /// Fits `source` into `target`, preserving aspect ratio and centering the result.
+    /// Returns the geometry for a content of `source` size magnified into `target`.
     ///
-    /// Returns `None` when `source` or `target` is empty, or when `source` is already at least as
-    /// large as `target` in both dimensions (so there is nothing to magnify).
+    /// Returns `None` when there is nothing to magnify, in which case the window should be drawn
+    /// at its own size like any other window.
     pub fn new(source: Size<f64, Logical>, target: Size<f64, Logical>) -> Option<Self> {
         if source.w <= 0. || source.h <= 0. || target.w <= 0. || target.h <= 0. {
             return None;
         }
 
-        // Only magnify. A window that is already as big as the target (or bigger) is not
+        // Only magnify, never shrink: a window that is bigger than the area it was given is not
         // this mode's business.
         if source.w >= target.w && source.h >= target.h {
             return None;
@@ -199,6 +200,9 @@ pub enum SuperResKernel {
 
     /// FSR1: EASU into an offscreen texture, then RCAS in the final draw.
     Fsr1(Fsr1Params),
+
+    /// A CuNNy network, whose passes run offscreen and whose residuals the final draw applies.
+    Cunny(CunnyVariant),
 }
 
 impl SuperResKernel {
@@ -216,9 +220,21 @@ impl SuperResKernel {
                 }),
                 false,
             ),
-            UpscalingAlgorithm::Cunny2 | UpscalingAlgorithm::Anime4k => {
-                (Self::Filter(ResampleFilter::Bicubic), true)
-            }
+            UpscalingAlgorithm::Cunny2 => (Self::Cunny(CunnyVariant::Fast), false),
+            UpscalingAlgorithm::Cunny2Large => (Self::Cunny(CunnyVariant::ThreeByTwelve), false),
+            UpscalingAlgorithm::Anime4k => (Self::Filter(ResampleFilter::Bicubic), true),
+        }
+    }
+}
+
+impl fmt::Display for SuperResKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Filter(ResampleFilter::Bilinear) => f.write_str("bilinear"),
+            Self::Filter(ResampleFilter::Bicubic) => f.write_str("bicubic"),
+            Self::Fsr1(params) => write!(f, "fsr1 (sharpness {})", params.sharpness),
+            Self::Cunny(CunnyVariant::Fast) => f.write_str("cunny2 (fast-NVL)"),
+            Self::Cunny(CunnyVariant::ThreeByTwelve) => f.write_str("cunny2 (3x12-NVL)"),
         }
     }
 }
@@ -284,6 +300,12 @@ impl Capabilities {
     fn probe(renderer: &mut GlesRenderer, render_node: Option<&Path>) -> Option<Self> {
         let capabilities = renderer.capabilities().to_vec();
         let is_software = renderer.is_software();
+        // Nested/headless contexts may also expose their actual render device through EGL.
+        let egl_render_node =
+            smithay::backend::egl::EGLDevice::device_for_display(renderer.egl_context().display())
+                .ok()
+                .and_then(|device| device.render_device_path().ok());
+        let render_node = egl_render_node.as_deref().or(render_node);
 
         let result = renderer
             .with_context(|gl| unsafe { Self::probe_gl(gl, render_node) })
@@ -528,6 +550,10 @@ pub struct SuperResPrograms {
     bicubic: Option<GlesTexProgram>,
     easu: Option<GlesTexProgram>,
     rcas: Option<GlesTexProgram>,
+    /// The CuNNy passes and the upscale, compiled the first time they are needed: there are more
+    /// than twenty of them, and most sessions never run the effect at all.
+    cunny: RefCell<HashMap<u32, GlesTexProgram>>,
+    cunny_upscale: Option<GlesTexProgram>,
 }
 
 impl SuperResPrograms {
@@ -543,6 +569,12 @@ impl SuperResPrograms {
                     UniformName::new("niri_tex_size", UniformType::_2f),
                     UniformName::new("niri_src_rect", UniformType::_4f),
                 ],
+            ),
+            cunny: RefCell::new(HashMap::new()),
+            cunny_upscale: Some(include_str!("shaders/superres/cunny_upscale.frag")).and_then(
+                |source| {
+                    Self::compile_file(renderer, "cunny upscale", source, &cunny_upscale_uniforms())
+                },
             ),
             rcas: Self::compile_file(
                 renderer,
@@ -594,7 +626,7 @@ impl SuperResPrograms {
         match renderer.compile_custom_texture_shader(source, uniforms) {
             Ok(program) => Some(program),
             Err(err) => {
-                warn!("error compiling the {name} shader: {err:?}");
+                warn!("super resolution: error compiling the {name} shader: {err:?}");
                 None
             }
         }
@@ -621,7 +653,7 @@ impl SuperResPrograms {
 /// Must be called once per renderer context, next to `shaders::init()`.
 pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
     let Some(capabilities) = Capabilities::probe(renderer, render_node) else {
-        warn!("error probing super resolution capabilities");
+        warn!("super resolution: error probing the capabilities");
         return;
     };
 
@@ -632,10 +664,10 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
 
     let data = renderer.egl_context().user_data();
     if !data.insert_if_missing(|| capabilities) {
-        error!("super resolution capabilities were already probed");
+        error!("super resolution: the capabilities were already probed");
     }
     if !data.insert_if_missing(|| programs) {
-        error!("super resolution programs were already compiled");
+        error!("super resolution: the programs were already compiled");
     }
 }
 
@@ -679,7 +711,16 @@ pub enum ElementKernel {
         /// Sharpening scale for RCAS, `exp2(-sharpness)`.
         sharpness_scale: f32,
     },
+
+    /// A CuNNy network's residuals, which the final draw applies to the client buffer.
+    Cunny {
+        /// The residuals, at the source's resolution, one source texel per texel.
+        residuals: GlesTexture,
+        /// The renderer context that the texture belongs to.
+        context_id: ContextId<GlesTexture>,
+    },
 }
+
 
 impl<R: Renderer> SuperResElement<R> {
     /// Creates an element that draws the client buffer with a resampling filter.
@@ -704,6 +745,23 @@ impl<R: Renderer> SuperResElement<R> {
     pub fn with_magnify(mut self, rect: Rectangle<f64, Logical>) -> Self {
         self.magnify = Some(rect);
         self
+    }
+
+
+    /// Creates an element that draws a CuNNy run's residuals over the client buffer.
+    pub fn cunny(
+        inner: WaylandSurfaceRenderElement<R>,
+        residuals: GlesTexture,
+        context_id: ContextId<GlesTexture>,
+    ) -> Self {
+        Self {
+            inner,
+            kernel: ElementKernel::Cunny {
+                residuals,
+                context_id,
+            },
+            magnify: None,
+        }
     }
 
     /// Creates an element that draws a cached FSR1 result.
@@ -769,6 +827,51 @@ impl<R: Renderer + ImportAll> SuperResElement<R>
 where
     R::TextureId: Texture,
 {
+
+    /// Returns the program that applies the residuals, with the uniforms and the texture binding
+    /// it needs.
+    ///
+    /// It reads the client buffer as `tex` and the residuals from the texture unit after it, which
+    /// is what a texture program has to do to reach more than one texture.
+    fn cunny_program(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        residuals: &GlesTexture,
+        context_id: ContextId<GlesTexture>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+    ) -> Option<(GlesTexProgram, Vec<Uniform<'static>>)> {
+        if frame.context_id() != context_id {
+            // This happens when the same window is drawn on another GPU, where the cached result is
+            // not valid. It is not an error, we just cannot use the cache here.
+            trace!("super resolution: not applying residuals from another renderer context");
+            return None;
+        }
+
+        let program = SuperResPrograms::get_from_frame(frame)?
+            .cunny_upscale
+            .clone()?;
+        let mut uniforms = self.resample_uniforms(src)?.to_vec();
+        uniforms.push(Uniform::new("niri_tex1", 1i32));
+        // The doubled image's size against the destination's, which is what says whether the
+        // destination magnifies it (one sample per pixel) or minifies it (average over the pixels
+        // each one covers).
+        uniforms.push(Uniform::new(
+            "niri_footprint",
+            [
+                2.0 * (src.size.w / f64::from(dst.size.w.max(1))) as f32,
+                2.0 * (src.size.h / f64::from(dst.size.h.max(1))) as f32,
+            ],
+        ));
+
+        let _ = frame.with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE1);
+            configure_pass_texture(gl, residuals.tex_id(), ffi::NEAREST);
+            gl.ActiveTexture(ffi::TEXTURE0);
+        });
+        Some((program, uniforms))
+    }
+
     /// Returns the resampling uniforms for a source rect of the client buffer.
     fn resample_uniforms(&self, src: Rectangle<f64, Buffer>) -> Option<[Uniform<'static>; 2]> {
         let WaylandSurfaceTexture::Texture(texture) = self.inner.texture() else {
@@ -915,7 +1018,7 @@ fn draw_fsr1(
     if frame.context_id() != context_id {
         // This happens when the same window is drawn on another GPU, where the cached result is
         // not valid. It is not an error, we just cannot use the cache here.
-        debug!("not drawing a super resolution result from another renderer context");
+        trace!("super resolution: not drawing a result from another renderer context");
         return None;
     }
 
@@ -954,14 +1057,22 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        match &self.kernel {
-            ElementKernel::Plain => {
-                draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
-            }
-            ElementKernel::Filter(_) => {
-                let Some((program, uniforms)) = self.resample_program(frame, src) else {
-                    // Fall back to the renderer's own sampling.
-                    return draw_inner_gles(
+        // The element draws with the renderer's own sampling, so there is nothing to measure.
+        if matches!(self.kernel, ElementKernel::Plain) {
+            return draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+        }
+
+
+        let res = match &self.kernel {
+            ElementKernel::Plain => unreachable!(),
+            ElementKernel::Filter(_) => match self.resample_program(frame, src) {
+                // Fall back to the renderer's own sampling.
+                None => {
+                    draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
+                }
+                Some((program, uniforms)) => {
+                    frame.override_default_tex_program(program, uniforms);
+                    let res = draw_inner_gles(
                         &self.inner,
                         frame,
                         src,
@@ -970,14 +1081,33 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                         opaque_regions,
                         cache,
                     );
-                };
-
-                frame.override_default_tex_program(program, uniforms);
-                let res =
-                    draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache);
-                frame.clear_tex_program_override();
-                res
-            }
+                    frame.clear_tex_program_override();
+                    res
+                }
+            },
+            ElementKernel::Cunny {
+                residuals,
+                context_id,
+            } => match self.cunny_program(frame, residuals, context_id.clone(), src, dst) {
+                Some((program, uniforms)) => {
+                    frame.override_default_tex_program(program, uniforms);
+                    let res = draw_inner_gles(
+                        &self.inner,
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    );
+                    frame.clear_tex_program_override();
+                    res
+                }
+                // Fall back to the renderer's own sampling.
+                None => {
+                    draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
+                }
+            },
             ElementKernel::Fsr1 {
                 texture,
                 context_id,
@@ -997,7 +1127,9 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                     draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
                 }
             },
-        }
+        };
+
+        res
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -1017,8 +1149,9 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        match &self.kernel {
-            ElementKernel::Plain => RenderElement::<TtyRenderer<'render>>::draw(
+        // The element draws with the renderer's own sampling, so there is nothing to measure.
+        if matches!(self.kernel, ElementKernel::Plain) {
+            return RenderElement::<TtyRenderer<'render>>::draw(
                 &self.inner,
                 frame,
                 src,
@@ -1026,13 +1159,16 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 damage,
                 opaque_regions,
                 cache,
-            ),
-            ElementKernel::Filter(_) => {
-                let program = self.resample_program(frame.as_gles_frame(), src);
+            );
+        }
 
-                let Some((program, uniforms)) = program else {
+
+        let res = match &self.kernel {
+            ElementKernel::Plain => unreachable!(),
+            ElementKernel::Filter(_) => {
+                match self.resample_program(frame.as_gles_frame(), src) {
                     // Fall back to the renderer's own sampling.
-                    return RenderElement::<TtyRenderer<'render>>::draw(
+                    None => RenderElement::<TtyRenderer<'render>>::draw(
                         &self.inner,
                         frame,
                         src,
@@ -1040,23 +1176,63 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                         damage,
                         opaque_regions,
                         cache,
-                    );
-                };
-
-                frame
-                    .as_gles_frame()
-                    .override_default_tex_program(program, uniforms);
-                let res = RenderElement::<TtyRenderer<'render>>::draw(
-                    &self.inner,
-                    frame,
+                    ),
+                    Some((program, uniforms)) => {
+                        frame
+                            .as_gles_frame()
+                            .override_default_tex_program(program, uniforms);
+                        let res = RenderElement::<TtyRenderer<'render>>::draw(
+                            &self.inner,
+                            frame,
+                            src,
+                            dst,
+                            damage,
+                            opaque_regions,
+                            cache,
+                        );
+                        frame.as_gles_frame().clear_tex_program_override();
+                        res
+                    }
+                }
+            }
+            ElementKernel::Cunny {
+                residuals,
+                context_id,
+            } => {
+                match self.cunny_program(
+                    frame.as_gles_frame(),
+                    residuals,
+                    context_id.clone(),
                     src,
                     dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                );
-                frame.as_gles_frame().clear_tex_program_override();
-                res
+                ) {
+                    Some((program, uniforms)) => {
+                        frame
+                            .as_gles_frame()
+                            .override_default_tex_program(program, uniforms);
+                        let res = RenderElement::<TtyRenderer<'render>>::draw(
+                            &self.inner,
+                            frame,
+                            src,
+                            dst,
+                            damage,
+                            opaque_regions,
+                            cache,
+                        );
+                        frame.as_gles_frame().clear_tex_program_override();
+                        res
+                    }
+                    // Fall back to the renderer's own sampling.
+                    None => RenderElement::<TtyRenderer<'render>>::draw(
+                        &self.inner,
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    ),
+                }
             }
             ElementKernel::Fsr1 {
                 texture,
@@ -1067,7 +1243,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 // the cached result is a plain GLES texture that the multigpu frame cannot address.
                 // This loses the multigpu frame's cross-GPU damage bookkeeping, which is why this
                 // has to be revisited together with mixed-GPU support.
-                if let Some(res) = draw_fsr1(
+                match draw_fsr1(
                     frame.as_gles_frame(),
                     texture,
                     context_id.clone(),
@@ -1077,20 +1253,21 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                     opaque_regions,
                     self.inner.alpha(),
                 ) {
-                    return res.map_err(TtyRendererError::Render);
+                    Some(res) => res.map_err(TtyRendererError::Render),
+                    None => RenderElement::<TtyRenderer<'render>>::draw(
+                        &self.inner,
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    ),
                 }
-
-                RenderElement::<TtyRenderer<'render>>::draw(
-                    &self.inner,
-                    frame,
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
             }
-        }
+        };
+
+        res
     }
 
     fn underlying_storage(
@@ -1145,23 +1322,553 @@ struct Fsr1Key {
     size: Size<i32, Physical>,
 }
 
+
+/// Returns the damage the element has accumulated since the given commit.
+///
+/// A galgame redraws the same scene at the display's rate, so most commits carry the same pixels as
+/// the one before, and a pass only has to run again when something actually changed. The renderer
+/// answers with the whole buffer when it cannot tell which parts changed, so an empty answer is the
+/// only one that proves the content is the same.
+fn damage_since<R: ImportAll>(
+    elem: &WaylandSurfaceRenderElement<R>,
+    scale: Scale<f64>,
+    commit: CommitCounter,
+) -> DamageSet<i32, Physical> {
+    elem.damage_since(scale, Some(commit))
+}
+
 /// Per-window super resolution state.
 ///
-/// This holds the resolved configuration, the cached FSR1 result, and whether we already explained
-/// a fallback, so that a window with an algorithm or mode that is not implemented logs about it
-/// once instead of every frame.
+/// This holds the resolved configuration, the cached FSR1 and CuNNy results, and whether we
+/// already explained a fallback, so that a window with an algorithm that is not implemented logs
+/// about it once instead of every frame.
 #[derive(Debug)]
 pub struct SuperResolutionPipeline {
-    /// The mode and algorithm that the current decision was made for.
-    resolved: Cell<Option<(UpscalingMode, UpscalingAlgorithm)>>,
+    /// The mode, algorithm and sharpness that the current decision was made for.
+    resolved: Cell<Option<(UpscalingMode, UpscalingAlgorithm, f32)>>,
     /// Whether we already logged a fallback for the current decision.
     warned_fallback: Cell<bool>,
     /// Whether we already logged that the offscreen pass failed.
     warned_pass_failure: Cell<bool>,
     /// Cached result of the EASU pass.
     fsr1: RefCell<Option<Fsr1Result>>,
+    /// Cached result of a CuNNy run.
+    cunny: RefCell<Option<(CunnyKey, CunnyResult)>>,
     /// The size that this window's content is magnified into, when it is being magnified.
     magnify_target: Cell<Option<Size<i32, Logical>>>,
+}
+
+/// Which CuNNy network to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CunnyVariant {
+    /// `CuNNy-fast-NVL`: four passes.
+    Fast,
+
+    /// `CuNNy-3x12-NVL`: the same network with one more 12x12 convolution.
+    ThreeByTwelve,
+}
+
+impl CunnyVariant {
+    /// The passes, in order, with the shaders each of them is made of.
+    fn passes(self) -> &'static [CunnyPass] {
+        match self {
+            CunnyVariant::Fast => FAST_NVL,
+            CunnyVariant::ThreeByTwelve => THREE_BY_TWELVE_NVL,
+        }
+    }
+
+    /// Index for the program cache, so that a program can be found again by what it is made of.
+    fn index(self) -> u32 {
+        match self {
+            CunnyVariant::Fast => 0,
+            CunnyVariant::ThreeByTwelve => 1,
+        }
+    }
+
+    /// How many source-sized textures the passes need, and how many the residuals take.
+    fn texture_count(self) -> usize {
+        6
+    }
+}
+
+/// Where a pass reads from or writes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CunnyTexture {
+    /// The client buffer.
+    Input,
+    /// The residuals, which are the network's result.
+    Residuals,
+    /// One of the source-sized textures that the passes ping-pong between.
+    Feature(usize),
+}
+
+/// One pass of a network.
+#[derive(Debug)]
+struct CunnyPass {
+    /// The shader for each group of four output channels.
+    shaders: &'static [&'static str],
+    /// What every one of those shaders reads. The first is drawn as `tex`, the rest are bound to
+    /// the texture units that follow it.
+    reads: &'static [CunnyTexture],
+    /// What each shader writes, in the same order as `shaders`.
+    writes: &'static [CunnyTexture],
+}
+
+/// The passes of `CuNNy-fast-NVL`.
+///
+/// The network doubles the image: the passes work at the source's resolution, and the pixel shuffle
+/// leaves four sub-pixels of luma residual per source texel, which the final draw applies.
+const FAST_NVL: &[CunnyPass] = &[
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/fast/pass1_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/fast/pass1_a1.frag"),
+            include_str!("shaders/superres/cunny/generated/fast/pass1_a2.frag"),
+        ],
+        reads: &[CunnyTexture::Input],
+        writes: &[
+            CunnyTexture::Feature(0),
+            CunnyTexture::Feature(1),
+            CunnyTexture::Feature(2),
+        ],
+    },
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/fast/pass2_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/fast/pass2_a1.frag"),
+            include_str!("shaders/superres/cunny/generated/fast/pass2_a2.frag"),
+        ],
+        reads: &[
+            CunnyTexture::Feature(0),
+            CunnyTexture::Feature(1),
+            CunnyTexture::Feature(2),
+        ],
+        writes: &[
+            CunnyTexture::Feature(3),
+            CunnyTexture::Feature(4),
+            CunnyTexture::Feature(5),
+        ],
+    },
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/fast/pass3_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/fast/pass3_a1.frag"),
+        ],
+        reads: &[
+            CunnyTexture::Feature(3),
+            CunnyTexture::Feature(4),
+            CunnyTexture::Feature(5),
+        ],
+        writes: &[CunnyTexture::Feature(0), CunnyTexture::Feature(1)],
+    },
+    CunnyPass {
+        shaders: &[include_str!(
+            "shaders/superres/cunny/generated/fast/shuffle.frag"
+        )],
+        reads: &[CunnyTexture::Feature(0), CunnyTexture::Feature(1)],
+        writes: &[CunnyTexture::Residuals],
+    },
+];
+
+/// The passes of `CuNNy-3x12-NVL`, which is the same network with one more 12x12 convolution.
+const THREE_BY_TWELVE_NVL: &[CunnyPass] = &[
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/3x12/pass1_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass1_a1.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass1_a2.frag"),
+        ],
+        reads: &[CunnyTexture::Input],
+        writes: &[
+            CunnyTexture::Feature(0),
+            CunnyTexture::Feature(1),
+            CunnyTexture::Feature(2),
+        ],
+    },
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/3x12/pass2_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass2_a1.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass2_a2.frag"),
+        ],
+        reads: &[
+            CunnyTexture::Feature(0),
+            CunnyTexture::Feature(1),
+            CunnyTexture::Feature(2),
+        ],
+        writes: &[
+            CunnyTexture::Feature(3),
+            CunnyTexture::Feature(4),
+            CunnyTexture::Feature(5),
+        ],
+    },
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/3x12/pass3_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass3_a1.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass3_a2.frag"),
+        ],
+        reads: &[
+            CunnyTexture::Feature(3),
+            CunnyTexture::Feature(4),
+            CunnyTexture::Feature(5),
+        ],
+        writes: &[
+            CunnyTexture::Feature(0),
+            CunnyTexture::Feature(1),
+            CunnyTexture::Feature(2),
+        ],
+    },
+    CunnyPass {
+        shaders: &[
+            include_str!("shaders/superres/cunny/generated/3x12/pass4_a0.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass4_a1.frag"),
+            include_str!("shaders/superres/cunny/generated/3x12/pass4_a2.frag"),
+        ],
+        reads: &[
+            CunnyTexture::Feature(0),
+            CunnyTexture::Feature(1),
+            CunnyTexture::Feature(2),
+        ],
+        writes: &[
+            CunnyTexture::Feature(3),
+            CunnyTexture::Feature(4),
+            CunnyTexture::Feature(5),
+        ],
+    },
+    CunnyPass {
+        shaders: &[include_str!(
+            "shaders/superres/cunny/generated/3x12/shuffle.frag"
+        )],
+        reads: &[
+            CunnyTexture::Feature(3),
+            CunnyTexture::Feature(4),
+            CunnyTexture::Feature(5),
+        ],
+        writes: &[CunnyTexture::Residuals],
+    },
+];
+
+/// What a CuNNy result is valid for.
+#[derive(Debug, Clone, PartialEq)]
+struct CunnyKey {
+    /// Which network ran.
+    variant: CunnyVariant,
+    /// The client buffer's commit.
+    commit: CommitCounter,
+    /// The rect of the buffer that was run.
+    src: Rectangle<f64, Buffer>,
+    /// Its size, which is the size of the residuals.
+    size: Size<i32, Buffer>,
+}
+
+/// A network's result: the residuals of the doubled image, one source texel per texel.
+#[derive(Debug, Clone)]
+struct CunnyResult {
+    /// The residuals.
+    texture: GlesTexture,
+    /// The intermediate feature textures, kept so the next commit at the same size does not
+    /// reallocate them.
+    features: Vec<GlesTexture>,
+    /// The renderer context the texture belongs to.
+    context_id: ContextId<GlesTexture>,
+}
+
+/// Sets a pass texture to the given filter and edge clamping.
+///
+/// `GlesRenderer::create_buffer` leaves `GL_TEXTURE_MIN_FILTER` at its initial value of
+/// `GL_NEAREST_MIPMAP_LINEAR` with a single mip level, which makes the texture incomplete in
+/// OpenGL ES until something sets a non-mipmap filter on it. `GlesFrame::render_texture` only
+/// does that for `GL_TEXTURE0`, so any texture bound to `GL_TEXTURE1` or `GL_TEXTURE2` (and
+/// the residuals texture, which is never drawn as `GL_TEXTURE0`) would otherwise read back as
+/// `(0, 0, 0, 1)` on every sample.
+///
+/// # Safety
+///
+/// Must be called with a current GLES context.
+unsafe fn configure_pass_texture(gl: &ffi::Gles2, tex_id: u32, filter: ffi::types::GLenum) {
+    gl.BindTexture(ffi::TEXTURE_2D, tex_id);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, filter as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, filter as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+}
+
+/// Runs a network over the client buffer, returning its feature textures and residuals.
+///
+/// Every pass is one draw per group of four output channels, since the renderer has no multiple
+/// render targets. The feature textures are the network's own and are reused across commits of the
+/// same size.
+#[allow(clippy::too_many_arguments)]
+fn run_cunny(
+    renderer: &mut GlesRenderer,
+    variant: CunnyVariant,
+    source: &GlesTexture,
+    src: Rectangle<f64, Buffer>,
+    tex_size: Size<i32, Buffer>,
+    transform: Transform,
+    reuse: Option<(Vec<GlesTexture>, GlesTexture)>,
+) -> anyhow::Result<(Vec<GlesTexture>, GlesTexture)> {
+    // The source rect in the client buffer's texels, which is the size the features have.
+    let size = src
+        .size
+        .to_i32_round()
+        .to_logical(1, Transform::Normal)
+        .to_physical(1);
+    anyhow::ensure!(size.w > 0 && size.h > 0, "empty source rect");
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+
+    let (features, residuals) = match reuse
+        .filter(|(features, _)| features.len() == variant.texture_count())
+    {
+        Some(reused) => reused,
+        None => {
+            let mut features: Vec<GlesTexture> = Vec::with_capacity(variant.texture_count());
+            for _ in 0..variant.texture_count() {
+                features.push(
+                    renderer
+                        .create_buffer(Fourcc::Abgr8888, buffer_size)
+                        .context("error creating a feature texture")?,
+                );
+            }
+
+            // The residuals are signed, and the quantization the reference does is on the eight-bit
+            // features, not on them, so they go into a half-float texture.
+            let residuals: GlesTexture = renderer
+                .create_buffer(Fourcc::Abgr16161616f, buffer_size)
+                .context("error creating the residuals texture")?;
+
+            renderer
+                .with_context(|gl| unsafe {
+                    for feature in &features {
+                        configure_pass_texture(gl, feature.tex_id(), ffi::NEAREST);
+                    }
+                    configure_pass_texture(gl, residuals.tex_id(), ffi::NEAREST);
+                    gl.BindTexture(ffi::TEXTURE_2D, 0);
+                })
+                .context("error configuring pass textures")?;
+
+            (features, residuals)
+        }
+    };
+
+    // Every pass samples exact texel centers, and `render_texture` overwrites `GL_TEXTURE0`'s
+    // filter with the renderer's filter on every draw. Setting it to `Nearest` for the run keeps
+    // both `GL_TEXTURE0` and any feature texture that is later bound to `GL_TEXTURE1`/`GL_TEXTURE2`
+    // on point sampling.
+    let _ = renderer.downscale_filter(TextureFilter::Nearest);
+    let _ = renderer.upscale_filter(TextureFilter::Nearest);
+
+    let run_passes = |renderer: &mut GlesRenderer| -> anyhow::Result<()> {
+        for (pass_index, pass) in variant.passes().iter().enumerate() {
+            for group in 0..pass.shaders.len() {
+                let pass_number = pass_index + 1;
+                let group_number = group + 1;
+                let program =
+                    cunny_program(renderer, variant, pass_index, group).with_context(|| {
+                        format!("error compiling pass {pass_number} group {group_number}")
+                    })?;
+
+                let uniforms = cunny_uniforms(pass, buffer_size, src, tex_size);
+
+                // A texture handle is cheap to copy, and copying it keeps the pass's reads and its
+                // write from borrowing the same list.
+                let mut target = match pass.writes[group] {
+                    CunnyTexture::Feature(index) => features[index].clone(),
+                    CunnyTexture::Residuals => residuals.clone(),
+                    CunnyTexture::Input => unreachable!(),
+                };
+
+                let mut fb = renderer.bind(&mut target).with_context(|| {
+                    format!(
+                        "error binding a feature texture (pass {pass_number} group {group_number})"
+                    )
+                })?;
+                let mut frame = renderer
+                    .render(&mut fb, size, Transform::Normal)
+                    .with_context(|| {
+                        format!("error starting pass {pass_number} group {group_number}")
+                    })?;
+
+
+                // The first input is drawn, so the renderer binds it as `tex`; the others are bound
+                // to the texture units after it, which is the only way to reach more than one
+                // texture from smithay's texture programs.
+                for (i, read) in pass.reads.iter().enumerate().skip(1) {
+                    let texture = match read {
+                        CunnyTexture::Feature(index) => features[*index].tex_id(),
+                        _ => unreachable!(),
+                    };
+                    frame
+                        .with_context(|gl| unsafe {
+                            gl.ActiveTexture(ffi::TEXTURE0 + i as u32);
+                            configure_pass_texture(gl, texture, ffi::NEAREST);
+                            gl.ActiveTexture(ffi::TEXTURE0);
+                        })
+                        .context("error binding a texture")?;
+                }
+
+                let dst = Rectangle::from_size(size);
+                let (texture, src_rect, transform) = match pass.reads[0] {
+                    CunnyTexture::Feature(index) => (
+                        &features[index],
+                        Rectangle::from_size(buffer_size).to_f64(),
+                        Transform::Normal,
+                    ),
+                    CunnyTexture::Input => (source, src, transform),
+                    CunnyTexture::Residuals => unreachable!(),
+                };
+
+                // Mark the whole destination as opaque so the renderer disables `GL_BLEND`: the
+                // fourth channel of `gl_FragColor` is a feature channel (or sub-pixel residual),
+                // not an alpha value to blend against previous contents of the texture.
+                frame
+                    .render_texture_from_to(
+                        texture,
+                        src_rect,
+                        dst,
+                        &[dst],
+                        &[dst],
+                        transform,
+                        1.0,
+                        Some(&program),
+                        &uniforms,
+                    )
+                    .with_context(|| format!("error in pass {pass_number} group {group_number}"))?;
+                let _ = frame.finish().with_context(|| {
+                    format!("error finishing pass {pass_number} group {group_number}")
+                })?;
+            }
+        }
+        Ok(())
+    };
+
+    let res = run_passes(renderer);
+    let _ = renderer.downscale_filter(TextureFilter::Linear);
+    let _ = renderer.upscale_filter(TextureFilter::Linear);
+    res?;
+
+    Ok((features, residuals))
+}
+
+/// The uniforms a CuNNy pass is drawn with.
+///
+/// Which of them a pass uses depends on what it reads, but the renderer has to be told about a
+/// uniform when the program is compiled rather than when it is drawn with: passing one that was
+/// not declared fails the whole draw, and the pass then falls back to the resampling kernels.
+/// The uniforms the upscale program is drawn with.
+fn cunny_upscale_uniforms() -> Vec<UniformName<'static>> {
+    vec![
+        UniformName::new("niri_tex_size", UniformType::_2f),
+        UniformName::new("niri_src_rect", UniformType::_4f),
+        UniformName::new("niri_footprint", UniformType::_2f),
+        UniformName::new("niri_tex1", UniformType::_1i),
+    ]
+}
+
+fn cunny_pass_uniforms() -> Vec<UniformName<'static>> {
+    vec![
+        UniformName::new("niri_tex_size", UniformType::_2f),
+        UniformName::new("niri_src_rect", UniformType::_4f),
+        UniformName::new("niri_size", UniformType::_2f),
+        UniformName::new("niri_src_size", UniformType::_2f),
+        UniformName::new("niri_tex1", UniformType::_1i),
+        UniformName::new("niri_tex2", UniformType::_1i),
+    ]
+}
+
+/// Returns the program of one group of a pass, compiling it the first time it is asked for.
+fn cunny_program(
+    renderer: &mut GlesRenderer,
+    variant: CunnyVariant,
+    pass: usize,
+    group: usize,
+) -> Option<GlesTexProgram> {
+    let key = variant.index() * 1000 + pass as u32 * 10 + group as u32;
+
+    {
+        let cached = SuperResPrograms::get(renderer)
+            .and_then(|programs| programs.cunny.borrow().get(&key).cloned());
+        if let Some(program) = cached {
+            return Some(program);
+        }
+    }
+
+    let source = variant.passes()[pass].shaders[group];
+    let program =
+        SuperResPrograms::compile_file(renderer, "cunny", source, &cunny_pass_uniforms())?;
+
+    if let Some(programs) = SuperResPrograms::get(renderer) {
+        programs.cunny.borrow_mut().insert(key, program.clone());
+    }
+
+    Some(program)
+}
+
+/// The uniforms of a pass: the size of what it reads, and the extra texture units.
+fn cunny_uniforms(
+    pass: &CunnyPass,
+    feature_size: Size<i32, Buffer>,
+    src: Rectangle<f64, Buffer>,
+    tex_size: Size<i32, Buffer>,
+) -> Vec<Uniform<'static>> {
+    let mut rv = Vec::new();
+
+    match pass.reads[0] {
+        // The first pass reads the client buffer, whose size is the window's rather than the source
+        // rect's, and needs the rect of it that is being resampled.
+        CunnyTexture::Input => {
+            rv.push(Uniform::new(
+                "niri_tex_size",
+                (tex_size.w as f32, tex_size.h as f32),
+            ));
+            rv.push(Uniform::new(
+                "niri_src_rect",
+                [
+                    src.loc.x as f32,
+                    src.loc.y as f32,
+                    src.size.w as f32,
+                    src.size.h as f32,
+                ],
+            ));
+        }
+        CunnyTexture::Feature(_) => {
+            // The pixel shuffle names its size after what it reads, the convolutions after the
+            // features they write.
+            let name = if matches!(pass.writes, [CunnyTexture::Residuals]) {
+                "niri_src_size"
+            } else {
+                "niri_size"
+            };
+            rv.push(Uniform::new(
+                name,
+                (feature_size.w as f32, feature_size.h as f32),
+            ));
+        }
+        CunnyTexture::Residuals => (),
+    }
+
+    // A sampler uniform is a texture unit, so these say which unit the texture was bound to.
+    for (i, read) in pass.reads.iter().enumerate().skip(1) {
+        if let CunnyTexture::Feature(_) = read {
+            let name = match i {
+                1 => "niri_tex1",
+                2 => "niri_tex2",
+                _ => continue,
+            };
+            rv.push(Uniform::new(name, i as i32));
+        }
+    }
+
+    rv
 }
 
 impl SuperResolutionPipeline {
@@ -1171,6 +1878,7 @@ impl SuperResolutionPipeline {
             warned_fallback: Cell::new(false),
             warned_pass_failure: Cell::new(false),
             fsr1: RefCell::new(None),
+            cunny: RefCell::new(None),
             magnify_target: Cell::new(None),
         }
     }
@@ -1181,27 +1889,34 @@ impl SuperResolutionPipeline {
     /// the window should be drawn the normal way.
     pub fn kernel(&self, rules: &Upscaling) -> Option<SuperResKernel> {
         if !rules.enabled() {
-            self.resolved.set(None);
+            if self.resolved.take().is_some() {
+                self.fsr1.borrow_mut().take();
+                self.cunny.borrow_mut().take();
+            }
             return None;
         }
 
         let mode = rules.mode();
         let algorithm = rules.algorithm();
-        let (kernel, fell_back) = SuperResKernel::for_algorithm(algorithm, rules.sharpness());
+        let sharpness = rules.sharpness();
+        let (kernel, fell_back) = SuperResKernel::for_algorithm(algorithm, sharpness);
 
-        if self.resolved.get() != Some((mode, algorithm)) {
-            self.resolved.set(Some((mode, algorithm)));
+        if self.resolved.get() != Some((mode, algorithm, sharpness as f32)) {
+            self.resolved.set(Some((mode, algorithm, sharpness as f32)));
             self.warned_fallback.set(false);
             self.warned_pass_failure.set(false);
             // The parameters may have changed, so the cached result may no longer match.
             self.fsr1.borrow_mut().take();
+            self.cunny.borrow_mut().take();
         }
 
         if !self.warned_fallback.get() {
             self.warned_fallback.set(true);
 
             if fell_back {
-                warn!("upscaling algorithm {algorithm:?} is not implemented yet, using {kernel:?}");
+                warn!(
+                    "super resolution: algorithm {algorithm:?} is not implemented yet, using {kernel}"
+                );
             }
         }
 
@@ -1216,6 +1931,104 @@ impl SuperResolutionPipeline {
     /// Returns the size that this window's content is magnified into, if it is being magnified.
     pub fn magnify_target(&self) -> Option<Size<i32, Logical>> {
         self.magnify_target.get()
+    }
+
+    /// Returns a network's residuals for this window, running it if the cached result is stale.
+    fn cunny_result<R: NiriRenderer>(
+        &self,
+        renderer: &mut GlesRenderer,
+        variant: CunnyVariant,
+        elem: &WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+    ) -> Option<CunnyResult>
+    where
+        R::TextureId: PassSource,
+    {
+        // The passes read and write axis-aligned texel grids, and the residuals only line up with
+        // the client buffer when it is not flipped, so other buffers keep the plain kernels.
+        if elem.transform() != Transform::Normal
+            || buffer_y_inverted(elem.buffer()).unwrap_or(false)
+        {
+            return None;
+        }
+
+        let src = elem.src();
+        let size = src.size.to_i32_round();
+        if size.w <= 0 || size.h <= 0 {
+            return None;
+        }
+
+        let key = CunnyKey {
+            variant,
+            commit: elem.current_commit(),
+            src,
+            size,
+        };
+
+        {
+            let cache = self.cunny.borrow();
+            if let Some((cached, result)) = cache.as_ref() {
+                if *cached == key && result.context_id == renderer.context_id() {
+                    return Some(result.clone());
+                }
+
+                // A galgame redraws the same scene at the display's rate, so a new commit usually
+                // carries the same pixels: the network only has to run when the window has damage
+                // since the commit its residuals were made for. The renderer answers with the whole
+                // buffer when it cannot say, so an empty answer is the only one that means the
+                // content is unchanged.
+                let same_geometry = cached.variant == key.variant
+                    && cached.src == key.src
+                    && cached.size == key.size;
+                if same_geometry
+                    && result.context_id == renderer.context_id()
+                    && damage_since(elem, scale, cached.commit).is_empty()
+                {
+                    return Some(result.clone());
+                }
+            }
+        }
+
+        let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
+            return None;
+        };
+        let source = texture.pass_texture(&renderer.context_id())?;
+        let tex_size = source.size();
+
+        let reuse = self
+            .cunny
+            .borrow_mut()
+            .take()
+            .filter(|(cached, result)| {
+                cached.size == key.size && result.context_id == renderer.context_id()
+            })
+            .map(|(_, result)| (result.features, result.texture));
+
+        let (features, texture) = match run_cunny(
+            renderer,
+            variant,
+            &source,
+            src,
+            tex_size,
+            elem.transform(),
+            reuse,
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                if !self.warned_pass_failure.replace(true) {
+                    warn!("super resolution: error running the pass: {err:?}");
+                }
+                return None;
+            }
+        };
+
+        let result = CunnyResult {
+            texture,
+            features,
+            context_id: renderer.context_id(),
+        };
+        *self.cunny.borrow_mut() = Some((key, result.clone()));
+        Some(result)
     }
 
     /// Wraps a surface element, running the EASU pass first if the cached result is stale.
@@ -1253,6 +2066,22 @@ impl SuperResolutionPipeline {
         }
 
         let params = match kernel {
+            SuperResKernel::Cunny(variant) => {
+                let Some(result) = self.cunny_result(renderer, variant, &elem, scale) else {
+                    // Fall back to the best single-pass kernel that we have, still magnifying.
+                    let mut element = SuperResElement::new(elem, ResampleFilter::Bicubic);
+                    if let Some(rect) = magnify {
+                        element = element.with_magnify(rect);
+                    }
+                    return element;
+                };
+
+                let mut element = SuperResElement::cunny(elem, result.texture, result.context_id);
+                if let Some(rect) = magnify {
+                    element = element.with_magnify(rect);
+                }
+                return element;
+            }
             SuperResKernel::Filter(filter) => {
                 let mut element = SuperResElement::new(elem, filter);
                 element = match magnify {
@@ -1264,13 +2093,13 @@ impl SuperResolutionPipeline {
             SuperResKernel::Fsr1(params) => params,
         };
 
-        let Some(texture) = self.fsr1_result(renderer, &elem, dest_size) else {
-            // Fall back to the best single-pass kernel that we have.
-            let element = SuperResElement::new(elem, ResampleFilter::Bicubic);
-            return match magnify {
-                Some(rect) => element.with_magnify(rect),
-                None => element,
-            };
+        let Some(texture) = self.fsr1_result(renderer, &elem, dest_size, scale) else {
+            // Fall back to the best single-pass kernel that we have, still magnifying.
+            let mut element = SuperResElement::new(elem, ResampleFilter::Bicubic);
+            if let Some(rect) = magnify {
+                element = element.with_magnify(rect);
+            }
+            return element;
         };
 
         let mut element = SuperResElement::fsr1(
@@ -1291,6 +2120,7 @@ impl SuperResolutionPipeline {
         renderer: &mut GlesRenderer,
         elem: &WaylandSurfaceRenderElement<R>,
         size: Size<i32, Physical>,
+        scale: Scale<f64>,
     ) -> Option<Fsr1Result>
     where
         R::TextureId: PassSource,
@@ -1300,20 +2130,38 @@ impl SuperResolutionPipeline {
         }
 
         let src = elem.src();
+
         let key = Fsr1Key {
             commit: elem.current_commit(),
             src,
             size,
         };
 
-        if let Some(result) = self.fsr1.borrow().as_ref() {
-            if result.key == key && result.context_id == renderer.context_id() {
-                // The cached result is still what this window would be drawn with.
-                return Some(Fsr1Result {
-                    texture: result.texture.clone(),
-                    context_id: result.context_id.clone(),
-                    key,
-                });
+        {
+            let cache = self.fsr1.borrow();
+            if let Some(result) = cache.as_ref() {
+                if result.key == key && result.context_id == renderer.context_id() {
+                    // The cached result is still what this window would be drawn with.
+                    return Some(Fsr1Result {
+                        texture: result.texture.clone(),
+                        context_id: result.context_id.clone(),
+                        key,
+                    });
+                }
+
+                // A galgame redraws the same scene at the display's rate, so a new commit usually
+                // carries the same pixels: the pass only has to run when the content changed.
+                if result.key.src == key.src
+                    && result.key.size == key.size
+                    && result.context_id == renderer.context_id()
+                    && damage_since(elem, scale, result.key.commit).is_empty()
+                {
+                    return Some(Fsr1Result {
+                        texture: result.texture.clone(),
+                        context_id: result.context_id.clone(),
+                        key,
+                    });
+                }
             }
         }
 
@@ -1325,7 +2173,6 @@ impl SuperResolutionPipeline {
         let y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false);
         let uniforms = resample_uniforms(&source, src, y_inverted)?;
         let program = SuperResPrograms::get(renderer)?.easu.clone()?;
-
         let texture = match run_easu_pass(
             renderer,
             &source,
@@ -1338,7 +2185,7 @@ impl SuperResolutionPipeline {
             Ok(texture) => texture,
             Err(err) => {
                 if !self.warned_pass_failure.replace(true) {
-                    warn!("error running the super resolution pass: {err:?}");
+                    warn!("super resolution: error running the pass: {err:?}");
                 }
                 return None;
             }
@@ -1403,6 +2250,7 @@ fn run_easu_pass(
                 uniforms,
             )
             .context("error in the EASU pass")?;
+
         let _ = frame.finish().context("error finishing frame")?;
     }
 
@@ -1418,6 +2266,7 @@ impl Default for SuperResolutionPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn parse_es_version_mesa() {
@@ -1461,6 +2310,17 @@ mod tests {
         );
         assert_eq!(
             SuperResKernel::for_algorithm(UpscalingAlgorithm::Cunny2, 0.2),
+            (SuperResKernel::Cunny(CunnyVariant::Fast), false)
+        );
+        assert_eq!(
+            SuperResKernel::for_algorithm(UpscalingAlgorithm::Cunny2Large, 0.2),
+            (SuperResKernel::Cunny(CunnyVariant::ThreeByTwelve), false)
+        );
+
+        // The larger network is implemented but not selectable yet, so that the algorithm the
+        // window rules can name keeps being the one that has been measured.
+        assert_eq!(
+            SuperResKernel::for_algorithm(UpscalingAlgorithm::Anime4k, 0.2),
             (SuperResKernel::Filter(ResampleFilter::Bicubic), true)
         );
 
@@ -1806,6 +2666,7 @@ mod tests {
         assert!(!has_something_to_magnify(Size::from((3840., 2160.)), area));
     }
 
+
     #[test]
     fn magnify_contain_fits_and_centers() {
         let source = Size::from((1280., 720.));
@@ -1964,6 +2825,298 @@ mod tests {
             Rectangle::from_size(dest.size)
         );
     }
+
+    /// Compiles every generated CuNNy pass, and says what the driver thinks of it.
+    ///
+    /// The passes are compiled lazily, so a driver that refuses one of them only shows up as a
+    /// window that quietly falls back to the resampling kernels. This is also the only way to see
+    /// why: the renderer's error type does not carry the compiler's message.
+    #[test]
+    fn gpu_cunny_shaders_compile() {
+        let Some(mut renderer) = surfaceless_renderer() else {
+            return;
+        };
+
+        crate::render_helpers::resources::init(&mut renderer);
+        crate::render_helpers::shaders::init(&mut renderer);
+        init(&mut renderer, None);
+
+        // The upscale is the one shader of the effect that is written by hand rather than
+        // generated, so it is the one nothing else checks.
+        let upscale = include_str!("shaders/superres/cunny_upscale.frag");
+        let mut failures = Vec::new();
+        if SuperResPrograms::compile_file(
+            &mut renderer,
+            "cunny upscale",
+            upscale,
+            &cunny_upscale_uniforms(),
+        )
+        .is_none()
+        {
+            let log = renderer
+                .with_context(|gl| unsafe { compile_log(gl, upscale) })
+                .unwrap_or_else(|err| format!("<{err:?}>"));
+            failures.push(format!("cunny upscale: {log}"));
+        }
+
+        // The programs the renderer keeps are the ones a session draws with, so check the one that
+        // matters rather than only that the source compiles.
+        assert!(
+            SuperResPrograms::get(&renderer)
+                .expect("the init above installs the programs")
+                .cunny_upscale
+                .is_some(),
+            "the upscale program did not survive init"
+        );
+        for (variant_name, variant) in [
+            ("fast", CunnyVariant::Fast),
+            ("3x12", CunnyVariant::ThreeByTwelve),
+        ] {
+            for (pass_index, pass) in variant.passes().iter().enumerate() {
+                for (group, source) in pass.shaders.iter().enumerate() {
+                    if SuperResPrograms::compile_file(
+                        &mut renderer,
+                        "cunny",
+                        source,
+                        &cunny_pass_uniforms(),
+                    )
+                    .is_some()
+                    {
+                        continue;
+                    }
+
+                    let log = renderer
+                        .with_context(|gl| unsafe { compile_log(gl, source) })
+                        .unwrap_or_else(|err| format!("<{err:?}>"));
+                    failures.push(format!(
+                        "{variant_name} pass{} group{group}: {log}",
+                        pass_index + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "the driver refused {} of the passes:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Runs a network over a small source, which is what the uniform declarations are for.
+    ///
+    /// Compiling says nothing about this: a program that was compiled without the uniforms it is
+    /// drawn with compiles fine and then fails every draw, which is how the network came to run on
+    /// every frame and be thrown away on every frame.
+    #[test]
+    fn gpu_cunny_network_runs() {
+        let Some(mut renderer) = surfaceless_renderer() else {
+            return;
+        };
+
+        let size = Size::<i32, Buffer>::from((64, 36));
+
+        // The residuals are half-float, and a context that cannot render to one cannot run the
+        // network at all.
+        let half_float_target: Result<GlesTexture, _> =
+            renderer.create_buffer(Fourcc::Abgr16161616f, size);
+        if half_float_target.is_err() {
+            return;
+        }
+        crate::render_helpers::resources::init(&mut renderer);
+        crate::render_helpers::shaders::init(&mut renderer);
+        init(&mut renderer, None);
+
+        let src_rect = Rectangle::from_size(size.to_f64());
+        let dest = Size::<i32, Physical>::from((size.w * 2, size.h * 2));
+        let dest_buf = dest.to_logical(1).to_buffer(1, Transform::Normal);
+        let upscale = SuperResPrograms::get(&renderer)
+            .unwrap()
+            .cunny_upscale
+            .clone()
+            .expect("the CuNNy upscale shader must compile");
+
+        let render_upscaled = |renderer: &mut GlesRenderer,
+                               source: &GlesTexture,
+                               residuals: &GlesTexture,
+                               out_size: Size<i32, Physical>|
+         -> Vec<u8> {
+            let out_buf = out_size.to_logical(1).to_buffer(1, Transform::Normal);
+            let mut out = renderer.create_buffer(Fourcc::Abgr8888, out_buf).unwrap();
+            {
+                let rect = Rectangle::from_size(out_size);
+                let mut target = renderer.bind(&mut out).unwrap();
+                let mut frame = renderer
+                    .render(&mut target, out_size, Transform::Normal)
+                    .unwrap();
+                frame.clear(Color32F::TRANSPARENT, &[rect]).unwrap();
+                frame
+                    .with_context(|gl| unsafe {
+                        gl.ActiveTexture(ffi::TEXTURE1);
+                        configure_pass_texture(gl, residuals.tex_id(), ffi::NEAREST);
+                        gl.ActiveTexture(ffi::TEXTURE0);
+                    })
+                    .unwrap();
+                frame
+                    .render_texture_from_to(
+                        source,
+                        src_rect,
+                        rect,
+                        &[rect],
+                        &[rect],
+                        Transform::Normal,
+                        1.0,
+                        Some(&upscale),
+                        &[
+                            Uniform::new("niri_tex_size", (size.w as f32, size.h as f32)),
+                            Uniform::new("niri_src_rect", [0.0, 0.0, size.w as f32, size.h as f32]),
+                            Uniform::new(
+                                "niri_footprint",
+                                [
+                                    2.0 * (size.w as f32 / out_size.w as f32),
+                                    2.0 * (size.h as f32 / out_size.h as f32),
+                                ],
+                            ),
+                            Uniform::new("niri_tex1", 1i32),
+                        ],
+                    )
+                    .unwrap();
+                let _ = frame.finish().unwrap();
+            }
+            read_back(renderer, &mut out, out_size)
+        };
+
+        // 1. Flat dark input: an incomplete texture (sampling as (0, 0, 0, 1)) or enabled alpha
+        // blending on the fourth channel turns every (1, 1) sub-pixel white (255) instead of ~50.
+        let flat_pixels = vec![50u8, 50, 50, 255].repeat((size.w * size.h) as usize);
+        let flat_source = renderer
+            .import_memory(&flat_pixels, Fourcc::Abgr8888, size, false)
+            .expect("error importing flat source");
+        let (features, flat_residuals) = run_cunny(
+            &mut renderer,
+            CunnyVariant::Fast,
+            &flat_source,
+            src_rect,
+            size,
+            Transform::Normal,
+            None,
+        )
+        .expect("error running Fast network on flat input");
+        let flat_out = render_upscaled(&mut renderer, &flat_source, &flat_residuals, dest);
+        // Check interior 2x2 blocks away from the border clamp.
+        for y in 8..(dest.h - 8) {
+            for x in 8..(dest.w - 8) {
+                let idx = ((y * dest.w + x) * 4) as usize;
+                for c in 0..3 {
+                    let got = flat_out[idx + c];
+                    assert!(
+                        got.abs_diff(50) <= 3,
+                        "flat input produced checkerboard artifact at ({x}, {y}) ch {c}: got {got}, expected ~50"
+                    );
+                }
+            }
+        }
+
+        // 2. Edge/gradient input: reuse the intermediate textures, verify that the network's
+        // residuals actually take effect (differing from plain bilinear on edges) and that both
+        // 2x and non-integer (<2x) footprints produce bounded output without checkerboard spikes.
+        let pixels = grayscale_pixels(size);
+        let source = renderer
+            .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+            .expect("error importing the source");
+        let (_, residuals) = run_cunny(
+            &mut renderer,
+            CunnyVariant::Fast,
+            &source,
+            src_rect,
+            size,
+            Transform::Normal,
+            Some((features, flat_residuals)),
+        )
+        .expect("error running Fast network on edge input");
+
+        let cunny_2x = render_upscaled(&mut renderer, &source, &residuals, dest);
+        let bilinear_2x = resample(&mut renderer, &source, src_rect, dest, None);
+        let _ = dest_buf;
+        let max_diff = cunny_2x
+            .iter()
+            .zip(bilinear_2x.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff > 0 && max_diff < 120,
+            "expected non-zero bounded residual reconstruction, got max_diff={max_diff}"
+        );
+
+        // Non-integer scale (<2x, so `niri_footprint > 1.0` averages sub-pixels).
+        let dest_1_5x = Size::<i32, Physical>::from((size.w * 3 / 2, size.h * 3 / 2));
+        let cunny_1_5x = render_upscaled(&mut renderer, &source, &residuals, dest_1_5x);
+        let bilinear_1_5x = resample(&mut renderer, &source, src_rect, dest_1_5x, None);
+        let max_diff_1_5x = cunny_1_5x
+            .iter()
+            .zip(bilinear_1_5x.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff_1_5x > 0 && max_diff_1_5x < 120,
+            "expected bounded 1.5x reconstruction, got max_diff={max_diff_1_5x}"
+        );
+
+        // 3. 3x12-NVL variant: verify that the M3x4 input pass and 12x12 shuffle weights produce
+        // non-zero bounded residuals too.
+        let (_, residuals_3x12) = run_cunny(
+            &mut renderer,
+            CunnyVariant::ThreeByTwelve,
+            &source,
+            src_rect,
+            size,
+            Transform::Normal,
+            None,
+        )
+        .expect("error running 3x12 network on edge input");
+        let cunny_3x12_2x = render_upscaled(&mut renderer, &source, &residuals_3x12, dest);
+        let max_diff_3x12 = cunny_3x12_2x
+            .iter()
+            .zip(bilinear_2x.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff_3x12 > 0 && max_diff_3x12 < 120,
+            "expected non-zero bounded 3x12 reconstruction, got max_diff={max_diff_3x12}"
+        );
+    }
+
+    /// Compiles one fragment shader and returns the driver's log for it.
+    ///
+    /// # Safety
+    ///
+    /// Must be called with a current GLES context.
+    unsafe fn compile_log(gl: &ffi::Gles2, source: &str) -> String {
+        let shader = gl.CreateShader(ffi::FRAGMENT_SHADER);
+        let ptr = source.as_ptr().cast();
+        gl.ShaderSource(shader, 1, &ptr, std::ptr::null());
+        gl.CompileShader(shader);
+
+        let mut status = 0;
+        gl.GetShaderiv(shader, ffi::COMPILE_STATUS, &mut status);
+        if status != 0 {
+            gl.DeleteShader(shader);
+            return String::from("(compiled on its own?!)");
+        }
+
+        let mut log = [0u8; 4096];
+        let mut len = 0;
+        gl.GetShaderInfoLog(shader, log.len() as i32, &mut len, log.as_mut_ptr().cast());
+        gl.DeleteShader(shader);
+
+        let len = (len.max(0) as usize).min(log.len());
+        String::from_utf8_lossy(&log[..len]).to_string()
+    }
+
 
     /// A grayscale pattern with hard edges and gradients.
     ///
@@ -2224,6 +3377,7 @@ mod tests {
             color.min(texel_alpha(src, size, x, y))
         }
     }
+
 
     /// Renders a texture through the FSR1 pass and checks both stages against the reference.
     #[test]
