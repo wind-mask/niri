@@ -1138,6 +1138,12 @@ Whether there is anything to magnify depends on the client. One that renders at 
 > [!NOTE]
 > `"cunny2"` reads the client buffer the way the sampling shaders do, so a buffer whose orientation it cannot read, and a renderer where one of the network's passes cannot be compiled or run, both fall back to `"bicubic"`. The log says so.
 
+> [!TIP]
+> niri logs what it does with this effect, which is the quickest way to find out why it does not seem to apply. Run niri with `RUST_LOG=niri=info,niri::render_helpers::superres=debug` to see which algorithm each window ends up with, whether the buffer turned out to be the same size as the display area, when a window gets magnified, and when the resampling actually runs.
+>
+> `"cunny2"` adds a line of its own when it runs a network for a window, and says which one: `super resolution: running the Fast network for window 5, 1600×900`.
+>
+> The same logs are where the passes are timed once per second, which is what makes the algorithms comparable on your own GPU: `super resolution: window 5 fsr1, 2560×1440: easu 0.84 ms in 60 passes + draw 1.12 ms in 60 passes, 118 ms of GPU time in 1000 ms`. `easu` is the offscreen pass that runs whenever the client draws a new frame, `draw` is the final draw, which is where the single-pass algorithms and RCAS run, `network` is a run of a neural network when the algorithm is `"cunny2"`, and the last number is what the effect costs in total as a share of the GPU time available in that second. A network page is occasionally the expensive one of the three, which is what makes the algorithms comparable rather than just curious. Drivers without timer query support (the capability line in the log says `timer = no`) report no numbers.
 
 #### Size Overrides
 

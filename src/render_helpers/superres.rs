@@ -19,10 +19,12 @@
 //! back to the renderer's own sampling instead of failing the frame.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::fmt::{self, Write as _};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use niri_config::{Upscaling, UpscalingAlgorithm, UpscalingMode};
@@ -407,8 +409,9 @@ impl Capabilities {
             texture_half_float_linear: es3 || has_extension("GL_OES_texture_half_float_linear"),
             color_buffer_float: es32 || has_extension("GL_EXT_color_buffer_float"),
             color_buffer_half_float: es3 || has_extension("GL_EXT_color_buffer_half_float"),
-            timer_query: has_extension("GL_EXT_disjoint_timer_query")
-                || has_extension("GL_EXT_disjoint_timer_query_ext"),
+            timer_query: (has_extension("GL_EXT_disjoint_timer_query")
+                || has_extension("GL_EXT_disjoint_timer_query_ext"))
+                && can_time(gl),
             extensions,
         }
     }
@@ -658,7 +661,6 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
     };
 
     info!("super resolution: {}", capabilities.summary());
-    debug!("super resolution capabilities: {capabilities:#?}");
 
     let programs = SuperResPrograms::compile(renderer);
 
@@ -690,6 +692,8 @@ pub struct SuperResElement<R: Renderer> {
     /// When set, draw the content into this rectangle (in the output's logical coordinate space)
     /// instead of the element's own geometry. This is the `magnify` mode.
     magnify: Option<Rectangle<f64, Logical>>,
+    /// Measures how long the passes take, when anything reads the numbers.
+    timings: Arc<Timings>,
 }
 
 /// What an element draws with.
@@ -729,6 +733,7 @@ impl<R: Renderer> SuperResElement<R> {
             inner,
             kernel: ElementKernel::Filter(filter),
             magnify: None,
+            timings: Timings::disabled(),
         }
     }
 
@@ -738,6 +743,7 @@ impl<R: Renderer> SuperResElement<R> {
             inner,
             kernel: ElementKernel::Plain,
             magnify: None,
+            timings: Timings::disabled(),
         }
     }
 
@@ -747,6 +753,11 @@ impl<R: Renderer> SuperResElement<R> {
         self
     }
 
+    /// Measures how long drawing this element takes on the GPU.
+    pub fn with_timings(mut self, timings: Arc<Timings>) -> Self {
+        self.timings = timings;
+        self
+    }
 
     /// Creates an element that draws a CuNNy run's residuals over the client buffer.
     pub fn cunny(
@@ -761,6 +772,7 @@ impl<R: Renderer> SuperResElement<R> {
                 context_id,
             },
             magnify: None,
+            timings: Timings::disabled(),
         }
     }
 
@@ -779,6 +791,7 @@ impl<R: Renderer> SuperResElement<R> {
                 sharpness_scale,
             },
             magnify: None,
+            timings: Timings::disabled(),
         }
     }
 }
@@ -1062,6 +1075,7 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
             return draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache);
         }
 
+        self.timings.begin(frame, Pass::Draw);
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
@@ -1129,6 +1143,7 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
             },
         };
 
+        self.timings.end(frame);
         res
     }
 
@@ -1162,6 +1177,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
             );
         }
 
+        self.timings.begin(frame.as_gles_frame(), Pass::Draw);
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
@@ -1267,6 +1283,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
             }
         };
 
+        self.timings.end(frame.as_gles_frame());
         res
     }
 
@@ -1322,6 +1339,19 @@ struct Fsr1Key {
     size: Size<i32, Physical>,
 }
 
+/// Messages that should be logged once per resolved configuration rather than every frame.
+mod logged {
+    /// The configured algorithm is not implemented.
+    pub const ALGORITHM_FALLBACK: u8 = 1 << 0;
+    /// The offscreen pass failed.
+    pub const PASS_FAILURE: u8 = 1 << 1;
+    /// The client buffer already matches the display area.
+    pub const NOTHING_TO_MAGNIFY: u8 = 1 << 2;
+    /// The offscreen pass cannot run for this window.
+    pub const NO_PASS: u8 = 1 << 3;
+    /// The client buffer is not in an orientation the CuNNy passes can handle.
+    pub const CUNNY_ORIENTATION: u8 = 1 << 4;
+}
 
 /// Returns the damage the element has accumulated since the given commit.
 ///
@@ -1339,23 +1369,34 @@ fn damage_since<R: ImportAll>(
 
 /// Per-window super resolution state.
 ///
-/// This holds the resolved configuration, the cached FSR1 and CuNNy results, and whether we
-/// already explained a fallback, so that a window with an algorithm that is not implemented logs
-/// about it once instead of every frame.
+/// This holds the resolved configuration and the cached FSR1 result. It also remembers which
+/// messages it already logged for the current configuration, so that a window with, say, an
+/// algorithm that is not implemented logs about it once instead of every frame.
+///
+/// Everything here is logged at `debug!` or below, except for the things the user has to know
+/// about (an algorithm that is not implemented, a failing pass), which are logged at `warn!`. The
+/// logger target is this module, so the whole feature can be filtered with, for example,
+/// `RUST_LOG=niri=info,niri::render_helpers::superres=debug`.
 #[derive(Debug)]
 pub struct SuperResolutionPipeline {
     /// The mode, algorithm and sharpness that the current decision was made for.
     resolved: Cell<Option<(UpscalingMode, UpscalingAlgorithm, f32)>>,
-    /// Whether we already logged a fallback for the current decision.
-    warned_fallback: Cell<bool>,
-    /// Whether we already logged that the offscreen pass failed.
-    warned_pass_failure: Cell<bool>,
+    /// Which of the once-per-configuration messages were already logged.
+    logged: Cell<u8>,
     /// Cached result of the EASU pass.
     fsr1: RefCell<Option<Fsr1Result>>,
     /// Cached result of a CuNNy run.
     cunny: RefCell<Option<(CunnyKey, CunnyResult)>>,
     /// The size that this window's content is magnified into, when it is being magnified.
+    ///
+    /// This is here rather than in the window so that everything about the effect, including its
+    /// log messages, is under this module's target, which is what the log filter in the wiki
+    /// enables.
     magnify_target: Cell<Option<Size<i32, Logical>>>,
+    /// How long this window's passes take on the GPU.
+    ///
+    /// Shared with the elements that draw the window, which is what measures the final draw.
+    timings: Arc<Timings>,
 }
 
 /// Which CuNNy network to run.
@@ -1615,6 +1656,7 @@ fn run_cunny(
     src: Rectangle<f64, Buffer>,
     tex_size: Size<i32, Buffer>,
     transform: Transform,
+    timings: &Timings,
     reuse: Option<(Vec<GlesTexture>, GlesTexture)>,
 ) -> anyhow::Result<(Vec<GlesTexture>, GlesTexture)> {
     // The source rect in the client buffer's texels, which is the size the features have.
@@ -1698,6 +1740,16 @@ fn run_cunny(
                         format!("error starting pass {pass_number} group {group_number}")
                     })?;
 
+                // A run is measured as a whole: what a user has to weigh is what running the network
+                // costs, and the passes are short enough that timing each of them separately would
+                // mostly measure the queries. The draw that applies the residuals is measured on its
+                // own, since it happens once per composited frame rather than once per client frame.
+                let first = pass_index == 0 && group == 0;
+                let last =
+                    pass_index + 1 == variant.passes().len() && group + 1 == pass.shaders.len();
+                if first {
+                    timings.begin(&mut frame, Pass::Network);
+                }
 
                 // The first input is drawn, so the renderer binds it as `tex`; the others are bound
                 // to the texture units after it, which is the only way to reach more than one
@@ -1743,6 +1795,9 @@ fn run_cunny(
                         &uniforms,
                     )
                     .with_context(|| format!("error in pass {pass_number} group {group_number}"))?;
+                if last {
+                    timings.end(&mut frame);
+                }
                 let _ = frame.finish().with_context(|| {
                     format!("error finishing pass {pass_number} group {group_number}")
                 })?;
@@ -1871,15 +1926,341 @@ fn cunny_uniforms(
     rv
 }
 
+/// Which pass is being measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// The EASU pass, which runs offscreen whenever the window's buffer changes.
+    Easu,
+    /// The final draw: the resampling filter, or RCAS over the cached EASU result.
+    Draw,
+    /// A run of a neural network, all of its passes together.
+    Network,
+}
+
+impl Pass {
+    /// Every pass, in the order they are logged.
+    const ALL: [Pass; 3] = [Pass::Easu, Pass::Draw, Pass::Network];
+
+    fn name(self) -> &'static str {
+        match self {
+            Pass::Easu => "easu",
+            Pass::Draw => "draw",
+            Pass::Network => "network",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Pass::Easu => 0,
+            Pass::Draw => 1,
+            Pass::Network => 2,
+        }
+    }
+}
+
+/// What one pass took over the last interval.
+#[derive(Debug, Clone, Copy)]
+pub struct PassReport {
+    /// Which pass this is.
+    pub pass: Pass,
+    /// Average GPU time of a single pass.
+    pub average: Duration,
+    /// How many passes were measured.
+    pub count: u64,
+}
+
+/// What the passes took over the last interval.
+#[derive(Debug, Clone)]
+pub struct Report {
+    /// How long the interval was.
+    pub interval: Duration,
+    /// One entry per pass that ran, in the order they are logged.
+    pub passes: Vec<PassReport>,
+}
+
+impl Report {
+    /// How much GPU time the passes took in total over the interval.
+    pub fn total(&self) -> Duration {
+        self.passes
+            .iter()
+            .map(|pass| pass.average * u32::try_from(pass.count).unwrap_or(u32::MAX))
+            .sum()
+    }
+}
+
+/// Formats what the passes took, for the log.
+fn format_timings(report: &Report) -> String {
+    let mut rv = String::new();
+
+    for (index, pass) in report.passes.iter().enumerate() {
+        if index > 0 {
+            rv.push_str(" + ");
+        }
+
+        let _ = write!(
+            rv,
+            "{name} {average:.2} ms in {count} pass{plural}",
+            name = pass.pass.name(),
+            average = pass.average.as_secs_f64() * 1000.,
+            count = pass.count,
+            plural = if pass.count == 1 { "" } else { "es" },
+        );
+    }
+
+    let _ = write!(
+        rv,
+        ", {total:.0} ms of GPU time in {interval} ms",
+        total = report.total().as_secs_f64() * 1000.,
+        interval = report.interval.as_millis(),
+    );
+
+    rv
+}
+
+/// How long to accumulate results before logging them.
+const TIMING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How many results to keep waiting for before giving up on the driver handing them back.
+const MAX_PENDING: usize = 64;
+
+/// Measures how long a pass takes on the GPU.
+///
+/// Timer queries are asynchronous: a result is only there a few frames after the pass it measured,
+/// so results are read when the driver has them and skipped otherwise, which is what keeps this
+/// from stalling the frame. What has been measured is logged once per interval, so the numbers are
+/// averages over that interval.
+#[derive(Debug)]
+pub struct Timings {
+    /// Whether this window measures at all.
+    enabled: bool,
+    inner: Mutex<Inner>,
+}
+
+impl Timings {
+    /// Returns timings that measure nothing, for elements that are built without a pipeline.
+    fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            enabled: false,
+            inner: Mutex::new(Inner::default()),
+        })
+    }
+
+    /// Returns timings for a window, measured whenever the driver can and anything reads them.
+    fn for_window() -> Arc<Self> {
+        Arc::new(Self {
+            enabled: true,
+            inner: Mutex::new(Inner::default()),
+        })
+    }
+
+    /// Notes the GL context the passes run in, giving up on what was measured in a different one.
+    ///
+    /// The context is identified by the address of its `EGLContext`, which lives inside the
+    /// renderer for as long as the context does. Rendering to several GPUs at once means the
+    /// passes run in more than one context, and then this keeps resetting, which is why such a
+    /// setup does not report timings.
+    fn set_context(&self, context: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.context != Some(context) {
+            // GL objects do not outlive their context, so the query names do not have to be
+            // deleted here.
+            *inner = Inner {
+                context: Some(context),
+                ..Default::default()
+            };
+        }
+    }
+
+    /// Starts measuring a pass. Every call has to be followed by [`Timings::end`].
+    fn begin(&self, frame: &mut GlesFrame<'_, '_>, pass: Pass) {
+        // Measuring costs GL calls and, on some drivers, flushes work. Only do it when the numbers
+        // are going to be logged anyway, and when the driver can measure at all.
+        if !self.enabled || !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        if !matches!(frame.with_context(can_time), Ok(true)) {
+            return;
+        }
+
+        self.set_context(context_address(frame.egl_context()));
+
+        let mut inner = self.inner.lock().unwrap();
+
+        // Read what the driver has ready: a result shows up a few frames later, and reading them
+        // here means that no pass ever waits for its own result.
+        let _ = frame.with_context(|gl| inner.collect(gl));
+
+        // If a query is somehow still running, close it here: leaving it active would make every
+        // later measurement fail.
+        if let Some((pass, query)) = inner.started.take() {
+            let _ = frame.with_context(|gl| unsafe { gl.EndQueryEXT(ffi::TIME_ELAPSED_EXT) });
+            inner.pending.push_back((pass, query));
+        }
+
+        let mut query = 0;
+        let _ = frame.with_context(|gl| unsafe { gl.GenQueriesEXT(1, &mut query) });
+        if query == 0 {
+            return;
+        }
+
+        let _ = frame.with_context(|gl| unsafe { gl.BeginQueryEXT(ffi::TIME_ELAPSED_EXT, query) });
+        inner.started = Some((pass, query));
+    }
+
+    /// Finishes measuring a pass. Does nothing when nothing was started.
+    fn end(&self, frame: &mut GlesFrame<'_, '_>) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some((pass, query)) = inner.started.take() else {
+            return;
+        };
+
+        let _ = frame.with_context(|gl| unsafe { gl.EndQueryEXT(ffi::TIME_ELAPSED_EXT) });
+        inner.pending.push_back((pass, query));
+    }
+
+    /// Returns what to log for the interval that just ended, if anything was measured.
+    fn take_report(&self) -> Option<Report> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.report(Instant::now(), TIMING_INTERVAL)
+    }
+}
+
+/// Returns whether the driver can measure passes with timer queries.
+///
+/// A GL entry point that is not there cannot be called at all, so nothing may use the query
+/// functions before this says that they are all loaded.
+fn can_time(gl: &ffi::Gles2) -> bool {
+    gl.GenQueriesEXT.is_loaded()
+        && gl.BeginQueryEXT.is_loaded()
+        && gl.EndQueryEXT.is_loaded()
+        && gl.DeleteQueriesEXT.is_loaded()
+        && gl.GetQueryObjectuivEXT.is_loaded()
+        && gl.GetQueryObjectui64vEXT.is_loaded()
+}
+
+/// The address of a GL context, to tell contexts apart.
+fn context_address(context: &smithay::backend::egl::EGLContext) -> usize {
+    std::ptr::from_ref(context) as usize
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    /// The GL context that the queries belong to.
+    context: Option<usize>,
+    /// The query that is being filled in right now, if a pass is being measured.
+    started: Option<(Pass, u32)>,
+    /// Queries that are waiting for their result, oldest first.
+    pending: VecDeque<(Pass, u32)>,
+    /// Accumulated results of the current interval.
+    totals_ns: [u64; Pass::ALL.len()],
+    /// How many results went into each total.
+    counts: [u64; Pass::ALL.len()],
+    /// When the first result of the interval arrived.
+    interval_start: Option<Instant>,
+    /// Results that had to be dropped, which means the numbers are incomplete.
+    dropped: u64,
+}
+
+impl Inner {
+    /// Reads the results that the driver has ready.
+    ///
+    /// Results come back in the order the passes were submitted, so this stops at the first query
+    /// that is not ready yet.
+    fn collect(&mut self, gl: &ffi::Gles2) {
+        // If the GPU hiccuped, the results that are in flight do not mean anything.
+        let mut disjoint = 0;
+        unsafe { gl.GetIntegerv(ffi::GPU_DISJOINT_EXT, &mut disjoint) };
+        if disjoint != 0 {
+            for (_, query) in self.pending.drain(..) {
+                unsafe { gl.DeleteQueriesEXT(1, &query) };
+            }
+            self.dropped += 1;
+            return;
+        }
+
+        while let Some(&(pass, query)) = self.pending.front() {
+            let mut available = 0;
+            unsafe {
+                gl.GetQueryObjectuivEXT(query, ffi::QUERY_RESULT_AVAILABLE_EXT, &mut available)
+            };
+            if available == 0 {
+                break;
+            }
+
+            let mut ns = 0;
+            unsafe { gl.GetQueryObjectui64vEXT(query, ffi::QUERY_RESULT_EXT, &mut ns) };
+            unsafe { gl.DeleteQueriesEXT(1, &query) };
+
+            self.pending.pop_front();
+            self.record(pass, ns, Instant::now());
+        }
+
+        // Rather than piling up results that the driver never hands back, give up on the oldest.
+        while self.pending.len() > MAX_PENDING {
+            let (_, query) = self.pending.pop_front().unwrap();
+            unsafe { gl.DeleteQueriesEXT(1, &query) };
+            self.dropped += 1;
+        }
+    }
+
+    /// Adds one measured pass to the interval.
+    fn record(&mut self, pass: Pass, ns: u64, now: Instant) {
+        if self.interval_start.is_none() {
+            self.interval_start = Some(now);
+        }
+
+        let index = pass.index();
+        self.totals_ns[index] += ns;
+        self.counts[index] += 1;
+    }
+
+    /// Returns what to log for the interval that just ended, and starts a new interval.
+    ///
+    /// `min_interval` is how long to accumulate before logging at all; tests pass zero to get what
+    /// has been measured right away.
+    fn report(&mut self, now: Instant, min_interval: Duration) -> Option<Report> {
+        let start = self.interval_start?;
+        let interval = now.duration_since(start);
+        if interval < min_interval {
+            return None;
+        }
+
+        let mut passes = Vec::new();
+        for pass in Pass::ALL {
+            let index = pass.index();
+            let count = self.counts[index];
+            if count == 0 {
+                continue;
+            }
+
+            passes.push(PassReport {
+                pass,
+                average: Duration::from_nanos(self.totals_ns[index] / count),
+                count,
+            });
+        }
+
+        self.totals_ns = Default::default();
+        self.counts = Default::default();
+        self.interval_start = Some(now);
+
+        if passes.is_empty() {
+            return None;
+        }
+
+        Some(Report { interval, passes })
+    }
+}
+
 impl SuperResolutionPipeline {
     pub fn new() -> Self {
         Self {
             resolved: Cell::new(None),
-            warned_fallback: Cell::new(false),
-            warned_pass_failure: Cell::new(false),
+            logged: Cell::new(0),
             fsr1: RefCell::new(None),
             cunny: RefCell::new(None),
             magnify_target: Cell::new(None),
+            timings: Timings::for_window(),
         }
     }
 
@@ -1887,11 +2268,12 @@ impl SuperResolutionPipeline {
     ///
     /// This returns `None` when the window rules do not enable super resolution, in which case
     /// the window should be drawn the normal way.
-    pub fn kernel(&self, rules: &Upscaling) -> Option<SuperResKernel> {
+    pub fn kernel(&self, rules: &Upscaling, id: u64) -> Option<SuperResKernel> {
         if !rules.enabled() {
             if self.resolved.take().is_some() {
                 self.fsr1.borrow_mut().take();
                 self.cunny.borrow_mut().take();
+                debug!("super resolution: window {id} back to the renderer's own sampling");
             }
             return None;
         }
@@ -1903,29 +2285,61 @@ impl SuperResolutionPipeline {
 
         if self.resolved.get() != Some((mode, algorithm, sharpness as f32)) {
             self.resolved.set(Some((mode, algorithm, sharpness as f32)));
-            self.warned_fallback.set(false);
-            self.warned_pass_failure.set(false);
+            self.logged.set(0);
             // The parameters may have changed, so the cached result may no longer match.
             self.fsr1.borrow_mut().take();
             self.cunny.borrow_mut().take();
+
+            debug!("super resolution: window {id} uses {kernel}");
         }
 
-        if !self.warned_fallback.get() {
-            self.warned_fallback.set(true);
-
-            if fell_back {
-                warn!(
-                    "super resolution: algorithm {algorithm:?} is not implemented yet, using {kernel}"
-                );
-            }
+        if self.log_once(logged::ALGORITHM_FALLBACK) && fell_back {
+            warn!(
+                "super resolution: algorithm {algorithm:?} is not implemented yet, using {kernel}"
+            );
         }
 
         Some(kernel)
     }
 
+    /// Returns whether the message behind `flag` should be logged now, and remembers it.
+    fn log_once(&self, flag: u8) -> bool {
+        let logged = self.logged.get();
+        if logged & flag != 0 {
+            return false;
+        }
+
+        self.logged.set(logged | flag);
+        true
+    }
+
     /// Records that this window's content is magnified into `target`, or that it is not anymore.
-    pub fn set_magnify_target(&self, target: Option<Size<i32, Logical>>) {
+    ///
+    /// `content` is the client's own size, which it keeps in this mode. Everything is logged here
+    /// so that the whole feature can be followed with one filter.
+    pub fn set_magnify_target(
+        &self,
+        id: u64,
+        content: Size<i32, Logical>,
+        target: Option<Size<i32, Logical>>,
+    ) {
+        if self.magnify_target.get() == target {
+            return;
+        }
+
         self.magnify_target.set(target);
+
+        match target {
+            Some(target) => debug!(
+                "super resolution: magnifying window {id}: its content stays {w}×{h} \
+                 and is drawn into {tw}×{th}",
+                w = content.w,
+                h = content.h,
+                tw = target.w,
+                th = target.h,
+            ),
+            None => debug!("super resolution: window {id} is not magnified anymore"),
+        }
     }
 
     /// Returns the size that this window's content is magnified into, if it is being magnified.
@@ -1934,12 +2348,14 @@ impl SuperResolutionPipeline {
     }
 
     /// Returns a network's residuals for this window, running it if the cached result is stale.
+
     fn cunny_result<R: NiriRenderer>(
         &self,
         renderer: &mut GlesRenderer,
         variant: CunnyVariant,
         elem: &WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
+        id: u64,
     ) -> Option<CunnyResult>
     where
         R::TextureId: PassSource,
@@ -1949,6 +2365,12 @@ impl SuperResolutionPipeline {
         if elem.transform() != Transform::Normal
             || buffer_y_inverted(elem.buffer()).unwrap_or(false)
         {
+            if self.log_once(logged::CUNNY_ORIENTATION) {
+                debug!(
+                    "super resolution: window {id} has a buffer the {variant:?} network cannot \
+                     read, drawing it with the resampling kernels"
+                );
+            }
             return None;
         }
 
@@ -1969,6 +2391,7 @@ impl SuperResolutionPipeline {
             let cache = self.cunny.borrow();
             if let Some((cached, result)) = cache.as_ref() {
                 if *cached == key && result.context_id == renderer.context_id() {
+                    trace!("super resolution: reusing the {variant:?} result for window {id}");
                     return Some(result.clone());
                 }
 
@@ -1995,6 +2418,12 @@ impl SuperResolutionPipeline {
         let source = texture.pass_texture(&renderer.context_id())?;
         let tex_size = source.size();
 
+        trace!(
+            "super resolution: running the {variant:?} network for window {id}, {w}×{h}",
+            w = size.w,
+            h = size.h,
+        );
+
         let reuse = self
             .cunny
             .borrow_mut()
@@ -2011,12 +2440,13 @@ impl SuperResolutionPipeline {
             src,
             tex_size,
             elem.transform(),
+            &self.timings,
             reuse,
         ) {
             Ok(out) => out,
             Err(err) => {
-                if !self.warned_pass_failure.replace(true) {
-                    warn!("super resolution: error running the pass: {err:?}");
+                if self.log_once(logged::PASS_FAILURE) {
+                    warn!("super resolution: error running the pass for window {id}: {err:?}");
                 }
                 return None;
             }
@@ -2037,12 +2467,14 @@ impl SuperResolutionPipeline {
     /// scale that the element is drawn at. The returned element falls back to drawing the client
     /// buffer normally when the pass cannot run or when its result is not valid for the renderer
     /// that ends up drawing it.
+    #[allow(clippy::too_many_arguments)]
     pub fn element<R: NiriRenderer>(
         &self,
         renderer: &mut GlesRenderer,
         elem: WaylandSurfaceRenderElement<R>,
         kernel: SuperResKernel,
         scale: Scale<f64>,
+        id: u64,
         magnify: Option<Rectangle<f64, Logical>>,
     ) -> SuperResElement<R>
     where
@@ -2055,6 +2487,11 @@ impl SuperResolutionPipeline {
             None => elem.geometry(scale).size,
         };
 
+        // The passes run in this renderer's context, which is where their timings belong.
+        self.timings
+            .set_context(context_address(renderer.egl_context()));
+        self.log_timings(id, kernel, dest_size);
+
         // A buffer that already matches its display area has nothing for the effect to recover: the
         // client is rendering at the physical resolution of the output, which is what Wayland
         // clients that handle fractional scaling do. There is at most a pixel in it, so draw the
@@ -2062,25 +2499,46 @@ impl SuperResolutionPipeline {
         // magnify mode is a different thing, since its content is drawn into a bigger area on
         // purpose.
         if magnify.is_none() && !has_something_to_magnify(elem.src().size, dest_size) {
+            let src = elem.src().size;
+            if self.log_once(logged::NOTHING_TO_MAGNIFY) {
+                debug!(
+                    "super resolution: window {id} has nothing to magnify: \
+                     the buffer is {src_w}×{src_h} and the display area is {dst_w}×{dst_h}, \
+                     drawing it the normal way",
+                    src_w = src.w as i32,
+                    src_h = src.h as i32,
+                    dst_w = dest_size.w,
+                    dst_h = dest_size.h,
+                );
+            }
+
             return SuperResElement::plain(elem);
         }
 
         let params = match kernel {
             SuperResKernel::Cunny(variant) => {
-                let Some(result) = self.cunny_result(renderer, variant, &elem, scale) else {
+                let Some(result) = self.cunny_result(renderer, variant, &elem, scale, id) else {
+                    if self.log_once(logged::NO_PASS) {
+                        debug!(
+                            "super resolution: cannot run {kernel} for window {id}, \
+                             drawing it with {kernel_alt}",
+                            kernel_alt = SuperResKernel::Filter(ResampleFilter::Bicubic),
+                        );
+                    }
+
                     // Fall back to the best single-pass kernel that we have, still magnifying.
                     let mut element = SuperResElement::new(elem, ResampleFilter::Bicubic);
                     if let Some(rect) = magnify {
                         element = element.with_magnify(rect);
                     }
-                    return element;
+                    return element.with_timings(self.timings.clone());
                 };
 
                 let mut element = SuperResElement::cunny(elem, result.texture, result.context_id);
                 if let Some(rect) = magnify {
                     element = element.with_magnify(rect);
                 }
-                return element;
+                return element.with_timings(self.timings.clone());
             }
             SuperResKernel::Filter(filter) => {
                 let mut element = SuperResElement::new(elem, filter);
@@ -2088,18 +2546,26 @@ impl SuperResolutionPipeline {
                     Some(rect) => element.with_magnify(rect),
                     None => element,
                 };
-                return element;
+                return element.with_timings(self.timings.clone());
             }
             SuperResKernel::Fsr1(params) => params,
         };
 
-        let Some(texture) = self.fsr1_result(renderer, &elem, dest_size, scale) else {
+        let Some(texture) = self.fsr1_result(renderer, &elem, dest_size, scale, id) else {
+            if self.log_once(logged::NO_PASS) {
+                debug!(
+                    "super resolution: cannot run {kernel} for window {id}, \
+                     drawing it with {kernel_alt}",
+                    kernel_alt = SuperResKernel::Filter(ResampleFilter::Bicubic),
+                );
+            }
+
             // Fall back to the best single-pass kernel that we have, still magnifying.
             let mut element = SuperResElement::new(elem, ResampleFilter::Bicubic);
             if let Some(rect) = magnify {
                 element = element.with_magnify(rect);
             }
-            return element;
+            return element.with_timings(self.timings.clone());
         };
 
         let mut element = SuperResElement::fsr1(
@@ -2111,8 +2577,23 @@ impl SuperResolutionPipeline {
         if let Some(rect) = magnify {
             element = element.with_magnify(rect);
         }
-        element
+        element.with_timings(self.timings.clone())
     }
+
+    /// Logs how long this window's passes took, once per interval.
+    fn log_timings(&self, id: u64, kernel: SuperResKernel, size: Size<i32, Physical>) {
+        let Some(report) = self.timings.take_report() else {
+            return;
+        };
+
+        debug!(
+            "super resolution: window {id} {kernel}, {w}×{h}: {timings}",
+            w = size.w,
+            h = size.h,
+            timings = format_timings(&report),
+        );
+    }
+
 
     /// Returns the cached EASU result, running the pass if it is stale.
     fn fsr1_result<R: NiriRenderer>(
@@ -2121,6 +2602,7 @@ impl SuperResolutionPipeline {
         elem: &WaylandSurfaceRenderElement<R>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
+        id: u64,
     ) -> Option<Fsr1Result>
     where
         R::TextureId: PassSource,
@@ -2142,6 +2624,13 @@ impl SuperResolutionPipeline {
             if let Some(result) = cache.as_ref() {
                 if result.key == key && result.context_id == renderer.context_id() {
                     // The cached result is still what this window would be drawn with.
+                    trace!(
+                        "super resolution: reusing the result for window {id}, \
+                         {w}×{h}",
+                        w = size.w,
+                        h = size.h,
+                    );
+
                     return Some(Fsr1Result {
                         texture: result.texture.clone(),
                         context_id: result.context_id.clone(),
@@ -2156,6 +2645,7 @@ impl SuperResolutionPipeline {
                     && result.context_id == renderer.context_id()
                     && damage_since(elem, scale, result.key.commit).is_empty()
                 {
+
                     return Some(Fsr1Result {
                         texture: result.texture.clone(),
                         context_id: result.context_id.clone(),
@@ -2164,6 +2654,17 @@ impl SuperResolutionPipeline {
                 }
             }
         }
+
+        trace!(
+            "super resolution: resampling window {id}, {src_w}×{src_h} -> {dst_w}×{dst_h} \
+             (×{ratio:.3}, {reason})",
+            src_w = src.size.w as i32,
+            src_h = src.size.h as i32,
+            dst_w = size.w,
+            dst_h = size.h,
+            ratio = f64::from(size.w) / src.size.w,
+            reason = self.cache_miss_reason(&key, renderer),
+        );
 
         let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
             return None;
@@ -2181,11 +2682,12 @@ impl SuperResolutionPipeline {
             elem.transform(),
             &program,
             &uniforms,
+            &self.timings,
         ) {
             Ok(texture) => texture,
             Err(err) => {
-                if !self.warned_pass_failure.replace(true) {
-                    warn!("super resolution: error running the pass: {err:?}");
+                if self.log_once(logged::PASS_FAILURE) {
+                    warn!("super resolution: error running the pass for window {id}: {err:?}");
                 }
                 return None;
             }
@@ -2207,6 +2709,28 @@ impl SuperResolutionPipeline {
     }
 }
 
+impl SuperResolutionPipeline {
+    /// Explains why the cached EASU result cannot be reused.
+    fn cache_miss_reason(&self, key: &Fsr1Key, renderer: &GlesRenderer) -> &'static str {
+        let cache = self.fsr1.borrow();
+        let Some(result) = cache.as_ref() else {
+            return "no cached result";
+        };
+
+        if result.context_id != renderer.context_id() {
+            "different renderer context"
+        } else if result.key.commit != key.commit {
+            "new source commit"
+        } else if result.key.src != key.src {
+            "different source rect"
+        } else if result.key.size != key.size {
+            "different display size"
+        } else {
+            "unknown"
+        }
+    }
+}
+
 /// Runs the EASU pass: renders the client buffer into an offscreen texture at the display size.
 #[allow(clippy::too_many_arguments)]
 fn run_easu_pass(
@@ -2217,6 +2741,7 @@ fn run_easu_pass(
     transform: Transform,
     program: &GlesTexProgram,
     uniforms: &[Uniform<'static>],
+    timings: &Timings,
 ) -> anyhow::Result<GlesTexture> {
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     let mut texture = renderer
@@ -2233,23 +2758,32 @@ fn run_easu_pass(
             .render(&mut target, size, Transform::Normal)
             .context("error starting frame")?;
 
-        frame
+        // The whole offscreen pass is measured, including the clear: it is the cost of running
+        // EASU for one client frame.
+        timings.begin(&mut frame, Pass::Easu);
+
+        let mut result = frame
             .clear(Color32F::TRANSPARENT, &[rect])
-            .context("error clearing")?;
-        frame
-            .render_texture_from_to(
-                source,
-                src,
-                rect,
-                &[rect],
-                &[rect],
-                transform,
-                // The element alpha is applied by the sharpening pass.
-                1.0,
-                Some(program),
-                uniforms,
-            )
-            .context("error in the EASU pass")?;
+            .context("error clearing");
+        if result.is_ok() {
+            result = frame
+                .render_texture_from_to(
+                    source,
+                    src,
+                    rect,
+                    &[rect],
+                    &[rect],
+                    transform,
+                    // The element alpha is applied by the sharpening pass.
+                    1.0,
+                    Some(program),
+                    uniforms,
+                )
+                .context("error in the EASU pass");
+        }
+
+        timings.end(&mut frame);
+        result?;
 
         let _ = frame.finish().context("error finishing frame")?;
     }
@@ -2340,7 +2874,7 @@ mod tests {
     #[test]
     fn pipeline_disabled_by_default() {
         let pipeline = SuperResolutionPipeline::new();
-        assert_eq!(pipeline.kernel(&Upscaling::default()), None);
+        assert_eq!(pipeline.kernel(&Upscaling::default(), 1), None);
     }
 
     #[test]
@@ -2354,7 +2888,7 @@ mod tests {
             virtual_size: None,
         };
         assert_eq!(
-            pipeline.kernel(&rules),
+            pipeline.kernel(&rules, 1),
             Some(SuperResKernel::Filter(ResampleFilter::Bilinear))
         );
     }
@@ -2370,7 +2904,7 @@ mod tests {
             virtual_size: None,
         };
         assert_eq!(
-            pipeline.kernel(&rules),
+            pipeline.kernel(&rules, 1),
             Some(SuperResKernel::Filter(ResampleFilter::Bicubic))
         );
     }
@@ -2386,7 +2920,7 @@ mod tests {
             virtual_size: None,
         };
         assert_eq!(
-            pipeline.kernel(&rules),
+            pipeline.kernel(&rules, 1),
             Some(SuperResKernel::Fsr1(Fsr1Params { sharpness: 1.0 }))
         );
     }
@@ -2401,7 +2935,7 @@ mod tests {
             client_scale: None,
             virtual_size: None,
         };
-        assert_eq!(pipeline.kernel(&rules), None);
+        assert_eq!(pipeline.kernel(&rules, 1), None);
     }
     // The kernels are verified on a real GL context below. These tests need an EGL device, so
     // they return early when there is not one (for example on a machine with no GPU access); the
@@ -2666,6 +3200,51 @@ mod tests {
         assert!(!has_something_to_magnify(Size::from((3840., 2160.)), area));
     }
 
+    #[test]
+    fn timing_report_aggregates_and_resets() {
+        let start = Instant::now();
+        let mut inner = Inner::default();
+
+        // Results come back a few frames after the pass, so there is nothing to log yet.
+        assert!(inner
+            .report(start + Duration::from_millis(500), TIMING_INTERVAL)
+            .is_none());
+
+        inner.record(Pass::Easu, 1_000_000, start);
+        inner.record(Pass::Easu, 5_000_000, start);
+        inner.record(Pass::Draw, 2_000_000, start);
+
+        let report = inner
+            .report(start + Duration::from_millis(1500), TIMING_INTERVAL)
+            .expect("expected a report");
+        assert_eq!(report.passes.len(), 2);
+        assert_eq!(report.passes[0].pass, Pass::Easu);
+        assert_eq!(report.passes[0].count, 2);
+        assert_eq!(report.passes[0].average, Duration::from_millis(3));
+        assert_eq!(report.passes[1].pass, Pass::Draw);
+        assert_eq!(report.passes[1].average, Duration::from_millis(2));
+        assert_eq!(report.total(), Duration::from_millis(8));
+        assert_eq!(report.interval, Duration::from_millis(1500));
+        assert_eq!(
+            format_timings(&report),
+            "easu 3.00 ms in 2 passes + draw 2.00 ms in 1 pass, 8 ms of GPU time in 1500 ms"
+        );
+
+        // What has been logged is not logged again, and the next interval starts over.
+        assert!(inner
+            .report(start + Duration::from_millis(1600), TIMING_INTERVAL)
+            .is_none());
+        assert_eq!(inner.counts, [0, 0, 0]);
+
+        // The interval that was just logged starts a new one.
+        inner.record(Pass::Easu, 1_000_000, start + Duration::from_millis(2000));
+        let report = inner
+            .report(start + Duration::from_millis(2600), TIMING_INTERVAL)
+            .expect("expected a report");
+        assert_eq!(report.passes[0].count, 1);
+        assert_eq!(report.passes[0].average, Duration::from_millis(1));
+        assert_eq!(report.interval, Duration::from_millis(1100));
+    }
 
     #[test]
     fn magnify_contain_fits_and_centers() {
@@ -2928,6 +3507,7 @@ mod tests {
         crate::render_helpers::shaders::init(&mut renderer);
         init(&mut renderer, None);
 
+        let timings = Timings::disabled();
         let src_rect = Rectangle::from_size(size.to_f64());
         let dest = Size::<i32, Physical>::from((size.w * 2, size.h * 2));
         let dest_buf = dest.to_logical(1).to_buffer(1, Transform::Normal);
@@ -3000,6 +3580,7 @@ mod tests {
             src_rect,
             size,
             Transform::Normal,
+            &timings,
             None,
         )
         .expect("error running Fast network on flat input");
@@ -3032,6 +3613,7 @@ mod tests {
             src_rect,
             size,
             Transform::Normal,
+            &timings,
             Some((features, flat_residuals)),
         )
         .expect("error running Fast network on edge input");
@@ -3074,6 +3656,7 @@ mod tests {
             src_rect,
             size,
             Transform::Normal,
+            &timings,
             None,
         )
         .expect("error running 3x12 network on edge input");
@@ -3117,6 +3700,78 @@ mod tests {
         String::from_utf8_lossy(&log[..len]).to_string()
     }
 
+    /// Measures a real pass with timer queries, the way a session does.
+    #[test]
+    fn gpu_timings_measure_a_pass() {
+        let Some(mut renderer) = surfaceless_renderer() else {
+            return;
+        };
+
+        crate::render_helpers::resources::init(&mut renderer);
+        crate::render_helpers::shaders::init(&mut renderer);
+        init(&mut renderer, None);
+
+        // Drivers that cannot measure have nothing to report, and that is not a failure here.
+        if !renderer.with_context(can_time).unwrap_or(false) {
+            return;
+        }
+
+        let src_size = Size::from((8, 8));
+        let pixels = grayscale_pixels(src_size);
+        let texture = renderer
+            .import_memory(&pixels, Fourcc::Abgr8888, src_size, false)
+            .unwrap();
+
+        let src_rect = Rectangle::from_size(src_size.to_f64());
+        let dest = Size::<i32, Physical>::from((16, 16));
+
+        let programs = SuperResPrograms::get(&renderer).unwrap();
+        let easu = programs.easu.clone().expect("the EASU shader must compile");
+        let uniforms = resample_uniforms(&texture, src_rect, false).unwrap();
+
+        // The passes are only measured when their log line would be visible, so pretend that it is.
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+
+        let report = tracing::subscriber::with_default(subscriber, || {
+            let timings = Arc::new(Timings {
+                enabled: true,
+                inner: Mutex::new(Inner::default()),
+            });
+
+            // A result is read when the driver hands it back, which is what a later pass does, so
+            // run a few passes. The test cannot wait for frames, so make the GPU finish instead.
+            for _ in 0..4 {
+                run_easu_pass(
+                    &mut renderer,
+                    &texture,
+                    src_rect,
+                    dest,
+                    Transform::Normal,
+                    &easu,
+                    &uniforms,
+                    &timings,
+                )
+                .unwrap();
+
+                let _ = renderer.with_context(|gl| unsafe { gl.Finish() });
+            }
+
+            let mut inner = timings.inner.lock().unwrap();
+            inner.report(Instant::now(), Duration::ZERO)
+        });
+
+        let report = report.expect("expected the passes to be measured");
+        assert_eq!(report.passes.len(), 1);
+        assert_eq!(report.passes[0].pass, Pass::Easu);
+        assert!(report.passes[0].count >= 1, "{report:?}");
+        assert!(report.passes[0].average > Duration::ZERO, "{report:?}");
+        assert!(
+            report.passes[0].average < Duration::from_secs(1),
+            "{report:?}"
+        );
+    }
 
     /// A grayscale pattern with hard edges and gradients.
     ///
@@ -3378,6 +4033,104 @@ mod tests {
         }
     }
 
+    /// A writer that collects the log output of a test.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Checks that the effect explains itself once per configuration change, and not per frame.
+    #[test]
+    fn pipeline_logs_once_per_change() {
+        let log = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let pipeline = SuperResolutionPipeline::new();
+            let fsr1 = Upscaling {
+                mode: None,
+                algorithm: Some(UpscalingAlgorithm::Fsr1),
+                sharpness: Some(0.4),
+                client_scale: None,
+                virtual_size: None,
+            };
+
+            // Called for every frame, so it must only log when the result changes.
+            for _ in 0..3 {
+                assert_eq!(
+                    pipeline.kernel(&fsr1, 42),
+                    Some(SuperResKernel::Fsr1(Fsr1Params { sharpness: 0.4 }))
+                );
+            }
+            let logged = log.contents();
+            assert_eq!(
+                logged
+                    .lines()
+                    .filter(|line| line.contains("window 42 uses"))
+                    .count(),
+                1,
+                "{logged}"
+            );
+            assert!(logged.contains("fsr1 (sharpness 0.4)"), "{logged}");
+            assert!(logged.contains("window 42"), "{logged}");
+
+            // Changing the sharpness is a different configuration.
+            let sharper = Upscaling {
+                sharpness: Some(0.1),
+                ..fsr1
+            };
+            let _ = pipeline.kernel(&sharper, 42);
+
+            // Turning the effect off says so.
+            let off = Upscaling {
+                mode: Some(UpscalingMode::Off),
+                ..fsr1
+            };
+            assert_eq!(pipeline.kernel(&off, 42), None);
+
+            let logged = log.contents();
+            assert_eq!(
+                logged
+                    .lines()
+                    .filter(|line| line.contains("window 42 uses"))
+                    .count(),
+                2,
+                "{logged}"
+            );
+            assert!(
+                logged.contains("back to the renderer's own sampling"),
+                "{logged}"
+            );
+        });
+    }
 
     /// Renders a texture through the FSR1 pass and checks both stages against the reference.
     #[test]
@@ -3408,6 +4161,7 @@ mod tests {
         let rcas = programs.rcas.clone().expect("the RCAS shader must compile");
         let uniforms = resample_uniforms(&texture, src_rect, false).unwrap();
 
+        let timings = Timings::disabled();
         let mut upsampled = run_easu_pass(
             &mut renderer,
             &texture,
@@ -3416,6 +4170,7 @@ mod tests {
             Transform::Normal,
             &easu,
             &uniforms,
+            &timings,
         )
         .unwrap();
         let upsampled_pixels = read_back(&mut renderer, &mut upsampled, dest);
