@@ -121,6 +121,12 @@ window-rule {
         }
     }
 
+    upscaling {
+        mode "filter"
+        algorithm "fsr1"
+        sharpness 0.2
+    }
+
     min-width 100
     max-width 200
     min-height 300
@@ -1064,6 +1070,74 @@ For example, GTK 4 pop-ups with pointing arrows (`has-arrow=true` property) are
 | ![](./img/popup-no-arrow.png)                       | ![](./img/popup-arrow.png)                                                     |
 
 These pop-ups with custom shapes will need the app to implement the [ext-background-effect protocol](https://wayland.app/protocols/ext-background-effect-v1) to work properly.
+
+#### `upscaling`
+
+<sup>Since: next release</sup>
+
+Render this window with super resolution: instead of the compositor's built-in bilinear sampling, niri resamples the window's buffer with an algorithm of your choice.
+
+This is meant for windows that render at a lower resolution than the area they are displayed in, like a game or a visual novel running in an upscaling mode, or an app that does not support fractional scaling. If the client buffer is already the same size as its display area, there is nothing to resample and the effect does not do anything useful.
+
+- `mode`: what to do with the window's content.
+  - `"filter"`: only replace the sampling used to magnify the buffer. The window keeps its display geometry, so clicking and input are unaffected. This is the default.
+  - `"off"`: turn super resolution off (useful to override an earlier rule).
+  - `"magnify"`: draw the window's content scaled into a larger display area, without resizing the client. This is what you want for a game that runs at a lower resolution than the screen: put the window in fullscreen (with the usual `fullscreen-window` action or an `open-fullscreen` rule) and niri fills the whole output with its content instead, keeping the aspect ratio and leaving black bars where needed. The client keeps its own size, so leaving fullscreen needs no restoring on its side, and input is mapped back into the client's coordinates, including the letterbox bars, which do not take input. With [`virtual-size`](#upscaling), the same thing happens wherever the window is: the client always renders the configured size, and niri scales it into whatever area the layout gives the window.
+- `algorithm`: resampling algorithm to use.
+  - `"bilinear"`: explicit bilinear sampling. This is what the compositor does anyway, so it is mostly useful as a reference.
+
+  - `"bicubic"`: Catmull-Rom bicubic sampling. A good default for sharp content.
+  - `"fsr1"`: AMD [FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), that is, EASU followed by RCAS. Good for content with edges and gradients, and it can sharpen.
+  - `"cunny2"`: a [CuNNy](https://github.com/funnyplanter/CuNNy) network, which reconstructs the image instead of resampling it, trained on illustrations. It is the one to try for visual novels, anime-style art and text, where its learned reconstruction keeps lines and letters cleaner than the resampling kernels do. It is also the most expensive algorithm here: the network runs at the client buffer's resolution, so unlike `"fsr1"` its cost follows the client's resolution rather than the output's, and it needs a few source-sized textures while it runs. Unlike the other algorithms, it does not sharpen; the details it recovers come from the network.
+  - `"cunny2-large"`: the larger CuNNy network, `CuNNy-3x12-NVL`, with one more convolution than `"cunny2"`. Noticeably more expensive, and worth trying where the extra detail shows, like text-heavy illustrations.
+  - `"anime4k"`: not implemented yet; it falls back to `"bicubic"` and says so in the log.
+- `sharpness`: sharpening strength for algorithms that sharpen, which is `"fsr1"`. Like FSR1's own setting, it is in stops of halving: `0` is maximum sharpening, `1` is half of that, and `2` is a quarter. Defaults to `0.2`.
+
+- `client-scale`: the scale niri advertises to this window's client, for making it render at a different pixel density than the output's scale. Clients that handle fractional scaling render one buffer pixel per `client-scale` logical pixels, so a value below the output's scale makes the client render fewer pixels than its display area has, which is exactly what this effect magnifies. This is how you turn a client that would render at the output's full resolution into a low-resolution one on purpose: with `scale 1.5` on the output, `client-scale 1.0` makes the client render one pixel per logical pixel, and niri magnifies it 1.5× while drawing it, with the configured algorithm. It combines with `mode "magnify"`, where the client keeps its own logical size while rendering fewer pixels. Keep in mind that the client cannot tell this apart from a smaller output scale: everything it draws itself, including its decorations, pop-ups and text, is sized for the configured scale too, so it will look smaller than the rest of the desktop. Zero means the output's scale, which is the default. This does not enable the effect by itself.
+
+- `virtual-size`: the size to tell this window's client to render at, as two arguments, the width and the height in logical pixels, like `virtual-size 1280 720`. The client is configured with this size instead of the area the layout gives the window, and niri draws its content scaled into that area, keeping the aspect ratio and leaving black bars where needed. This is the other half of "render less and let niri magnify": `client-scale` decides how many pixels the client renders per logical pixel, and this decides the logical size it renders at. Setting it turns on the `"magnify"` mode, since that is the only mode where it does anything, but you can set the mode explicitly as well. The size is only used when it fits in the area the layout gives the window: one that is bigger than the area in both dimensions would only make the window overflow it, so such a window is left alone, and its client is given the area's size like any other window.
+
+Super resolution stays off unless a rule enables it, either by setting `mode` to something other than `"off"`, or by setting `algorithm` or `virtual-size` on its own.
+
+```kdl
+// Resample a visual novel that renders at a lower resolution as sharply as possible.
+window-rule {
+    match app-id="^vn4ever$"
+
+    upscaling {
+        mode "filter"
+        algorithm "fsr1"
+        sharpness 0.2
+    }
+}
+```
+
+```kdl
+// Make a game render 1280×720, and magnify it to the output with FSR1.
+window-rule {
+    match app-id="^steam_app_default$"
+
+    upscaling {
+        algorithm "fsr1"
+        virtual-size 1280 720
+        client-scale 1.0
+    }
+}
+```
+
+> [!NOTE]
+> The effect has to actually run, so while it is on, niri cannot hand the window's buffer to the display directly. This rules out [direct scanout](./Configuration:-Debug-Options.md#disable-direct-scanout) for that window, which costs performance. Enabling it for a window that is not magnified, like a fullscreen game at its native resolution, gains nothing and still costs that.
+
+With `mode "magnify"`, only a window that is actually fullscreen is magnified, unless it has a `virtual-size`: that makes niri scale the client's content into the area the layout gives the window wherever the window is. A window that is not fullscreen and has no virtual size is unaffected. Pop-ups are drawn scaled along with the window, but with bilinear sampling rather than with the configured algorithm.
+
+Whether there is anything to magnify depends on the client. One that renders at the physical resolution of the output (which is what Wayland clients that handle fractional scaling do) leaves no detail for the effect to recover, and such a window is drawn the normal way, without running the effect at all. One that keeps rendering at a lower resolution than its display area, like an app that predates fractional scaling on a scaled output, does. The `client-scale` and `virtual-size` options are how you make a client render at a lower resolution on purpose.
+
+> [!NOTE]
+> [`clip-to-geometry`](#clip-to-geometry) and `geometry-corner-radius` are not applied to resampled windows yet. Pop-ups, borders and the cursor are composited normally.
+
+> [!NOTE]
+> `"cunny2"` reads the client buffer the way the sampling shaders do, so a buffer whose orientation it cannot read, and a renderer where one of the network's passes cannot be compiled or run, both fall back to `"bicubic"`. The log says so.
+
 
 #### Size Overrides
 
