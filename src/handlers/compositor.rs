@@ -21,6 +21,7 @@ use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
+use crate::render_helpers::renderer::log_surface_buffer;
 use crate::utils::transaction::Transaction;
 use crate::utils::{is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
@@ -61,7 +62,9 @@ impl CompositorHandler for State {
         trace!("commit");
 
         on_commit_buffer_handler::<Self>(surface);
+        log_surface_buffer(surface, "before-early-import");
         self.backend.early_import(surface);
+        log_surface_buffer(surface, "after-early-import");
 
         let mut root_surface = surface.clone();
         while let Some(parent) = get_parent(&root_surface) {
