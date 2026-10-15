@@ -554,6 +554,7 @@ fn parse_glsl_version(version: &str) -> Option<(i32, i32)> {
 pub struct SuperResPrograms {
     bilinear: Option<GlesTexProgram>,
     bicubic: Option<GlesTexProgram>,
+    digest: Option<GlesTexProgram>,
     easu: Option<GlesTexProgram>,
     rcas: Option<GlesTexProgram>,
     /// The CuNNy passes and the upscale, compiled the first time they are needed: there are more
@@ -567,6 +568,7 @@ impl SuperResPrograms {
         Self {
             bilinear: Self::compile_filter(renderer, ResampleFilter::Bilinear),
             bicubic: Self::compile_filter(renderer, ResampleFilter::Bicubic),
+            digest: Self::compile_digest(renderer),
             easu: Self::compile_file(
                 renderer,
                 "easu",
@@ -615,6 +617,23 @@ impl SuperResPrograms {
                 ResampleFilter::Bilinear => "bilinear",
                 ResampleFilter::Bicubic => "bicubic",
             },
+            &source,
+            &[
+                UniformName::new("niri_tex_size", UniformType::_2f),
+                UniformName::new("niri_src_rect", UniformType::_4f),
+            ],
+        )
+    }
+
+    fn compile_digest(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
+        let source = include_str!("shaders/superres/resample.frag").replace(
+            "// niri:resample-filter",
+            &format!("#define NIRI_RESAMPLE_FILTER 2\n#define NIRI_DIGEST_SIDE {DIGEST_SIDE}.0"),
+        );
+
+        Self::compile_file(
+            renderer,
+            "digest",
             &source,
             &[
                 UniformName::new("niri_tex_size", UniformType::_2f),
@@ -1426,25 +1445,311 @@ impl PassSource for MultiTexture {
 }
 
 /// An offscreen result of the EASU pass.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Fsr1Result {
     texture: GlesTexture,
     context_id: ContextId<GlesTexture>,
-    key: Fsr1Key,
 }
 
-/// What an EASU result was produced from.
+/// Geometry and crop that an EASU result was produced from.
 ///
-/// Resampling a window goes through this pass once per source commit, and the final sharpening
-/// pass runs on the result every frame, so this only has to change when the content or the size
-/// does. Moving the window, drawing other windows or moving the cursor must not invalidate it.
+/// Resampling a window goes through this pass once per distinct source content, and the final
+/// sharpening pass runs on the result every frame, so this only has to change when the content or
+/// the size does. Moving the window, drawing other windows or moving the cursor must not
+/// invalidate it.
 #[derive(Debug, Clone, PartialEq)]
 struct Fsr1Key {
-    commit: CommitCounter,
     /// Source rect in buffer texels.
     src: Rectangle<f64, Buffer>,
     /// Destination size in physical pixels.
     size: Size<i32, Physical>,
+}
+
+/// Side length of the offscreen digest texture used to detect unchanged client frames.
+const DIGEST_SIDE: i32 = 32;
+
+/// Number of bytes in a [`SourceDigest`] (`32 * 32 * 4` RGBA8 bytes).
+const DIGEST_BYTES: usize = (DIGEST_SIDE as usize) * (DIGEST_SIDE as usize) * 4;
+
+/// Minimum offscreen pass work (total output texels written across all offscreen passes) before
+/// computing a [`SourceDigest`] is worthwhile.
+///
+/// Measured on `Mesa Intel(R) Iris(R) Xe Graphics (ADL GT2)` and `NVIDIA GeForce RTX 3050 Ti`:
+/// - Computing and reading back a 32×32 digest takes ~220 µs on Iris Xe and ~81 µs on RTX 3050 Ti,
+///   dominated by the single offscreen bind + `glReadPixels` synchronization round-trip.
+/// - A single-pass EASU run is faster than the digest below 640×360 destination pixels (~212 µs on
+///   Iris Xe, ~121 µs on RTX 3050 Ti) and reaches ~368 µs (Iris Xe) / ~108–205 µs (RTX 3050 Ti) at
+///   960×540 (518,400 destination texels).
+/// - CuNNy-Fast runs 9 offscreen passes and already takes ~534–701 µs on Iris Xe (~512–524 µs on
+///   RTX 3050 Ti) at 320×180 source texels (`9 * 57,600 = 518,400` pass texels), scaling up to
+///   ~6.17 ms (Iris Xe) / ~1.52 ms (RTX 3050 Ti) at 1280×720.
+///
+/// Setting the threshold at 500,000 total pass texels (with at least `32 * 32` source texels)
+/// skips the digest for small surfaces where running the pass directly is cheaper or comparable,
+/// while enabling it for 960×540+ FSR1 outputs and 320×180+ CuNNy inputs.
+const DIGEST_MIN_PASS_TEXELS: u64 = 500_000;
+const DIGEST_MIN_SOURCE_TEXELS: u64 = (DIGEST_SIDE as u64) * (DIGEST_SIDE as u64);
+
+/// Compact GPU-computed fingerprint of a client buffer's sampled region.
+#[derive(Clone, PartialEq, Eq)]
+struct SourceDigest(Box<[u8; DIGEST_BYTES]>);
+
+impl fmt::Debug for SourceDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SourceDigest")
+            .field(&format_args!("{DIGEST_BYTES}B"))
+            .finish()
+    }
+}
+
+/// Reusable 32×32 offscreen target for computing [`SourceDigest`]s without reallocating.
+#[derive(Debug, Default)]
+struct DigestTarget {
+    texture: Option<(ContextId<GlesTexture>, GlesTexture)>,
+}
+
+impl DigestTarget {
+    fn compute(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        source: &GlesTexture,
+        src: Rectangle<f64, Buffer>,
+        y_inverted: bool,
+        transform: Transform,
+    ) -> Option<SourceDigest> {
+        let program = SuperResPrograms::get(renderer)?.digest.clone()?;
+        let uniforms = resample_uniforms(source, src, y_inverted)?;
+        let context_id = renderer.context_id();
+
+        let digest_phys = Size::<i32, Physical>::from((DIGEST_SIDE, DIGEST_SIDE));
+        let digest_buf = digest_phys.to_logical(1).to_buffer(1, Transform::Normal);
+
+        let need_alloc = self
+            .texture
+            .as_ref()
+            .is_none_or(|(id, _)| *id != context_id);
+        if need_alloc {
+            let tex = renderer.create_buffer(Fourcc::Abgr8888, digest_buf).ok()?;
+            self.texture = Some((context_id, tex));
+        }
+        let (_, texture) = self.texture.as_mut()?;
+
+        let rect = Rectangle::from_size(digest_phys);
+        let mut bytes = Box::new([0u8; DIGEST_BYTES]);
+
+        let mut target = renderer.bind(texture).ok()?;
+        let mut frame = renderer
+            .render(&mut target, digest_phys, Transform::Normal)
+            .ok()?;
+        frame
+            .render_texture_from_to(
+                source,
+                src,
+                rect,
+                &[rect],
+                &[rect],
+                transform,
+                1.0,
+                Some(&program),
+                &uniforms,
+            )
+            .ok()?;
+        frame
+            .with_context(|gl| unsafe {
+                gl.PixelStorei(ffi::PACK_ALIGNMENT, 1);
+                gl.ReadPixels(
+                    0,
+                    0,
+                    DIGEST_SIDE,
+                    DIGEST_SIDE,
+                    ffi::RGBA,
+                    ffi::UNSIGNED_BYTE,
+                    bytes.as_mut_ptr().cast(),
+                );
+            })
+            .ok()?;
+        let _ = frame.finish().ok()?;
+
+        Some(SourceDigest(bytes))
+    }
+}
+
+/// Workload of an offscreen super-resolution pipeline, used to decide whether computing a
+/// [`SourceDigest`] is cheaper than running the pass.
+#[derive(Debug, Clone, Copy)]
+struct PassWorkload {
+    /// Source region size in buffer texels.
+    source_size: Size<i32, Buffer>,
+    /// Total output texels written across all offscreen passes of the algorithm.
+    pass_texels: u64,
+}
+
+impl PassWorkload {
+    fn single_pass(source_size: Size<i32, Buffer>, dest_size: Size<i32, Physical>) -> Self {
+        let pass_texels = u64::try_from(dest_size.w.max(0)).unwrap_or(0)
+            * u64::try_from(dest_size.h.max(0)).unwrap_or(0);
+        Self {
+            source_size,
+            pass_texels,
+        }
+    }
+
+    fn multi_pass(source_size: Size<i32, Buffer>, pass_count: usize) -> Self {
+        let src_texels = u64::try_from(source_size.w.max(0)).unwrap_or(0)
+            * u64::try_from(source_size.h.max(0)).unwrap_or(0);
+        Self {
+            source_size,
+            pass_texels: src_texels.saturating_mul(pass_count as u64),
+        }
+    }
+
+    /// Returns whether computing a [`SourceDigest`] is worthwhile for this workload.
+    fn should_use_digest(self) -> bool {
+        let src_texels = u64::try_from(self.source_size.w.max(0)).unwrap_or(0)
+            * u64::try_from(self.source_size.h.max(0)).unwrap_or(0);
+        src_texels >= DIGEST_MIN_SOURCE_TEXELS && self.pass_texels >= DIGEST_MIN_PASS_TEXELS
+    }
+}
+
+/// Why a cached offscreen pass result could be reused without rerunning the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheReuse {
+    /// Same [`CommitCounter`], geometry and renderer context.
+    SameCommit,
+    /// New [`CommitCounter`], but Wayland `damage_since` was empty.
+    NoDamage { made_for: CommitCounter },
+    /// New [`CommitCounter`] with reported damage, but GPU [`SourceDigest`] matched.
+    SameDigest { made_for: CommitCounter },
+}
+
+/// Cached entry of an offscreen super-resolution pass, shared across all multi-pass algorithms.
+#[derive(Debug)]
+struct CachedPass<K, V> {
+    key: K,
+    commit: CommitCounter,
+    context_id: ContextId<GlesTexture>,
+    digest: Option<SourceDigest>,
+    value: V,
+}
+
+/// Generic cache for any offscreen super-resolution pass.
+///
+/// Unifies commit-counter matching, Wayland damage-set checking, and GPU [`SourceDigest`]
+/// comparison so every multi-pass upscaler (FSR1, CuNNy variants, and future passes) benefits from
+/// unchanged-frame detection through one abstraction.
+#[derive(Debug)]
+struct PassCache<K, V> {
+    entry: Option<CachedPass<K, V>>,
+}
+
+impl<K, V> Default for PassCache<K, V> {
+    fn default() -> Self {
+        Self { entry: None }
+    }
+}
+
+impl<K: PartialEq, V: Clone> PassCache<K, V> {
+    fn clear(&mut self) {
+        self.entry = None;
+    }
+
+    /// Checks whether the cached result can be reused before looking up the client's GLES texture.
+    fn probe_before_import<R: ImportAll>(
+        &mut self,
+        key: &K,
+        commit: CommitCounter,
+        context_id: &ContextId<GlesTexture>,
+        elem: &WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+    ) -> Option<(CacheReuse, V)> {
+        let entry = self.entry.as_mut()?;
+        if entry.key != *key || entry.context_id != *context_id {
+            return None;
+        }
+
+        if entry.commit == commit {
+            return Some((CacheReuse::SameCommit, entry.value.clone()));
+        }
+
+        if damage_since(elem, scale, entry.commit).is_empty() {
+            let made_for = entry.commit;
+            entry.commit = commit;
+            return Some((CacheReuse::NoDamage { made_for }, entry.value.clone()));
+        }
+
+        None
+    }
+
+    /// Computes a [`SourceDigest`] when `workload` is above the worthwhile threshold and checks
+    /// whether the new client buffer carries the exact same pixels as the cached entry.
+    ///
+    /// Returns `Ok((reuse, value))` on a digest hit, or `Err(computed_digest)` on a miss so the
+    /// caller can store `computed_digest` alongside the newly produced pass result without
+    /// computing it a second time.
+    #[allow(clippy::too_many_arguments)]
+    fn probe_digest(
+        &mut self,
+        key: &K,
+        commit: CommitCounter,
+        context_id: &ContextId<GlesTexture>,
+        workload: PassWorkload,
+        digest_target: &mut DigestTarget,
+        renderer: &mut GlesRenderer,
+        source: &GlesTexture,
+        src: Rectangle<f64, Buffer>,
+        y_inverted: bool,
+        transform: Transform,
+    ) -> Result<(CacheReuse, V), Option<SourceDigest>> {
+        if !workload.should_use_digest() {
+            return Err(None);
+        }
+
+        let new_digest = digest_target.compute(renderer, source, src, y_inverted, transform);
+
+        if let Some(entry) = self.entry.as_mut() {
+            if entry.key == *key
+                && entry.context_id == *context_id
+                && new_digest.is_some()
+                && entry.digest == new_digest
+            {
+                let made_for = entry.commit;
+                entry.commit = commit;
+                return Ok((CacheReuse::SameDigest { made_for }, entry.value.clone()));
+            }
+        }
+
+        Err(new_digest)
+    }
+
+    /// Takes the cached value for intermediate texture reuse if `predicate` matches.
+    fn take_reusable(
+        &mut self,
+        predicate: impl FnOnce(&K, &ContextId<GlesTexture>) -> bool,
+    ) -> Option<V> {
+        let entry = self.entry.take()?;
+        if predicate(&entry.key, &entry.context_id) {
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    fn store(
+        &mut self,
+        key: K,
+        commit: CommitCounter,
+        context_id: ContextId<GlesTexture>,
+        digest: Option<SourceDigest>,
+        value: V,
+    ) {
+        self.entry = Some(CachedPass {
+            key,
+            commit,
+            context_id,
+            digest,
+            value,
+        });
+    }
 }
 
 /// Messages that should be logged once per resolved configuration rather than every frame.
@@ -1466,7 +1771,7 @@ mod logged {
 /// A galgame redraws the same scene at the display's rate, so most commits carry the same pixels as
 /// the one before, and a pass only has to run again when something actually changed. The renderer
 /// answers with the whole buffer when it cannot tell which parts changed, so an empty answer is the
-/// only one that proves the content is the same.
+/// only one that proves the content is the same without inspecting the texture.
 fn damage_since<R: ImportAll>(
     elem: &WaylandSurfaceRenderElement<R>,
     scale: Scale<f64>,
@@ -1477,7 +1782,7 @@ fn damage_since<R: ImportAll>(
 
 /// Per-window super resolution state.
 ///
-/// This holds the resolved configuration and the cached FSR1 result. It also remembers which
+/// This holds the resolved configuration and the cached offscreen results. It also remembers which
 /// messages it already logged for the current configuration, so that a window with, say, an
 /// algorithm that is not implemented logs about it once instead of every frame.
 ///
@@ -1496,15 +1801,22 @@ pub struct SuperResolutionPipeline {
     /// Which of the once-per-configuration messages were already logged.
     logged: Cell<u8>,
     /// Cached result of the EASU pass.
-    fsr1: RefCell<Option<Fsr1Result>>,
+    fsr1: RefCell<PassCache<Fsr1Key, Fsr1Result>>,
     /// Cached result of a CuNNy run.
-    cunny: RefCell<Option<(CunnyKey, CunnyResult)>>,
+    cunny: RefCell<PassCache<CunnyKey, CunnyResult>>,
+    /// Reusable 32×32 target for GPU content digests across all upscaling passes.
+    digest: RefCell<DigestTarget>,
     /// The size that this window's content is magnified into, when it is being magnified.
     ///
     /// This is here rather than in the window so that everything about the effect, including its
     /// log messages, is under this module's target, which is what the log filter in the wiki
     /// enables.
     magnify_target: Cell<Option<Size<i32, Logical>>>,
+    /// Visible output viewport relative to the window's origin, when rendered through a tile.
+    ///
+    /// Elements outside this rectangle are culled by the damage tracker and skip offscreen
+    /// super-resolution passes.
+    view_rect: Cell<Option<Rectangle<f64, Logical>>>,
     /// How long this window's passes take on the GPU.
     ///
     /// Shared with the elements that draw the window, which is what measures the final draw.
@@ -1528,6 +1840,11 @@ impl CunnyVariant {
             CunnyVariant::Fast => FAST_NVL,
             CunnyVariant::ThreeByTwelve => THREE_BY_TWELVE_NVL,
         }
+    }
+
+    /// Total number of offscreen draw groups across all passes of this network.
+    fn draw_count(self) -> usize {
+        self.passes().iter().map(|pass| pass.shaders.len()).sum()
     }
 
     /// Index for the program cache, so that a program can be found again by what it is made of.
@@ -1702,13 +2019,11 @@ const THREE_BY_TWELVE_NVL: &[CunnyPass] = &[
     },
 ];
 
-/// What a CuNNy result is valid for.
+/// Geometry and variant that a CuNNy result is valid for.
 #[derive(Debug, Clone, PartialEq)]
 struct CunnyKey {
     /// Which network ran.
     variant: CunnyVariant,
-    /// The client buffer's commit.
-    commit: CommitCounter,
     /// The rect of the buffer that was run.
     src: Rectangle<f64, Buffer>,
     /// Its size, which is the size of the residuals.
@@ -2399,11 +2714,23 @@ impl SuperResolutionPipeline {
         Self {
             resolved: Cell::new(None),
             logged: Cell::new(0),
-            fsr1: RefCell::new(None),
-            cunny: RefCell::new(None),
+            fsr1: RefCell::new(PassCache::default()),
+            cunny: RefCell::new(PassCache::default()),
+            digest: RefCell::new(DigestTarget::default()),
             magnify_target: Cell::new(None),
+            view_rect: Cell::new(None),
             timings: Timings::for_window(),
         }
+    }
+
+    /// Sets the visible output viewport relative to the window's origin for the current render.
+    pub fn set_view_rect(&self, view_rect: Option<Rectangle<f64, Logical>>) {
+        self.view_rect.set(view_rect);
+    }
+
+    /// Returns the visible output viewport relative to the window's origin, if set.
+    pub fn view_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        self.view_rect.get()
     }
 
     /// Returns the kernel to draw this window with, if the effect is enabled.
@@ -2413,8 +2740,8 @@ impl SuperResolutionPipeline {
     pub fn kernel(&self, rules: &Upscaling, id: u64) -> Option<SuperResKernel> {
         if !rules.enabled() {
             if self.resolved.take().is_some() {
-                self.fsr1.borrow_mut().take();
-                self.cunny.borrow_mut().take();
+                self.fsr1.borrow_mut().clear();
+                self.cunny.borrow_mut().clear();
                 debug!("super resolution: window {id} back to the renderer's own sampling");
             }
             return None;
@@ -2429,8 +2756,8 @@ impl SuperResolutionPipeline {
             self.resolved.set(Some((mode, algorithm, sharpness as f32)));
             self.logged.set(0);
             // The parameters may have changed, so the cached result may no longer match.
-            self.fsr1.borrow_mut().take();
-            self.cunny.borrow_mut().take();
+            self.fsr1.borrow_mut().clear();
+            self.cunny.borrow_mut().clear();
 
             debug!("super resolution: window {id} uses {kernel}");
         }
@@ -2490,7 +2817,6 @@ impl SuperResolutionPipeline {
     }
 
     /// Returns a network's residuals for this window, running it if the cached result is stale.
-
     fn cunny_result<R: NiriRenderer>(
         &self,
         renderer: &mut GlesRenderer,
@@ -2502,12 +2828,13 @@ impl SuperResolutionPipeline {
     where
         R::TextureId: PassSource,
     {
+        let commit = elem.current_commit();
         let _span = debug_span!(
             target: GPU_LOG_TARGET,
             "cunny",
             window = id,
             element = ?elem.id(),
-            commit = ?elem.current_commit(),
+            ?commit,
             ?variant,
         )
         .entered();
@@ -2539,17 +2866,16 @@ impl SuperResolutionPipeline {
             return None;
         }
 
-        let key = CunnyKey {
-            variant,
-            commit: elem.current_commit(),
-            src,
-            size,
-        };
+        let key = CunnyKey { variant, src, size };
+        let context_id = renderer.context_id();
 
+        if let Some((reuse, result)) =
+            self.cunny
+                .borrow_mut()
+                .probe_before_import(&key, commit, &context_id, elem, scale)
         {
-            let cache = self.cunny.borrow();
-            if let Some((cached, result)) = cache.as_ref() {
-                if *cached == key && result.context_id == renderer.context_id() {
+            match reuse {
+                CacheReuse::SameCommit => {
                     trace!("super resolution: reusing the {variant:?} result for window {id}");
                     trace!(
                         target: GPU_LOG_TARGET,
@@ -2558,39 +2884,26 @@ impl SuperResolutionPipeline {
                         result = ?TextureDebug(&result.texture),
                         "reusing CuNNy residuals; network not rerun",
                     );
-                    return Some(result.clone());
                 }
-
-                // A galgame redraws the same scene at the display's rate, so a new commit usually
-                // carries the same pixels: the network only has to run when the window has damage
-                // since the commit its residuals were made for. The renderer answers with the whole
-                // buffer when it cannot say, so an empty answer is the only one that means the
-                // content is unchanged.
-                let same_geometry = cached.variant == key.variant
-                    && cached.src == key.src
-                    && cached.size == key.size;
-                if same_geometry
-                    && result.context_id == renderer.context_id()
-                    && damage_since(elem, scale, cached.commit).is_empty()
-                {
+                CacheReuse::NoDamage { made_for } | CacheReuse::SameDigest { made_for } => {
                     trace!(
                         target: GPU_LOG_TARGET,
                         cache = "unchanged",
                         window = id,
-                        commit = ?key.commit,
-                        made_for = ?cached.commit,
+                        ?commit,
+                        ?made_for,
                         gpu = ?GpuDebug::renderer(renderer),
                         "the window has no damage since the network ran; reusing its residuals",
                     );
-                    return Some(result.clone());
                 }
             }
+            return Some(result);
         }
 
         let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
             return None;
         };
-        let Some(source) = texture.pass_texture(&renderer.context_id()) else {
+        let Some(source) = texture.pass_texture(&context_id) else {
             debug!(
                 target: GPU_LOG_TARGET,
                 gpu = ?GpuDebug::renderer(renderer),
@@ -2600,6 +2913,37 @@ impl SuperResolutionPipeline {
             return None;
         };
         let tex_size = source.size();
+        let workload = PassWorkload::multi_pass(size, variant.draw_count());
+
+        let digest = match self.cunny.borrow_mut().probe_digest(
+            &key,
+            commit,
+            &context_id,
+            workload,
+            &mut self.digest.borrow_mut(),
+            renderer,
+            &source,
+            src,
+            false,
+            elem.transform(),
+        ) {
+            Ok((CacheReuse::SameDigest { made_for }, result)) => {
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    cache = "unchanged",
+                    reason = "source digest matched",
+                    window = id,
+                    ?commit,
+                    ?made_for,
+                    gpu = ?GpuDebug::renderer(renderer),
+                    result = ?TextureDebug(&result.texture),
+                    "the client buffer pixels did not change; reusing CuNNy residuals",
+                );
+                return Some(result);
+            }
+            Ok((_, result)) => return Some(result),
+            Err(digest) => digest,
+        };
 
         trace!(
             "super resolution: running the {variant:?} network for window {id}, {w}×{h}",
@@ -2617,11 +2961,10 @@ impl SuperResolutionPipeline {
         let reuse = self
             .cunny
             .borrow_mut()
-            .take()
-            .filter(|(cached, result)| {
-                cached.size == key.size && result.context_id == renderer.context_id()
+            .take_reusable(|cached, cached_ctx| {
+                cached.size == key.size && *cached_ctx == context_id
             })
-            .map(|(_, result)| (result.features, result.texture));
+            .map(|result| (result.features, result.texture));
 
         let (features, texture) = match run_cunny(
             renderer,
@@ -2655,18 +2998,21 @@ impl SuperResolutionPipeline {
         let result = CunnyResult {
             texture,
             features,
-            context_id: renderer.context_id(),
+            context_id: context_id.clone(),
         };
-        *self.cunny.borrow_mut() = Some((key, result.clone()));
+        self.cunny
+            .borrow_mut()
+            .store(key, commit, context_id, digest, result.clone());
         Some(result)
     }
 
-    /// Wraps a surface element, running the EASU pass first if the cached result is stale.
+    /// Wraps a surface element, running the EASU or CuNNy pass first if the cached result is stale.
     ///
     /// `renderer` must be the GLES renderer that will draw the element, and `scale` is the output
-    /// scale that the element is drawn at. The returned element falls back to drawing the client
-    /// buffer normally when the pass cannot run or when its result is not valid for the renderer
-    /// that ends up drawing it.
+    /// scale that the element is drawn at. When `on_screen` is `false`, the element lies outside
+    /// the visible viewport and skips offscreen passes entirely. The returned element falls back
+    /// to drawing the client buffer normally when the pass cannot run or when its result is not
+    /// valid for the renderer that ends up drawing it.
     #[allow(clippy::too_many_arguments)]
     pub fn element<R: NiriRenderer>(
         &self,
@@ -2676,6 +3022,7 @@ impl SuperResolutionPipeline {
         scale: Scale<f64>,
         id: u64,
         magnify: Option<Rectangle<f64, Logical>>,
+        on_screen: bool,
     ) -> SuperResElement<R>
     where
         R::TextureId: PassSource,
@@ -2688,6 +3035,32 @@ impl SuperResolutionPipeline {
             commit = ?elem.current_commit(),
         )
         .entered();
+        // With magnify, the content is drawn into a rect inside the area the layout gave the
+        // window, so that is the size the effect has to produce.
+        let dest_size = match magnify {
+            Some(rect) => rect.size.to_physical_precise_round(scale),
+            None => elem.geometry(scale).size,
+        };
+
+        // The passes run in this renderer's context, which is where their timings belong.
+        self.timings
+            .set_context(context_address(renderer.egl_context()));
+        self.log_timings(id, kernel, dest_size, renderer);
+
+        if !on_screen {
+            trace!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::renderer(renderer),
+                ?dest_size,
+                "element is offscreen; skipping super-resolution pass",
+            );
+            let mut element = SuperResElement::plain(elem);
+            if let Some(rect) = magnify {
+                element = element.with_magnify(rect);
+            }
+            return element;
+        }
+
         if gpu_diagnostics() {
             let native = match elem.texture() {
                 WaylandSurfaceTexture::Texture(texture) => {
@@ -2729,17 +3102,6 @@ impl SuperResolutionPipeline {
                 );
             }
         }
-        // With magnify, the content is drawn into a rect inside the area the layout gave the
-        // window, so that is the size the effect has to produce.
-        let dest_size = match magnify {
-            Some(rect) => rect.size.to_physical_precise_round(scale),
-            None => elem.geometry(scale).size,
-        };
-
-        // The passes run in this renderer's context, which is where their timings belong.
-        self.timings
-            .set_context(context_address(renderer.egl_context()));
-        self.log_timings(id, kernel, dest_size, renderer);
 
         // A buffer that already matches its display area has nothing for the effect to recover: the
         // client is rendering at the physical resolution of the output, which is what Wayland
@@ -2893,12 +3255,13 @@ impl SuperResolutionPipeline {
     where
         R::TextureId: PassSource,
     {
+        let commit = elem.current_commit();
         let _span = debug_span!(
             target: GPU_LOG_TARGET,
             "easu",
             window = id,
             element = ?elem.id(),
-            commit = ?elem.current_commit(),
+            ?commit,
         )
         .entered();
         if size.w <= 0 || size.h <= 0 {
@@ -2906,18 +3269,21 @@ impl SuperResolutionPipeline {
         }
 
         let src = elem.src();
+        let src_size = src.size.to_i32_round();
+        if src_size.w <= 0 || src_size.h <= 0 {
+            return None;
+        }
 
-        let key = Fsr1Key {
-            commit: elem.current_commit(),
-            src,
-            size,
-        };
+        let key = Fsr1Key { src, size };
+        let context_id = renderer.context_id();
 
+        if let Some((reuse, result)) =
+            self.fsr1
+                .borrow_mut()
+                .probe_before_import(&key, commit, &context_id, elem, scale)
         {
-            let cache = self.fsr1.borrow();
-            if let Some(result) = cache.as_ref() {
-                if result.key == key && result.context_id == renderer.context_id() {
-                    // The cached result is still what this window would be drawn with.
+            match reuse {
+                CacheReuse::SameCommit => {
                     trace!(
                         target: GPU_LOG_TARGET,
                         cache = "hit",
@@ -2931,55 +3297,26 @@ impl SuperResolutionPipeline {
                         w = size.w,
                         h = size.h,
                     );
-
-                    return Some(Fsr1Result {
-                        texture: result.texture.clone(),
-                        context_id: result.context_id.clone(),
-                        key,
-                    });
                 }
-
-                // A galgame redraws the same scene at the display's rate, so a new commit usually
-                // carries the same pixels: the pass only has to run when the content changed.
-                if result.key.src == key.src
-                    && result.key.size == key.size
-                    && result.context_id == renderer.context_id()
-                    && damage_since(elem, scale, result.key.commit).is_empty()
-                {
+                CacheReuse::NoDamage { made_for } | CacheReuse::SameDigest { made_for } => {
                     trace!(
                         target: GPU_LOG_TARGET,
                         cache = "unchanged",
                         window = id,
-                        commit = ?key.commit,
-                        made_for = ?result.key.commit,
+                        ?commit,
+                        ?made_for,
                         gpu = ?GpuDebug::renderer(renderer),
                         "the window has no damage since the pass ran; reusing its result",
                     );
-
-                    return Some(Fsr1Result {
-                        texture: result.texture.clone(),
-                        context_id: result.context_id.clone(),
-                        key,
-                    });
                 }
             }
+            return Some(result);
         }
-
-        trace!(
-            "super resolution: resampling window {id}, {src_w}×{src_h} -> {dst_w}×{dst_h} \
-             (×{ratio:.3}, {reason})",
-            src_w = src.size.w as i32,
-            src_h = src.size.h as i32,
-            dst_w = size.w,
-            dst_h = size.h,
-            ratio = f64::from(size.w) / src.size.w,
-            reason = self.cache_miss_reason(&key, renderer),
-        );
 
         let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
             return None;
         };
-        let Some(source) = texture.pass_texture(&renderer.context_id()) else {
+        let Some(source) = texture.pass_texture(&context_id) else {
             debug!(
                 target: GPU_LOG_TARGET,
                 gpu = ?GpuDebug::renderer(renderer),
@@ -2990,6 +3327,49 @@ impl SuperResolutionPipeline {
         };
 
         let y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false);
+        let workload = PassWorkload::single_pass(src_size, size);
+
+        let digest = match self.fsr1.borrow_mut().probe_digest(
+            &key,
+            commit,
+            &context_id,
+            workload,
+            &mut self.digest.borrow_mut(),
+            renderer,
+            &source,
+            src,
+            y_inverted,
+            elem.transform(),
+        ) {
+            Ok((CacheReuse::SameDigest { made_for }, result)) => {
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    cache = "unchanged",
+                    reason = "source digest matched",
+                    window = id,
+                    ?commit,
+                    ?made_for,
+                    gpu = ?GpuDebug::renderer(renderer),
+                    result = ?TextureDebug(&result.texture),
+                    "the client buffer pixels did not change; reusing EASU result",
+                );
+                return Some(result);
+            }
+            Ok((_, result)) => return Some(result),
+            Err(digest) => digest,
+        };
+
+        let reason = self.cache_miss_reason(&key, commit, renderer);
+        trace!(
+            "super resolution: resampling window {id}, {src_w}×{src_h} -> {dst_w}×{dst_h} \
+             (×{ratio:.3}, {reason})",
+            src_w = src.size.w as i32,
+            src_h = src.size.h as i32,
+            dst_w = size.w,
+            dst_h = size.h,
+            ratio = f64::from(size.w) / src.size.w,
+        );
+
         let uniforms = resample_uniforms(&source, src, y_inverted)?;
         let Some(program) =
             SuperResPrograms::get(renderer).and_then(|programs| programs.easu.clone())
@@ -3001,7 +3381,7 @@ impl SuperResolutionPipeline {
         debug!(
             target: GPU_LOG_TARGET,
             cache = "miss",
-            reason = self.cache_miss_reason(&key, renderer),
+            reason,
             gpu = ?GpuDebug::renderer(renderer),
             source = ?TextureDebug(&source),
             "submitting EASU",
@@ -3034,15 +3414,11 @@ impl SuperResolutionPipeline {
 
         let result = Fsr1Result {
             texture,
-            context_id: renderer.context_id(),
-            key,
+            context_id: context_id.clone(),
         };
-
-        *self.fsr1.borrow_mut() = Some(Fsr1Result {
-            texture: result.texture.clone(),
-            context_id: result.context_id.clone(),
-            key: result.key.clone(),
-        });
+        self.fsr1
+            .borrow_mut()
+            .store(key, commit, context_id, digest, result.clone());
 
         Some(result)
     }
@@ -3050,20 +3426,25 @@ impl SuperResolutionPipeline {
 
 impl SuperResolutionPipeline {
     /// Explains why the cached EASU result cannot be reused.
-    fn cache_miss_reason(&self, key: &Fsr1Key, renderer: &GlesRenderer) -> &'static str {
+    fn cache_miss_reason(
+        &self,
+        key: &Fsr1Key,
+        commit: CommitCounter,
+        renderer: &GlesRenderer,
+    ) -> &'static str {
         let cache = self.fsr1.borrow();
-        let Some(result) = cache.as_ref() else {
+        let Some(entry) = cache.entry.as_ref() else {
             return "no cached result";
         };
 
-        if result.context_id != renderer.context_id() {
+        if entry.context_id != renderer.context_id() {
             "different renderer context"
-        } else if result.key.commit != key.commit {
-            "new source commit"
-        } else if result.key.src != key.src {
+        } else if entry.key.src != key.src {
             "different source rect"
-        } else if result.key.size != key.size {
+        } else if entry.key.size != key.size {
             "different display size"
+        } else if entry.commit != commit {
+            "new source commit"
         } else {
             "unknown"
         }
@@ -4612,5 +4993,209 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pass_workload_digest_threshold() {
+        // Below the 32x32 source floor: never run the digest.
+        assert!(!PassWorkload::multi_pass(Size::from((16, 16)), 12).should_use_digest());
+
+        // Single-pass EASU below 500k destination pixels (e.g. 640x360 = 230,400): cheaper to
+        // run EASU directly than to synchronize a digest readback.
+        assert!(
+            !PassWorkload::single_pass(Size::from((320, 180)), Size::from((640, 360)))
+                .should_use_digest()
+        );
+
+        // Single-pass EASU at 960x540 (518,400 destination texels): above threshold.
+        assert!(
+            PassWorkload::single_pass(Size::from((480, 270)), Size::from((960, 540)))
+                .should_use_digest()
+        );
+
+        // CuNNy-Fast (9 passes) at 240x135 (9 * 32,400 = 291,600 pass texels): below threshold.
+        assert!(
+            !PassWorkload::multi_pass(Size::from((240, 135)), CunnyVariant::Fast.draw_count())
+                .should_use_digest()
+        );
+
+        // CuNNy-Fast (9 passes) at 320x180 (9 * 57,600 = 518,400 pass texels): above threshold.
+        assert!(
+            PassWorkload::multi_pass(Size::from((320, 180)), CunnyVariant::Fast.draw_count())
+                .should_use_digest()
+        );
+    }
+
+    #[test]
+    fn gpu_source_digest_detects_unchanged_and_changed_frames() {
+        let Some(mut renderer) = surfaceless_renderer() else {
+            return;
+        };
+        crate::render_helpers::resources::init(&mut renderer);
+        crate::render_helpers::shaders::init(&mut renderer);
+        init(&mut renderer, None);
+
+        let size = Size::<i32, Buffer>::from((320, 180));
+        let src_rect = Rectangle::from_size(size.to_f64());
+        let pixels_a = grayscale_pixels(size);
+        let tex_a = renderer
+            .import_memory(&pixels_a, Fourcc::Abgr8888, size, false)
+            .unwrap();
+        // Separate swapchain texture carrying the exact same pixels.
+        let tex_b = renderer
+            .import_memory(&pixels_a, Fourcc::Abgr8888, size, false)
+            .unwrap();
+        assert_ne!(tex_a.tex_id(), tex_b.tex_id());
+
+        let mut target = DigestTarget::default();
+        let digest_a = target
+            .compute(&mut renderer, &tex_a, src_rect, false, Transform::Normal)
+            .expect("digest must succeed");
+        let digest_b = target
+            .compute(&mut renderer, &tex_b, src_rect, false, Transform::Normal)
+            .expect("digest must succeed");
+        assert_eq!(
+            digest_a, digest_b,
+            "identical pixels in different swapchain textures must produce the same digest"
+        );
+
+        // Mutate a small 4x4 character-sized glyph patch in the dialog area.
+        let mut pixels_c = pixels_a.clone();
+        for dy in 120..124 {
+            for dx in 160..164 {
+                let idx = ((dy * size.w + dx) * 4) as usize;
+                pixels_c[idx] = pixels_c[idx].wrapping_add(40);
+                pixels_c[idx + 1] = pixels_c[idx + 1].wrapping_add(40);
+                pixels_c[idx + 2] = pixels_c[idx + 2].wrapping_add(40);
+            }
+        }
+        let tex_c = renderer
+            .import_memory(&pixels_c, Fourcc::Abgr8888, size, false)
+            .unwrap();
+        let digest_c = target
+            .compute(&mut renderer, &tex_c, src_rect, false, Transform::Normal)
+            .expect("digest must succeed");
+        assert_ne!(
+            digest_a, digest_c,
+            "a small glyph change must change the source digest"
+        );
+    }
+
+    #[test]
+    fn gpu_pass_cache_reuses_unchanged_and_respects_threshold() {
+        let Some(mut renderer) = surfaceless_renderer() else {
+            return;
+        };
+        crate::render_helpers::resources::init(&mut renderer);
+        crate::render_helpers::shaders::init(&mut renderer);
+        init(&mut renderer, None);
+
+        let size = Size::<i32, Buffer>::from((320, 180));
+        let src_rect = Rectangle::from_size(size.to_f64());
+        let pixels_a = grayscale_pixels(size);
+        let tex_a = renderer
+            .import_memory(&pixels_a, Fourcc::Abgr8888, size, false)
+            .unwrap();
+        let tex_b = renderer
+            .import_memory(&pixels_a, Fourcc::Abgr8888, size, false)
+            .unwrap();
+        let mut pixels_c = pixels_a.clone();
+        pixels_c[0] = pixels_c[0].wrapping_add(80);
+        let tex_c = renderer
+            .import_memory(&pixels_c, Fourcc::Abgr8888, size, false)
+            .unwrap();
+
+        let key = CunnyKey {
+            variant: CunnyVariant::Fast,
+            src: src_rect,
+            size,
+        };
+        let context_id = renderer.context_id();
+        let workload = PassWorkload::multi_pass(size, CunnyVariant::Fast.draw_count());
+        let mut digest_target = DigestTarget::default();
+        let mut cache: PassCache<CunnyKey, u32> = PassCache::default();
+
+        let mut c1 = CommitCounter::default();
+        c1.increment();
+        let mut c2 = c1;
+        c2.increment();
+        let mut c3 = c2;
+        c3.increment();
+
+        // First commit: cache is empty, computes digest and returns Err(Some(digest)).
+        let digest_1 = cache
+            .probe_digest(
+                &key,
+                c1,
+                &context_id,
+                workload,
+                &mut digest_target,
+                &mut renderer,
+                &tex_a,
+                src_rect,
+                false,
+                Transform::Normal,
+            )
+            .expect_err("first commit must miss");
+        assert!(digest_1.is_some());
+        cache.store(key.clone(), c1, context_id.clone(), digest_1, 77);
+
+        // Second commit with a different texture handle carrying identical pixels: digest hit!
+        let (reuse, val) = cache
+            .probe_digest(
+                &key,
+                c2,
+                &context_id,
+                workload,
+                &mut digest_target,
+                &mut renderer,
+                &tex_b,
+                src_rect,
+                false,
+                Transform::Normal,
+            )
+            .expect("second commit with identical pixels must hit via digest");
+        assert_eq!(reuse, CacheReuse::SameDigest { made_for: c1 });
+        assert_eq!(val, 77);
+        assert_eq!(
+            cache.entry.as_ref().unwrap().commit,
+            c2,
+            "digest hit must advance the cached CommitCounter"
+        );
+
+        // Third commit with modified pixels: digest mismatch -> cache miss.
+        let digest_3 = cache
+            .probe_digest(
+                &key,
+                c3,
+                &context_id,
+                workload,
+                &mut digest_target,
+                &mut renderer,
+                &tex_c,
+                src_rect,
+                false,
+                Transform::Normal,
+            )
+            .expect_err("modified pixels must miss");
+        assert!(digest_3.is_some());
+
+        // Below-threshold workload skips digest computation completely.
+        let small_workload = PassWorkload::single_pass(size, Size::from((640, 360)));
+        let below = cache
+            .probe_digest(
+                &key,
+                c3,
+                &context_id,
+                small_workload,
+                &mut digest_target,
+                &mut renderer,
+                &tex_b,
+                src_rect,
+                false,
+                Transform::Normal,
+            )
+            .expect_err("below-threshold workload must not hit via digest");
+        assert!(below.is_none());
     }
 }
