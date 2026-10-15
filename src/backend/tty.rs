@@ -67,7 +67,7 @@ use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
-use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
+use crate::render_helpers::{resources, shaders, superres, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
 // When copying from rendering Nvidia dGPU to target iGPU,
@@ -853,6 +853,10 @@ impl Tty {
             let gles_renderer = renderer.as_gles_renderer();
             resources::init(gles_renderer);
             shaders::init(gles_renderer);
+            superres::init(
+                gles_renderer,
+                self.primary_render_node.dev_path().as_deref(),
+            );
 
             let config = self.config.borrow();
             if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {

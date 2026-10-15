@@ -60,7 +60,8 @@ pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, 
 pub use crate::utils::FloatOrInt;
 use crate::utils::{expand_home_path, Flag, MergeWith as _};
 pub use crate::window_rule::{
-    FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, WindowRule,
+    FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, Upscaling,
+    UpscalingAlgorithm, UpscalingMode, UpscalingRule, WindowRule,
 };
 pub use crate::workspace::{Workspace, WorkspaceLayoutPart};
 
@@ -672,6 +673,82 @@ mod tests {
     }
 
     #[test]
+    fn parse_upscaling() {
+        let parsed = do_parse(
+            r#"
+            window-rule {
+                upscaling {
+                    mode "filter"
+                    algorithm "bicubic"
+                }
+            }
+            window-rule {
+                upscaling {
+                    algorithm "fsr1"
+                }
+            }
+            window-rule {
+                upscaling {
+                    mode "off"
+                }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            parsed
+                .window_rules
+                .iter()
+                .map(|rule| rule.upscaling)
+                .collect::<Vec<_>>(),
+            vec![
+                UpscalingRule {
+                    mode: Some(UpscalingMode::Filter),
+                    algorithm: Some(UpscalingAlgorithm::Bicubic),
+                },
+                UpscalingRule {
+                    mode: None,
+                    algorithm: Some(UpscalingAlgorithm::Fsr1),
+                },
+                UpscalingRule {
+                    mode: Some(UpscalingMode::Off),
+                    algorithm: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn upscaling_merge() {
+        let mut resolved = Upscaling::default();
+        assert!(!resolved.enabled());
+
+        // Setting an algorithm without a mode enables the effect.
+        resolved.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: Some(UpscalingAlgorithm::Bicubic),
+        });
+        assert!(resolved.enabled());
+        assert_eq!(resolved.mode(), UpscalingMode::Filter);
+        assert_eq!(resolved.algorithm(), UpscalingAlgorithm::Bicubic);
+
+        // A later rule can override the algorithm.
+        resolved.merge_with(&UpscalingRule {
+            mode: None,
+            algorithm: Some(UpscalingAlgorithm::Bilinear),
+        });
+        assert!(resolved.enabled());
+        assert_eq!(resolved.algorithm(), UpscalingAlgorithm::Bilinear);
+
+        // ...and turn the effect off again.
+        resolved.merge_with(&UpscalingRule {
+            mode: Some(UpscalingMode::Off),
+            algorithm: None,
+        });
+        assert!(!resolved.enabled());
+    }
+
+    #[test]
     fn parse() {
         let parsed = do_parse(
             r##"
@@ -925,6 +1002,11 @@ mod tests {
                 }
 
                 pinch-sensitivity 1.2
+
+                upscaling {
+                    mode "filter"
+                    algorithm "bicubic"
+                }
             }
 
             layer-rule {
@@ -1931,6 +2013,14 @@ mod tests {
                             noise: None,
                             saturation: None,
                         },
+                    },
+                    upscaling: UpscalingRule {
+                        mode: Some(
+                            Filter,
+                        ),
+                        algorithm: Some(
+                            Bicubic,
+                        ),
                     },
                 },
             ],

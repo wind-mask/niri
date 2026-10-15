@@ -1257,6 +1257,11 @@ impl<W: LayoutElement> Tile<W> {
                     // Otherwise, render the solid color as is.
                     LayoutElementRenderElement::SolidColor(elem).into()
                 }
+                elem @ LayoutElementRenderElement::SuperRes(_) => {
+                    // FIXME: apply clip-to-geometry and the corner radius to resampled windows
+                    // too. ClippedSurfaceRenderElement only wraps plain surface elements.
+                    elem.into()
+                }
                 elem @ LayoutElementRenderElement::BackgroundEffect(_) => {
                     // This is only used on popups for now. If subsurface blur is implemented, this
                     // will need to be handled somehow.
