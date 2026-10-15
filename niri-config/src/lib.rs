@@ -685,6 +685,7 @@ mod tests {
             window-rule {
                 upscaling {
                     algorithm "fsr1"
+                    sharpness 0.4
                 }
             }
             window-rule {
@@ -705,14 +706,17 @@ mod tests {
                 UpscalingRule {
                     mode: Some(UpscalingMode::Filter),
                     algorithm: Some(UpscalingAlgorithm::Bicubic),
+                    sharpness: None,
                 },
                 UpscalingRule {
                     mode: None,
                     algorithm: Some(UpscalingAlgorithm::Fsr1),
+                    sharpness: Some(FloatOrInt(0.4)),
                 },
                 UpscalingRule {
                     mode: Some(UpscalingMode::Off),
                     algorithm: None,
+                    sharpness: None,
                 },
             ]
         );
@@ -727,6 +731,7 @@ mod tests {
         resolved.merge_with(&UpscalingRule {
             mode: None,
             algorithm: Some(UpscalingAlgorithm::Bicubic),
+            sharpness: None,
         });
         assert!(resolved.enabled());
         assert_eq!(resolved.mode(), UpscalingMode::Filter);
@@ -736,6 +741,7 @@ mod tests {
         resolved.merge_with(&UpscalingRule {
             mode: None,
             algorithm: Some(UpscalingAlgorithm::Bilinear),
+            sharpness: None,
         });
         assert!(resolved.enabled());
         assert_eq!(resolved.algorithm(), UpscalingAlgorithm::Bilinear);
@@ -744,6 +750,7 @@ mod tests {
         resolved.merge_with(&UpscalingRule {
             mode: Some(UpscalingMode::Off),
             algorithm: None,
+            sharpness: None,
         });
         assert!(!resolved.enabled());
     }
@@ -2030,6 +2037,7 @@ mod tests {
                         algorithm: Some(
                             Bicubic,
                         ),
+                        sharpness: None,
                     },
                 },
             ],

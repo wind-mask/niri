@@ -18,27 +18,33 @@
 //! (unsupported context, compile error) or a surface has nothing to resample, the element falls
 //! back to the renderer's own sampling instead of failing the frame.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use anyhow::Context as _;
 use niri_config::{Upscaling, UpscalingAlgorithm, UpscalingMode};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, WaylandSurfaceTexture,
 };
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
-    ffi, Capability, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName,
-    UniformType,
+    ffi, Capability, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
+    UniformName, UniformType,
 };
+use smithay::backend::renderer::multigpu::MultiTexture;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::backend::renderer::{buffer_y_inverted, ImportAll, Renderer, Texture};
+use smithay::backend::renderer::{
+    buffer_y_inverted, Bind as _, Color32F, ContextId, Frame as _, ImportAll, Offscreen as _,
+    Renderer, Texture,
+};
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Physical, Rectangle, Scale, Size, Transform};
 
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-use crate::render_helpers::renderer::AsGlesFrame as _;
+use crate::backend::tty::{native_texture, TtyFrame, TtyRenderer, TtyRendererError};
+use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
 
 /// Resampling kernel for a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,19 +59,49 @@ pub enum ResampleFilter {
     Bicubic,
 }
 
-impl ResampleFilter {
+/// How a window is drawn with super resolution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SuperResKernel {
+    /// A single-pass resampling filter drawn over the client buffer.
+    Filter(ResampleFilter),
+
+    /// FSR1: EASU into an offscreen texture, then RCAS in the final draw.
+    Fsr1(Fsr1Params),
+}
+
+impl SuperResKernel {
     /// Returns the kernel to use for an algorithm, and whether it fell back to a baseline.
     ///
     /// Algorithms that are not implemented yet fall back to the best baseline kernel rather than
     /// drawing something that we cannot explain.
-    fn for_algorithm(algorithm: UpscalingAlgorithm) -> (Self, bool) {
+    fn for_algorithm(algorithm: UpscalingAlgorithm, sharpness: f64) -> (Self, bool) {
         match algorithm {
-            UpscalingAlgorithm::Bilinear => (Self::Bilinear, false),
-            UpscalingAlgorithm::Bicubic => (Self::Bicubic, false),
-            UpscalingAlgorithm::Fsr1 | UpscalingAlgorithm::Cunny2 | UpscalingAlgorithm::Anime4k => {
-                (Self::Bicubic, true)
+            UpscalingAlgorithm::Bilinear => (Self::Filter(ResampleFilter::Bilinear), false),
+            UpscalingAlgorithm::Bicubic => (Self::Filter(ResampleFilter::Bicubic), false),
+            UpscalingAlgorithm::Fsr1 => (
+                Self::Fsr1(Fsr1Params {
+                    sharpness: sharpness as f32,
+                }),
+                false,
+            ),
+            UpscalingAlgorithm::Cunny2 | UpscalingAlgorithm::Anime4k => {
+                (Self::Filter(ResampleFilter::Bicubic), true)
             }
         }
+    }
+}
+
+/// FSR1 parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fsr1Params {
+    /// Sharpening strength, in RCAS stops of halving.
+    pub sharpness: f32,
+}
+
+impl Fsr1Params {
+    /// Returns the RCAS sharpening scale, `exp2(-sharpness)` of `FsrRcasCon()`.
+    fn sharpness_scale(&self) -> f32 {
+        (-self.sharpness).exp2()
     }
 }
 
@@ -351,20 +387,41 @@ fn parse_glsl_version(version: &str) -> Option<(i32, i32)> {
     Some((major, minor))
 }
 
-/// The resampling programs, one per kernel.
+/// The super resolution programs, one per pass.
 ///
 /// These are compiled once per renderer context and stored in the EGL context user data.
 #[derive(Debug)]
-pub struct ResamplePrograms {
+pub struct SuperResPrograms {
     bilinear: Option<GlesTexProgram>,
     bicubic: Option<GlesTexProgram>,
+    easu: Option<GlesTexProgram>,
+    rcas: Option<GlesTexProgram>,
 }
 
-impl ResamplePrograms {
+impl SuperResPrograms {
     fn compile(renderer: &mut GlesRenderer) -> Self {
         Self {
             bilinear: Self::compile_filter(renderer, ResampleFilter::Bilinear),
             bicubic: Self::compile_filter(renderer, ResampleFilter::Bicubic),
+            easu: Self::compile_file(
+                renderer,
+                "easu",
+                include_str!("shaders/superres/fsr1_easu.frag"),
+                &[
+                    UniformName::new("niri_tex_size", UniformType::_2f),
+                    UniformName::new("niri_src_rect", UniformType::_4f),
+                ],
+            ),
+            rcas: Self::compile_file(
+                renderer,
+                "rcas",
+                include_str!("shaders/superres/fsr1_rcas.frag"),
+                &[
+                    UniformName::new("niri_tex_size", UniformType::_2f),
+                    UniformName::new("niri_src_rect", UniformType::_4f),
+                    UniformName::new("niri_rcas_sharpness", UniformType::_1f),
+                ],
+            ),
         }
     }
 
@@ -372,11 +429,6 @@ impl ResamplePrograms {
         renderer: &mut GlesRenderer,
         filter: ResampleFilter,
     ) -> Option<GlesTexProgram> {
-        let uniforms = [
-            UniformName::new("niri_tex_size", UniformType::_2f),
-            UniformName::new("niri_src_rect", UniformType::_4f),
-        ];
-
         let index = match filter {
             ResampleFilter::Bilinear => 0,
             ResampleFilter::Bicubic => 1,
@@ -387,10 +439,30 @@ impl ResamplePrograms {
             &format!("#define NIRI_RESAMPLE_FILTER {index}"),
         );
 
-        match renderer.compile_custom_texture_shader(source, &uniforms) {
+        Self::compile_file(
+            renderer,
+            match filter {
+                ResampleFilter::Bilinear => "bilinear",
+                ResampleFilter::Bicubic => "bicubic",
+            },
+            &source,
+            &[
+                UniformName::new("niri_tex_size", UniformType::_2f),
+                UniformName::new("niri_src_rect", UniformType::_4f),
+            ],
+        )
+    }
+
+    fn compile_file(
+        renderer: &mut GlesRenderer,
+        name: &str,
+        source: &str,
+        uniforms: &[UniformName<'_>],
+    ) -> Option<GlesTexProgram> {
+        match renderer.compile_custom_texture_shader(source, uniforms) {
             Ok(program) => Some(program),
             Err(err) => {
-                warn!("error compiling {filter:?} resampling shader: {err:?}");
+                warn!("error compiling the {name} shader: {err:?}");
                 None
             }
         }
@@ -398,6 +470,10 @@ impl ResamplePrograms {
 
     fn get_from_frame<'a>(frame: &'a GlesFrame<'_, '_>) -> Option<&'a Self> {
         frame.egl_context().user_data().get()
+    }
+
+    fn get(renderer: &GlesRenderer) -> Option<&Self> {
+        renderer.egl_context().user_data().get()
     }
 
     fn program(&self, filter: ResampleFilter) -> Option<GlesTexProgram> {
@@ -420,7 +496,7 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
     info!("super resolution: {}", capabilities.summary());
     debug!("super resolution capabilities: {capabilities:#?}");
 
-    let programs = ResamplePrograms::compile(renderer);
+    let programs = SuperResPrograms::compile(renderer);
 
     let data = renderer.egl_context().user_data();
     if !data.insert_if_missing(|| capabilities) {
@@ -446,12 +522,50 @@ pub fn capabilities(renderer: &mut GlesRenderer) -> Option<&Capabilities> {
 #[derive(Debug)]
 pub struct SuperResElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    filter: ResampleFilter,
+    kernel: ElementKernel,
+}
+
+/// What an element draws with.
+#[derive(Debug, Clone)]
+pub enum ElementKernel {
+    /// The client buffer, resampled with a single-pass filter.
+    Filter(ResampleFilter),
+
+    /// A cached EASU result, sharpened with RCAS.
+    Fsr1 {
+        /// The EASU result.
+        texture: GlesTexture,
+        /// The renderer context that the texture belongs to.
+        context_id: ContextId<GlesTexture>,
+        /// Sharpening scale for RCAS, `exp2(-sharpness)`.
+        sharpness_scale: f32,
+    },
 }
 
 impl<R: Renderer> SuperResElement<R> {
+    /// Creates an element that draws the client buffer with a resampling filter.
     pub fn new(inner: WaylandSurfaceRenderElement<R>, filter: ResampleFilter) -> Self {
-        Self { inner, filter }
+        Self {
+            inner,
+            kernel: ElementKernel::Filter(filter),
+        }
+    }
+
+    /// Creates an element that draws a cached FSR1 result.
+    pub fn fsr1(
+        inner: WaylandSurfaceRenderElement<R>,
+        texture: GlesTexture,
+        context_id: ContextId<GlesTexture>,
+        sharpness_scale: f32,
+    ) -> Self {
+        Self {
+            inner,
+            kernel: ElementKernel::Fsr1 {
+                texture,
+                context_id,
+                sharpness_scale,
+            },
+        }
     }
 }
 
@@ -499,7 +613,7 @@ impl<R: Renderer + ImportAll> SuperResElement<R>
 where
     R::TextureId: Texture,
 {
-    /// Returns the resampling uniforms for a source rect.
+    /// Returns the resampling uniforms for a source rect of the client buffer.
     fn resample_uniforms(&self, src: Rectangle<f64, Buffer>) -> Option<[Uniform<'static>; 2]> {
         let WaylandSurfaceTexture::Texture(texture) = self.inner.texture() else {
             return None;
@@ -520,7 +634,11 @@ where
         frame: &GlesFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
     ) -> Option<(GlesTexProgram, Vec<Uniform<'static>>)> {
-        let program = ResamplePrograms::get_from_frame(frame)?.program(self.filter)?;
+        let ElementKernel::Filter(filter) = self.kernel else {
+            return None;
+        };
+
+        let program = SuperResPrograms::get_from_frame(frame)?.program(filter)?;
         let uniforms = self.resample_uniforms(src)?;
         Some((program, uniforms.to_vec()))
     }
@@ -568,6 +686,68 @@ impl<R: Renderer + ImportAll> Element for SuperResElement<R> {
     }
 }
 
+/// Draws a surface element with the renderer's own sampling.
+#[allow(clippy::too_many_arguments)]
+fn draw_inner_gles(
+    inner: &WaylandSurfaceRenderElement<GlesRenderer>,
+    frame: &mut GlesFrame<'_, '_>,
+    src: Rectangle<f64, Buffer>,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+    opaque_regions: &[Rectangle<i32, Physical>],
+    cache: Option<&UserDataMap>,
+) -> Result<(), GlesError> {
+    RenderElement::<GlesRenderer>::draw(inner, frame, src, dst, damage, opaque_regions, cache)
+}
+
+/// Draws a cached FSR1 result with the sharpening pass.
+///
+/// Returns `None` when the result cannot be drawn, in which case the caller must fall back to
+/// drawing the client buffer. The result texture belongs to the renderer that produced it, and it
+/// is already at the element's size, so this is a straight 1:1 draw.
+#[allow(clippy::too_many_arguments)]
+fn draw_fsr1(
+    frame: &mut GlesFrame<'_, '_>,
+    texture: &GlesTexture,
+    context_id: ContextId<GlesTexture>,
+    sharpness_scale: f32,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+    opaque_regions: &[Rectangle<i32, Physical>],
+    alpha: f32,
+) -> Option<Result<(), GlesError>> {
+    if frame.context_id() != context_id {
+        // This happens when the same window is drawn on another GPU, where the cached result is
+        // not valid. It is not an error, we just cannot use the cache here.
+        debug!("not drawing a super resolution result from another renderer context");
+        return None;
+    }
+
+    let size = texture.size();
+    if size.w <= 0 || size.h <= 0 {
+        return None;
+    }
+
+    let program = SuperResPrograms::get_from_frame(frame)?.rcas.clone()?;
+    let uniforms = [
+        Uniform::new("niri_tex_size", (size.w as f32, size.h as f32)),
+        Uniform::new("niri_src_rect", [0f32, 0., size.w as f32, size.h as f32]),
+        Uniform::new("niri_rcas_sharpness", sharpness_scale),
+    ];
+
+    Some(frame.render_texture_from_to(
+        texture,
+        Rectangle::from_size(size.to_f64()),
+        dst,
+        damage,
+        opaque_regions,
+        Transform::Normal,
+        alpha,
+        Some(&program),
+        &uniforms,
+    ))
+}
+
 impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
     fn draw(
         &self,
@@ -578,31 +758,47 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let Some((program, uniforms)) = self.resample_program(frame, src) else {
-            // Fall back to the renderer's own sampling.
-            return RenderElement::<GlesRenderer>::draw(
-                &self.inner,
+        match &self.kernel {
+            ElementKernel::Filter(_) => {
+                let Some((program, uniforms)) = self.resample_program(frame, src) else {
+                    // Fall back to the renderer's own sampling.
+                    return draw_inner_gles(
+                        &self.inner,
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    );
+                };
+
+                frame.override_default_tex_program(program, uniforms);
+                let res =
+                    draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+                frame.clear_tex_program_override();
+                res
+            }
+            ElementKernel::Fsr1 {
+                texture,
+                context_id,
+                sharpness_scale,
+            } => match draw_fsr1(
                 frame,
-                src,
+                texture,
+                context_id.clone(),
+                *sharpness_scale,
                 dst,
                 damage,
                 opaque_regions,
-                cache,
-            );
-        };
-
-        frame.override_default_tex_program(program, uniforms);
-        let res = RenderElement::<GlesRenderer>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
-        frame.clear_tex_program_override();
-        res
+                self.inner.alpha(),
+            ) {
+                Some(res) => res,
+                None => {
+                    draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
+                }
+            },
+        }
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -622,35 +818,71 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let program = self.resample_program(frame.as_gles_frame(), src);
+        match &self.kernel {
+            ElementKernel::Filter(_) => {
+                let program = self.resample_program(frame.as_gles_frame(), src);
 
-        let Some((program, uniforms)) = program else {
-            // Fall back to the renderer's own sampling.
-            return RenderElement::<TtyRenderer<'render>>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            );
-        };
+                let Some((program, uniforms)) = program else {
+                    // Fall back to the renderer's own sampling.
+                    return RenderElement::<TtyRenderer<'render>>::draw(
+                        &self.inner,
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    );
+                };
 
-        frame
-            .as_gles_frame()
-            .override_default_tex_program(program, uniforms);
-        let res = RenderElement::<TtyRenderer<'render>>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
-        frame.as_gles_frame().clear_tex_program_override();
-        res
+                frame
+                    .as_gles_frame()
+                    .override_default_tex_program(program, uniforms);
+                let res = RenderElement::<TtyRenderer<'render>>::draw(
+                    &self.inner,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                );
+                frame.as_gles_frame().clear_tex_program_override();
+                res
+            }
+            ElementKernel::Fsr1 {
+                texture,
+                context_id,
+                sharpness_scale,
+            } => {
+                // Drawing through the underlying GLES frame rather than through the multigpu frame:
+                // the cached result is a plain GLES texture that the multigpu frame cannot address.
+                // This loses the multigpu frame's cross-GPU damage bookkeeping, which is why this
+                // has to be revisited together with mixed-GPU support.
+                if let Some(res) = draw_fsr1(
+                    frame.as_gles_frame(),
+                    texture,
+                    context_id.clone(),
+                    *sharpness_scale,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    self.inner.alpha(),
+                ) {
+                    return res.map_err(TtyRendererError::Render);
+                }
+
+                RenderElement::<TtyRenderer<'render>>::draw(
+                    &self.inner,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+            }
+        }
     }
 
     fn underlying_storage(
@@ -661,21 +893,65 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
     }
 }
 
+/// Gets a renderer's own GLES texture, or the per-GPU texture behind a multigpu texture.
+///
+/// Offscreen passes run on one GPU's GLES renderer, so they need the texture that belongs to that
+/// renderer's context rather than the renderer-independent handle.
+pub trait PassSource {
+    /// Returns the texture as it exists in the given renderer context.
+    fn pass_texture(&self, context_id: &ContextId<GlesTexture>) -> Option<GlesTexture>;
+}
+
+impl PassSource for GlesTexture {
+    fn pass_texture(&self, _context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
+        // The element was built with this renderer, so the texture belongs to its context.
+        Some(self.clone())
+    }
+}
+
+impl PassSource for MultiTexture {
+    fn pass_texture(&self, context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
+        native_texture(self, context_id)
+    }
+}
+
+/// An offscreen result of the EASU pass.
+#[derive(Debug)]
+struct Fsr1Result {
+    texture: GlesTexture,
+    context_id: ContextId<GlesTexture>,
+    key: Fsr1Key,
+}
+
+/// What an EASU result was produced from.
+///
+/// Resampling a window goes through this pass once per source commit, and the final sharpening
+/// pass runs on the result every frame, so this only has to change when the content or the size
+/// does. Moving the window, drawing other windows or moving the cursor must not invalidate it.
+#[derive(Debug, Clone, PartialEq)]
+struct Fsr1Key {
+    commit: CommitCounter,
+    /// Source rect in buffer texels.
+    src: Rectangle<f64, Buffer>,
+    /// Destination size in physical pixels.
+    size: Size<i32, Physical>,
+}
+
 /// Per-window super resolution state.
 ///
-/// The first stage resamples during the final draw, so there is no cached result texture and no
-/// pass graph to keep here yet. What this holds is the resolved configuration, plus whether we
-/// already explained a fallback, so that a window with an algorithm or mode that is not
-/// implemented logs about it once instead of every frame.
-///
-/// Later stages (neural network models, multi-pass execution, result caching) attach their state
-/// here.
+/// This holds the resolved configuration, the cached FSR1 result, and whether we already explained
+/// a fallback, so that a window with an algorithm or mode that is not implemented logs about it
+/// once instead of every frame.
 #[derive(Debug)]
 pub struct SuperResolutionPipeline {
     /// The mode and algorithm that the current decision was made for.
     resolved: Cell<Option<(UpscalingMode, UpscalingAlgorithm)>>,
     /// Whether we already logged a fallback for the current decision.
     warned_fallback: Cell<bool>,
+    /// Whether we already logged that the offscreen pass failed.
+    warned_pass_failure: Cell<bool>,
+    /// Cached result of the EASU pass.
+    fsr1: RefCell<Option<Fsr1Result>>,
 }
 
 impl SuperResolutionPipeline {
@@ -683,14 +959,16 @@ impl SuperResolutionPipeline {
         Self {
             resolved: Cell::new(None),
             warned_fallback: Cell::new(false),
+            warned_pass_failure: Cell::new(false),
+            fsr1: RefCell::new(None),
         }
     }
 
-    /// Returns the resampling kernel to draw this window with, if the effect is enabled.
+    /// Returns the kernel to draw this window with, if the effect is enabled.
     ///
     /// This returns `None` when the window rules do not enable super resolution, in which case
     /// the window should be drawn the normal way.
-    pub fn filter(&self, rules: &Upscaling) -> Option<ResampleFilter> {
+    pub fn kernel(&self, rules: &Upscaling) -> Option<SuperResKernel> {
         if !rules.enabled() {
             self.resolved.set(None);
             return None;
@@ -698,11 +976,14 @@ impl SuperResolutionPipeline {
 
         let mode = rules.mode();
         let algorithm = rules.algorithm();
-        let (filter, fell_back) = ResampleFilter::for_algorithm(algorithm);
+        let (kernel, fell_back) = SuperResKernel::for_algorithm(algorithm, rules.sharpness());
 
         if self.resolved.get() != Some((mode, algorithm)) {
             self.resolved.set(Some((mode, algorithm)));
             self.warned_fallback.set(false);
+            self.warned_pass_failure.set(false);
+            // The parameters may have changed, so the cached result may no longer match.
+            self.fsr1.borrow_mut().take();
         }
 
         if !self.warned_fallback.get() {
@@ -716,12 +997,170 @@ impl SuperResolutionPipeline {
             }
 
             if fell_back {
-                warn!("upscaling algorithm {algorithm:?} is not implemented yet, using {filter:?}");
+                warn!("upscaling algorithm {algorithm:?} is not implemented yet, using {kernel:?}");
             }
         }
 
-        Some(filter)
+        Some(kernel)
     }
+
+    /// Wraps a surface element, running the EASU pass first if the cached result is stale.
+    ///
+    /// `renderer` must be the GLES renderer that will draw the element, and `scale` is the output
+    /// scale that the element is drawn at. The returned element falls back to drawing the client
+    /// buffer normally when the pass cannot run or when its result is not valid for the renderer
+    /// that ends up drawing it.
+    pub fn element<R: NiriRenderer>(
+        &self,
+        renderer: &mut GlesRenderer,
+        elem: WaylandSurfaceRenderElement<R>,
+        kernel: SuperResKernel,
+        scale: Scale<f64>,
+    ) -> SuperResElement<R>
+    where
+        R::TextureId: PassSource,
+    {
+        let params = match kernel {
+            SuperResKernel::Filter(filter) => return SuperResElement::new(elem, filter),
+            SuperResKernel::Fsr1(params) => params,
+        };
+
+        let Some(texture) = self.fsr1_result(renderer, &elem, scale) else {
+            // Fall back to the best single-pass kernel that we have.
+            return SuperResElement::new(elem, ResampleFilter::Bicubic);
+        };
+
+        SuperResElement::fsr1(
+            elem,
+            texture.texture.clone(),
+            texture.context_id.clone(),
+            params.sharpness_scale(),
+        )
+    }
+
+    /// Returns the cached EASU result, running the pass if it is stale.
+    fn fsr1_result<R: NiriRenderer>(
+        &self,
+        renderer: &mut GlesRenderer,
+        elem: &WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+    ) -> Option<Fsr1Result>
+    where
+        R::TextureId: PassSource,
+    {
+        let size = elem.geometry(scale).size;
+        if size.w <= 0 || size.h <= 0 {
+            return None;
+        }
+
+        let src = elem.src();
+        let key = Fsr1Key {
+            commit: elem.current_commit(),
+            src,
+            size,
+        };
+
+        if let Some(result) = self.fsr1.borrow().as_ref() {
+            if result.key == key && result.context_id == renderer.context_id() {
+                // The cached result is still what this window would be drawn with.
+                return Some(Fsr1Result {
+                    texture: result.texture.clone(),
+                    context_id: result.context_id.clone(),
+                    key,
+                });
+            }
+        }
+
+        let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
+            return None;
+        };
+        let source = texture.pass_texture(&renderer.context_id())?;
+
+        let y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false);
+        let uniforms = resample_uniforms(&source, src, y_inverted)?;
+        let program = SuperResPrograms::get(renderer)?.easu.clone()?;
+
+        let texture = match run_easu_pass(
+            renderer,
+            &source,
+            src,
+            size,
+            elem.transform(),
+            &program,
+            &uniforms,
+        ) {
+            Ok(texture) => texture,
+            Err(err) => {
+                if !self.warned_pass_failure.replace(true) {
+                    warn!("error running the super resolution pass: {err:?}");
+                }
+                return None;
+            }
+        };
+
+        let result = Fsr1Result {
+            texture,
+            context_id: renderer.context_id(),
+            key,
+        };
+
+        *self.fsr1.borrow_mut() = Some(Fsr1Result {
+            texture: result.texture.clone(),
+            context_id: result.context_id.clone(),
+            key: result.key.clone(),
+        });
+
+        Some(result)
+    }
+}
+
+/// Runs the EASU pass: renders the client buffer into an offscreen texture at the display size.
+#[allow(clippy::too_many_arguments)]
+fn run_easu_pass(
+    renderer: &mut GlesRenderer,
+    source: &GlesTexture,
+    src: Rectangle<f64, Buffer>,
+    size: Size<i32, Physical>,
+    transform: Transform,
+    program: &GlesTexProgram,
+    uniforms: &[Uniform<'static>],
+) -> anyhow::Result<GlesTexture> {
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    let mut texture = renderer
+        .create_buffer(Fourcc::Abgr8888, buffer_size)
+        .context("error creating texture")?;
+
+    let rect = Rectangle::from_size(size);
+
+    {
+        let mut target = renderer
+            .bind(&mut texture)
+            .context("error binding texture")?;
+        let mut frame = renderer
+            .render(&mut target, size, Transform::Normal)
+            .context("error starting frame")?;
+
+        frame
+            .clear(Color32F::TRANSPARENT, &[rect])
+            .context("error clearing")?;
+        frame
+            .render_texture_from_to(
+                source,
+                src,
+                rect,
+                &[rect],
+                &[rect],
+                transform,
+                // The element alpha is applied by the sharpening pass.
+                1.0,
+                Some(program),
+                uniforms,
+            )
+            .context("error in the EASU pass")?;
+        let _ = frame.finish().context("error finishing frame")?;
+    }
+
+    Ok(texture)
 }
 
 impl Default for SuperResolutionPipeline {
@@ -765,25 +1204,37 @@ mod tests {
     }
 
     #[test]
-    fn filter_for_algorithm() {
+    fn kernel_for_algorithm() {
         assert_eq!(
-            ResampleFilter::for_algorithm(UpscalingAlgorithm::Bilinear),
-            (ResampleFilter::Bilinear, false)
+            SuperResKernel::for_algorithm(UpscalingAlgorithm::Bilinear, 0.2),
+            (SuperResKernel::Filter(ResampleFilter::Bilinear), false)
         );
         assert_eq!(
-            ResampleFilter::for_algorithm(UpscalingAlgorithm::Bicubic),
-            (ResampleFilter::Bicubic, false)
+            SuperResKernel::for_algorithm(UpscalingAlgorithm::Bicubic, 0.2),
+            (SuperResKernel::Filter(ResampleFilter::Bicubic), false)
         );
         assert_eq!(
-            ResampleFilter::for_algorithm(UpscalingAlgorithm::Cunny2),
-            (ResampleFilter::Bicubic, true)
+            SuperResKernel::for_algorithm(UpscalingAlgorithm::Cunny2, 0.2),
+            (SuperResKernel::Filter(ResampleFilter::Bicubic), true)
         );
+
+        let (kernel, fell_back) = SuperResKernel::for_algorithm(UpscalingAlgorithm::Fsr1, 0.5);
+        assert!(!fell_back);
+        assert_eq!(kernel, SuperResKernel::Fsr1(Fsr1Params { sharpness: 0.5 }));
+    }
+
+    #[test]
+    fn fsr1_sharpness_scale() {
+        // `FsrRcasCon()` turns stops of halving into a linear scale.
+        assert_eq!(Fsr1Params { sharpness: 0.0 }.sharpness_scale(), 1.0);
+        assert_eq!(Fsr1Params { sharpness: 1.0 }.sharpness_scale(), 0.5);
+        assert_eq!(Fsr1Params { sharpness: 2.0 }.sharpness_scale(), 0.25);
     }
 
     #[test]
     fn pipeline_disabled_by_default() {
         let pipeline = SuperResolutionPipeline::new();
-        assert_eq!(pipeline.filter(&Upscaling::default()), None);
+        assert_eq!(pipeline.kernel(&Upscaling::default()), None);
     }
 
     #[test]
@@ -792,8 +1243,12 @@ mod tests {
         let rules = Upscaling {
             mode: Some(UpscalingMode::Filter),
             algorithm: None,
+            sharpness: None,
         };
-        assert_eq!(pipeline.filter(&rules), Some(ResampleFilter::Bilinear));
+        assert_eq!(
+            pipeline.kernel(&rules),
+            Some(SuperResKernel::Filter(ResampleFilter::Bilinear))
+        );
     }
 
     #[test]
@@ -802,8 +1257,26 @@ mod tests {
         let rules = Upscaling {
             mode: None,
             algorithm: Some(UpscalingAlgorithm::Bicubic),
+            sharpness: None,
         };
-        assert_eq!(pipeline.filter(&rules), Some(ResampleFilter::Bicubic));
+        assert_eq!(
+            pipeline.kernel(&rules),
+            Some(SuperResKernel::Filter(ResampleFilter::Bicubic))
+        );
+    }
+
+    #[test]
+    fn pipeline_fsr1() {
+        let pipeline = SuperResolutionPipeline::new();
+        let rules = Upscaling {
+            mode: None,
+            algorithm: Some(UpscalingAlgorithm::Fsr1),
+            sharpness: Some(1.0),
+        };
+        assert_eq!(
+            pipeline.kernel(&rules),
+            Some(SuperResKernel::Fsr1(Fsr1Params { sharpness: 1.0 }))
+        );
     }
 
     #[test]
@@ -812,8 +1285,9 @@ mod tests {
         let rules = Upscaling {
             mode: Some(UpscalingMode::Off),
             algorithm: Some(UpscalingAlgorithm::Bicubic),
+            sharpness: None,
         };
-        assert_eq!(pipeline.filter(&rules), None);
+        assert_eq!(pipeline.kernel(&rules), None);
     }
     // The kernels are verified on a real GL context below. These tests need an EGL device, so
     // they return early when there is not one (for example on a machine with no GPU access); the
@@ -823,9 +1297,7 @@ mod tests {
     use smithay::backend::egl::native::EGLSurfacelessDisplay;
     use smithay::backend::egl::{EGLContext, EGLDisplay};
     use smithay::backend::renderer::gles::GlesTexture;
-    use smithay::backend::renderer::{
-        Bind as _, Color32F, ExportMem as _, Frame as _, ImportMem as _, Offscreen as _,
-    };
+    use smithay::backend::renderer::{Color32F, ExportMem as _, ImportMem as _};
     use smithay::utils::Size;
 
     use crate::render_helpers::copy_framebuffer;
@@ -897,7 +1369,7 @@ mod tests {
             frame.clear(Color32F::TRANSPARENT, &[dest_rect]).unwrap();
 
             let program = filter.map(|filter| {
-                let programs = ResamplePrograms::get_from_frame(&frame)
+                let programs = SuperResPrograms::get_from_frame(&frame)
                     .expect("superres::init() must be called on this renderer");
                 let program = programs
                     .program(filter)
@@ -1056,6 +1528,378 @@ mod tests {
                             "{filter:?} at ({x}, {y}) channel {channel}: {got} != {want}",
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// A grayscale pattern with hard edges and gradients.
+    ///
+    /// All four channels carry the same luminance, which makes the FSR1 checks below independent
+    /// of the channel order that the framebuffer happens to use. The color path is the same code
+    /// with per-channel weights, since EASU and RCAS only use the channel values through the
+    /// weighted average and the limiter rings.
+    fn grayscale_pixels(size: Size<i32, Buffer>) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for y in 0..size.h {
+            for x in 0..size.w {
+                // A diagonal edge plus a gradient, so that both the edge-adaptive weights and the
+                // flat parts of the kernel are used.
+                let value = if x + y < size.w {
+                    40 + x * 8
+                } else {
+                    200 - y * 4
+                };
+                let value = value.clamp(0, 255) as u8;
+                pixels.extend_from_slice(&[value, value, value, value]);
+            }
+        }
+        pixels
+    }
+
+    /// CPU transcriptions of the EASU and RCAS kernels, used to check the shaders.
+    ///
+    /// These are written from the same reference code as the shaders, so they catch transcription
+    /// and coordinate mistakes rather than changes to the algorithm.
+    mod reference {
+        /// Fetches the alpha of one texel with edge clamping.
+        fn texel_alpha(src: &[u8], size: (i32, i32), x: i32, y: i32) -> f64 {
+            let x = x.clamp(0, size.0 - 1);
+            let y = y.clamp(0, size.1 - 1);
+            f64::from(src[((y * size.0 + x) * 4) as usize + 3]) / 255.0
+        }
+
+        /// Fetches one texel with edge clamping, like the shaders' tap functions.
+        fn texel(src: &[u8], size: (i32, i32), x: i32, y: i32) -> f64 {
+            let x = x.clamp(0, size.0 - 1);
+            let y = y.clamp(0, size.1 - 1);
+            f64::from(src[((y * size.0 + x) * 4) as usize]) / 255.0
+        }
+
+        /// Luma times 2, as in the reference.
+        fn luma(src: &[u8], size: (i32, i32), x: i32, y: i32) -> f64 {
+            let c = texel(src, size, x, y);
+            c * 0.5 + (c * 0.5 + c)
+        }
+
+        /// Accumulates one weighted tap, with anisotropic windowing and a negative lobe.
+        #[allow(clippy::too_many_arguments)]
+        fn tap(
+            a_c: &mut f64,
+            a_w: &mut f64,
+            off: (f64, f64),
+            dir: (f64, f64),
+            len: (f64, f64),
+            lob: f64,
+            clp: f64,
+            c: f64,
+        ) {
+            let v = (
+                off.0 * dir.0 + off.1 * dir.1,
+                off.0 * -dir.1 + off.1 * dir.0,
+            );
+            let v = (v.0 * len.0, v.1 * len.1);
+            let d2 = (v.0 * v.0 + v.1 * v.1).min(clp);
+            let mut wb = (2.0 / 5.0) * d2 - 1.0;
+            let mut wa = lob * d2 - 1.0;
+            wb *= wb;
+            wa *= wa;
+            wb = (25.0 / 16.0) * wb - (25.0 / 16.0 - 1.0);
+            let w = wb * wa;
+            *a_c += c * w;
+            *a_w += w;
+        }
+
+        /// Accumulates direction and length for one quadrant.
+        fn set(w: f64, l: [f64; 5]) -> (f64, f64, f64) {
+            let [la, lb, lc, ld, le] = l;
+            let mut dir = (0.0, 0.0);
+            let mut len = 0.0;
+
+            let dc = ld - lc;
+            let cb = lc - lb;
+            let len_x_mag = dc.abs().max(cb.abs());
+            let dir_x = ld - lb;
+            dir.0 += dir_x * w;
+            let len_x = if len_x_mag > 0.0 {
+                (dir_x.abs() / len_x_mag).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let len_x = len_x * len_x;
+            len += len_x * w;
+
+            let ec = le - lc;
+            let ca = lc - la;
+            let len_y_mag = ec.abs().max(ca.abs());
+            let dir_y = le - la;
+            dir.1 += dir_y * w;
+            let len_y = if len_y_mag > 0.0 {
+                (dir_y.abs() / len_y_mag).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let len_y = len_y * len_y;
+            len += len_y * w;
+
+            (dir.0, dir.1, len)
+        }
+
+        /// EASU for one output pixel: the luminance value and the resampled alpha.
+        pub fn easu(
+            src: &[u8],
+            src_size: (i32, i32),
+            dest_size: (i32, i32),
+            x: i32,
+            y: i32,
+        ) -> (f64, f64) {
+            let ratio = (
+                f64::from(src_size.0) / f64::from(dest_size.0),
+                f64::from(src_size.1) / f64::from(dest_size.1),
+            );
+            let pos = (
+                (f64::from(x) + 0.5) * ratio.0 - 0.5,
+                (f64::from(y) + 0.5) * ratio.1 - 0.5,
+            );
+            let fp = (pos.0.floor(), pos.1.floor());
+            let pp = (pos.0 - fp.0, pos.1 - fp.1);
+            let fp = (fp.0 as i32, fp.1 as i32);
+
+            let t = |dx: i32, dy: i32| texel(src, src_size, fp.0 + dx, fp.1 + dy);
+            let l = |dx: i32, dy: i32| luma(src, src_size, fp.0 + dx, fp.1 + dy);
+
+            let (b, c, e, f, g, h, i, j, k, ll, n, o) = (
+                l(0, -1),
+                l(1, -1),
+                l(-1, 0),
+                l(0, 0),
+                l(1, 0),
+                l(2, 0),
+                l(-1, 1),
+                l(0, 1),
+                l(1, 1),
+                l(2, 1),
+                l(0, 2),
+                l(1, 2),
+            );
+
+            let w_s = (1.0 - pp.0) * (1.0 - pp.1);
+            let w_t = pp.0 * (1.0 - pp.1);
+            let w_u = (1.0 - pp.0) * pp.1;
+            let w_v = pp.0 * pp.1;
+
+            let (mut dx, mut dy, mut len) = (0.0, 0.0, 0.0);
+            for (w, quad) in [
+                (w_s, [b, e, f, g, j]),
+                (w_t, [c, f, g, h, k]),
+                (w_u, [f, i, j, k, n]),
+                (w_v, [g, j, k, ll, o]),
+            ] {
+                let (x, y, l) = set(w, quad);
+                dx += x;
+                dy += y;
+                len += l;
+            }
+
+            let dir2 = dx * dx + dy * dy;
+            let zro = dir2 < (1.0 / 32768.0);
+            let mut dir_r = 1.0 / dir2.sqrt();
+            dir_r = if zro { 1.0 } else { dir_r };
+            if zro {
+                dx = 1.0;
+            }
+            dx *= dir_r;
+            dy *= dir_r;
+
+            let mut len = len * 0.5;
+            len *= len;
+
+            let stretch = (dx * dx + dy * dy) / dx.abs().max(dy.abs());
+            let len2 = (1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+            let lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+            let clp = 1.0 / lob;
+
+            let min4 = t(0, 0).min(t(1, 0)).min(t(0, 1)).min(t(1, 1));
+            let max4 = t(0, 0).max(t(1, 0)).max(t(0, 1)).max(t(1, 1));
+
+            let mut a_c = 0.0;
+            let mut a_w = 0.0;
+            for (off, color) in [
+                ((0.0, -1.0), t(0, -1)),
+                ((1.0, -1.0), t(1, -1)),
+                ((-1.0, 1.0), t(-1, 1)),
+                ((0.0, 1.0), t(0, 1)),
+                ((0.0, 0.0), t(0, 0)),
+                ((-1.0, 0.0), t(-1, 0)),
+                ((1.0, 1.0), t(1, 1)),
+                ((2.0, 1.0), t(2, 1)),
+                ((2.0, 0.0), t(2, 0)),
+                ((1.0, 0.0), t(1, 0)),
+                ((1.0, 2.0), t(1, 2)),
+                ((0.0, 2.0), t(0, 2)),
+            ] {
+                tap(
+                    &mut a_c,
+                    &mut a_w,
+                    (off.0 - pp.0, off.1 - pp.1),
+                    (dx, dy),
+                    len2,
+                    lob,
+                    clp,
+                    color,
+                );
+            }
+
+            let color = (a_c / a_w).clamp(min4, max4);
+
+            let alpha = {
+                let f = texel(src, src_size, fp.0, fp.1);
+                let g = texel(src, src_size, fp.0 + 1, fp.1);
+                let j = texel(src, src_size, fp.0, fp.1 + 1);
+                let k = texel(src, src_size, fp.0 + 1, fp.1 + 1);
+                let lower = f + (g - f) * pp.0;
+                let upper = j + (k - j) * pp.0;
+                lower + (upper - lower) * pp.1
+            };
+
+            (color.min(alpha), alpha)
+        }
+
+        /// RCAS for one pixel of the sharpened image.
+        ///
+        /// The shader also clamps the sharpened color to the resampled alpha, which keeps the
+        /// result a valid premultiplied color. That is not part of the reference algorithm, so it
+        /// has to be mirrored here.
+        pub fn rcas(src: &[u8], size: (i32, i32), sharpness_scale: f64, x: i32, y: i32) -> f64 {
+            let t = |dx: i32, dy: i32| texel(src, size, x + dx, y + dy);
+            let l = |dx: i32, dy: i32| luma(src, size, x + dx, y + dy);
+
+            let (b, d, e, f, h) = (t(0, -1), t(-1, 0), t(0, 0), t(1, 0), t(0, 1));
+            let (bl, dl, el, fl, hl) = (l(0, -1), l(-1, 0), l(0, 0), l(1, 0), l(0, 1));
+
+            let mn4 = b.min(d).min(f).min(h);
+            let mx4 = b.max(d).max(f).max(h);
+
+            let peak = (1.0, -4.0);
+            let hit_min = mn4.min(e) / (4.0 * mx4);
+            let hit_max = (peak.0 - mx4.max(e)) / (4.0 * mn4 + peak.1);
+            let lobe = (-(0.25_f64 - 1.0 / 16.0)).max(((-hit_min).max(hit_max)).min(0.0))
+                * sharpness_scale;
+
+            let rcp_l = 1.0 / (4.0 * lobe + 1.0);
+            let _ = (bl, dl, el, fl, hl);
+            let color = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcp_l;
+            color.min(texel_alpha(src, size, x, y))
+        }
+    }
+
+    /// Renders a texture through the FSR1 pass and checks both stages against the reference.
+    #[test]
+    fn gpu_fsr1_matches_the_reference() {
+        let Some(mut renderer) = surfaceless_renderer() else {
+            return;
+        };
+
+        crate::render_helpers::resources::init(&mut renderer);
+        crate::render_helpers::shaders::init(&mut renderer);
+        init(&mut renderer, None);
+
+        let src_size = Size::from((8, 8));
+        let src_physical = Size::<i32, Physical>::from((8, 8));
+        let pixels = grayscale_pixels(src_size);
+        let mut texture = renderer
+            .import_memory(&pixels, Fourcc::Abgr8888, src_size, false)
+            .unwrap();
+        let source = read_back(&mut renderer, &mut texture, src_physical);
+        assert_eq!(source, pixels, "the harness must not change the source");
+
+        let src_rect = Rectangle::from_size(src_size.to_f64());
+        let dest = Size::<i32, Physical>::from((16, 16));
+
+        // EASU: the client buffer into an offscreen texture at the display size.
+        let programs = SuperResPrograms::get(&renderer).unwrap();
+        let easu = programs.easu.clone().expect("the EASU shader must compile");
+        let rcas = programs.rcas.clone().expect("the RCAS shader must compile");
+        let uniforms = resample_uniforms(&texture, src_rect, false).unwrap();
+
+        let mut upsampled = run_easu_pass(
+            &mut renderer,
+            &texture,
+            src_rect,
+            dest,
+            Transform::Normal,
+            &easu,
+            &uniforms,
+        )
+        .unwrap();
+        let upsampled_pixels = read_back(&mut renderer, &mut upsampled, dest);
+
+        for y in 0..dest.h {
+            for x in 0..dest.w {
+                let (want, want_alpha) =
+                    reference::easu(&source, (src_size.w, src_size.h), (dest.w, dest.h), x, y);
+                for channel in 0..4 {
+                    let index = ((y * dest.w + x) * 4) as usize + channel;
+                    let got = f64::from(upsampled_pixels[index]) / 255.0;
+                    let want = if channel == 3 { want_alpha } else { want };
+                    assert!(
+                        (got - want).abs() <= 0.01,
+                        "EASU at ({x}, {y}) channel {channel}: {got} != {want}",
+                    );
+                }
+            }
+        }
+
+        // RCAS: the EASU result, sharpened 1:1.
+        let sharpness_scale = 0.5_f32;
+        let buffer_size = dest.to_logical(1).to_buffer(1, Transform::Normal);
+        let mut sharpened = renderer
+            .create_buffer(Fourcc::Abgr8888, buffer_size)
+            .unwrap();
+        {
+            let rect = Rectangle::from_size(dest);
+            let mut target = renderer.bind(&mut sharpened).unwrap();
+            let mut frame = renderer
+                .render(&mut target, dest, Transform::Normal)
+                .unwrap();
+            frame.clear(Color32F::TRANSPARENT, &[rect]).unwrap();
+            frame
+                .render_texture_from_to(
+                    &upsampled,
+                    Rectangle::from_size(buffer_size.to_f64()),
+                    rect,
+                    &[rect],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                    Some(&rcas),
+                    &[
+                        Uniform::new("niri_tex_size", (dest.w as f32, dest.h as f32)),
+                        Uniform::new("niri_src_rect", [0f32, 0., dest.w as f32, dest.h as f32]),
+                        Uniform::new("niri_rcas_sharpness", sharpness_scale),
+                    ],
+                )
+                .unwrap();
+            let _ = frame.finish().unwrap();
+        }
+        let sharpened_pixels = read_back(&mut renderer, &mut sharpened, dest);
+
+        for y in 0..dest.h {
+            for x in 0..dest.w {
+                let want = reference::rcas(
+                    &upsampled_pixels,
+                    (dest.w, dest.h),
+                    f64::from(sharpness_scale),
+                    x,
+                    y,
+                );
+                for channel in 0..3 {
+                    let index = ((y * dest.w + x) * 4) as usize + channel;
+                    let got = f64::from(sharpened_pixels[index]) / 255.0;
+                    assert!(
+                        (got - want).abs() <= 0.01,
+                        "RCAS at ({x}, {y}) channel {channel}: {got} != {want}",
+                    );
                 }
             }
         }

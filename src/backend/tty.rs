@@ -29,10 +29,10 @@ use smithay::backend::drm::{
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
-use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer, MultiTexture};
+use smithay::backend::renderer::{ContextId, DebugFlags, ImportDma, ImportEgl, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -103,21 +103,26 @@ pub struct Tty {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
-pub type TtyRenderer<'render> = MultiRenderer<
-    'render,
-    'render,
-    GbmGlesBackend<GlesRenderer, DeviceFd>,
-    GbmGlesBackend<GlesRenderer, DeviceFd>,
->;
+/// The GPU backend that the TTY renderer runs on.
+pub type TtyGpuBackend = GbmGlesBackend<GlesRenderer, DeviceFd>;
 
-pub type TtyFrame<'render, 'frame, 'buffer> = MultiFrame<
-    'render,
-    'render,
-    'frame,
-    'buffer,
-    GbmGlesBackend<GlesRenderer, DeviceFd>,
-    GbmGlesBackend<GlesRenderer, DeviceFd>,
->;
+pub type TtyRenderer<'render> = MultiRenderer<'render, 'render, TtyGpuBackend, TtyGpuBackend>;
+
+pub type TtyFrame<'render, 'frame, 'buffer> =
+    MultiFrame<'render, 'render, 'frame, 'buffer, TtyGpuBackend, TtyGpuBackend>;
+
+/// Returns the native GLES texture that a multigpu texture has for the given renderer context.
+///
+/// Offscreen work in niri is done with a `GlesRenderer` rather than through the multigpu renderer,
+/// since that is the renderer that owns the target GPU's context. This is how such code gets at
+/// the per-GPU texture of a multigpu texture. Returns `None` when the texture was not imported for
+/// that context, in which case cross-GPU synchronization would have to happen first.
+pub fn native_texture(
+    texture: &MultiTexture,
+    context_id: &ContextId<GlesTexture>,
+) -> Option<GlesTexture> {
+    texture.get::<TtyGpuBackend>(context_id)
+}
 
 pub type TtyRendererError<'render> = <TtyRenderer<'render> as RendererSuper>::Error;
 

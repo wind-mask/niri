@@ -32,10 +32,18 @@ pub struct UpscalingRule {
 
     /// Resampling algorithm to use.
     ///
-    /// Algorithms other than `"bilinear"` and `"bicubic"` are not implemented yet and currently
-    /// fall back to `"bicubic"`.
+    /// `"fsr1"` runs FSR1 (EASU then RCAS) and uses `sharpness`. Algorithms other than
+    /// `"bilinear"`, `"bicubic"` and `"fsr1"` are not implemented yet and currently fall back to
+    /// `"bicubic"`.
     #[knuffel(child, unwrap(argument))]
     pub algorithm: Option<UpscalingAlgorithm>,
+
+    /// Sharpening strength for algorithms that sharpen.
+    ///
+    /// This is FSR1's RCAS sharpness, in stops of halving: 0 is maximum sharpening, 1 is half of
+    /// it, and 2 is a quarter. Defaults to 0.2, which is what AMD's FSR1 sample uses.
+    #[knuffel(child, unwrap(argument))]
+    pub sharpness: Option<FloatOrInt<0, 2>>,
 }
 
 /// Resolved super resolution rules.
@@ -46,6 +54,9 @@ pub struct Upscaling {
 
     /// Resampling algorithm. `None` means unset.
     pub algorithm: Option<UpscalingAlgorithm>,
+
+    /// Sharpening strength, in FSR1 RCAS stops. `None` means unset.
+    pub sharpness: Option<f64>,
 }
 
 impl Upscaling {
@@ -67,6 +78,11 @@ impl Upscaling {
     pub fn algorithm(&self) -> UpscalingAlgorithm {
         self.algorithm.unwrap_or_default()
     }
+
+    /// Returns the sharpness to use, defaulting to what AMD's FSR1 sample uses.
+    pub fn sharpness(&self) -> f64 {
+        self.sharpness.unwrap_or(0.2)
+    }
 }
 
 impl MergeWith<UpscalingRule> for Upscaling {
@@ -77,6 +93,10 @@ impl MergeWith<UpscalingRule> for Upscaling {
 
         if let Some(x) = part.algorithm {
             self.algorithm = Some(x);
+        }
+
+        if let Some(x) = part.sharpness {
+            self.sharpness = Some(x.0);
         }
     }
 }
@@ -111,7 +131,7 @@ pub enum UpscalingAlgorithm {
 
     /// AMD FidelityFX Super Resolution 1.
     ///
-    /// Not implemented yet.
+    /// Runs EASU into an offscreen texture and then RCAS on the result, using `sharpness`.
     Fsr1,
 
     /// CuNNy2 neural network.
