@@ -7,6 +7,12 @@ use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1}, ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
 };
+use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::server::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::{
+        self, ExtForeignToplevelImageCaptureSourceManagerV1,
+    },
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1}, zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
@@ -17,6 +23,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
+use smithay::wayland::image_capture_source::{ImageCaptureSource, ImageCaptureSourceData};
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 use smithay::wayland::shell::xdg::{
     ToplevelState, ToplevelStateSet, XdgToplevelSurfaceRoleAttributes
@@ -30,11 +37,28 @@ use crate::utils::with_toplevel_role_and_current;
 const EXT_LIST_VERSION: u32 = 1;
 const WLR_MANAGEMENT_VERSION: u32 = 3;
 
+/// Title and app ID of the synthetic toplevel standing in for the dynamic cast target.
+const DYNAMIC_CAST_TARGET_TITLE: &str = "niri Dynamic Cast Target";
+const DYNAMIC_CAST_TARGET_APP_ID: &str = "rs.bxt.niri.desktop";
+
+/// Marker in an image capture source's user data for sources created from the synthetic
+/// "niri Dynamic Cast Target" toplevel.
+///
+/// Such sources follow the target picked with the `set-dynamic-cast-*` actions instead of
+/// capturing a fixed window.
+#[derive(Debug)]
+pub struct DynamicCastSource;
+
 pub struct ForeignToplevelManagerState {
     display: DisplayHandle,
     ext_list_instances: HashSet<ExtForeignToplevelListV1>,
     wlr_management_instances: HashSet<ZwlrForeignToplevelManagerV1>,
     toplevels: HashMap<WlSurface, ToplevelData>,
+    /// Synthetic toplevel that screencast clients can pick to follow the dynamic cast target.
+    ///
+    /// Only exposed through ext-foreign-toplevel-list; adding it to
+    /// wlr-foreign-toplevel-management would make it show up in taskbars and the like.
+    dynamic_cast_toplevel: Option<ToplevelData>,
 }
 
 pub trait ForeignToplevelHandler {
@@ -69,6 +93,8 @@ impl ForeignToplevelManagerState {
     where
         D: GlobalDispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelGlobalData>,
         D: GlobalDispatch<ExtForeignToplevelListV1, ForeignToplevelGlobalData>,
+        D: GlobalDispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ForeignToplevelGlobalData>,
+        D: Dispatch<ExtImageCaptureSourceV1, ImageCaptureSourceData>,
         D: 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
@@ -77,6 +103,10 @@ impl ForeignToplevelManagerState {
         };
         display
             .create_global::<D, ExtForeignToplevelListV1, _>(EXT_LIST_VERSION, global_data.clone());
+        display.create_global::<D, ExtForeignToplevelImageCaptureSourceManagerV1, _>(
+            1,
+            global_data.clone(),
+        );
         display.create_global::<D, ZwlrForeignToplevelManagerV1, _>(
             WLR_MANAGEMENT_VERSION,
             global_data,
@@ -86,6 +116,7 @@ impl ForeignToplevelManagerState {
             ext_list_instances: HashSet::new(),
             wlr_management_instances: HashSet::new(),
             toplevels: HashMap::new(),
+            dynamic_cast_toplevel: None,
         }
     }
 }
@@ -163,6 +194,39 @@ pub fn refresh(state: &mut State) {
             );
         });
     }
+    refresh_dynamic_cast_toplevel(state);
+}
+
+/// Makes sure the synthetic "niri Dynamic Cast Target" toplevel is exposed to clients.
+///
+/// Screencast clients that don't go through xdg-desktop-portal-gnome (e.g.
+/// xdg-desktop-portal-luminous, through ext-image-copy-capture) pick this toplevel to follow
+/// the target of the `set-dynamic-cast-*` actions. It's only added to the ext list; clients of
+/// wlr-foreign-toplevel-management (taskbars, etc.) must not see it.
+fn refresh_dynamic_cast_toplevel(state: &mut State) {
+    let protocol_state = &mut state.niri.foreign_toplevel_state;
+    if protocol_state.dynamic_cast_toplevel.is_some() {
+        return;
+    }
+
+    let mut data = ToplevelData {
+        identifier: MappedId::next(),
+        title: Some(DYNAMIC_CAST_TARGET_TITLE.to_owned()),
+        app_id: Some(DYNAMIC_CAST_TARGET_APP_ID.to_owned()),
+        states: ArrayVec::new(),
+        output: None,
+        ext_list_instances: HashSet::new(),
+        wlr_management_instances: HashMap::new(),
+    };
+
+    // Add handles for clients that bound the list before this ran.
+    for manager in &protocol_state.ext_list_instances {
+        if let Some(client) = manager.client() {
+            data.add_ext_instance::<State>(&protocol_state.display, &client, manager);
+        }
+    }
+
+    protocol_state.dynamic_cast_toplevel = Some(data);
 }
 
 pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput) {
@@ -412,6 +476,10 @@ where
             data.add_ext_instance::<D>(handle, client, &manager);
         }
 
+        if let Some(data) = &mut state.dynamic_cast_toplevel {
+            data.add_ext_instance::<D>(handle, client, &manager);
+        }
+
         state.ext_list_instances.insert(manager);
     }
 
@@ -476,6 +544,88 @@ where
         let state = state.foreign_toplevel_manager_state();
         for data in state.toplevels.values_mut() {
             data.ext_list_instances.remove(resource);
+        }
+
+        if let Some(data) = &mut state.dynamic_cast_toplevel {
+            data.ext_list_instances.remove(resource);
+        }
+    }
+}
+
+// See https://github.com/Smithay/smithay/blob/master/src/wayland/image_capture_source/mod.rs
+impl<D> GlobalDispatch2<ExtForeignToplevelImageCaptureSourceManagerV1, D>
+    for ForeignToplevelGlobalData
+where
+    D: Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, EmptyData>,
+    D: ForeignToplevelHandler,
+{
+    fn bind(
+        &self,
+        _state: &mut D,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<ExtForeignToplevelImageCaptureSourceManagerV1>,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        data_init.init(resource, EmptyData);
+    }
+
+    fn can_view(&self, client: &Client) -> bool {
+        (self.filter)(client)
+    }
+}
+
+impl<D> Dispatch2<ExtForeignToplevelImageCaptureSourceManagerV1, D> for EmptyData
+where
+    D: Dispatch<ExtImageCaptureSourceV1, ImageCaptureSourceData>,
+    D: ForeignToplevelHandler,
+{
+    fn request(
+        &self,
+        state: &mut D,
+        _client: &Client,
+        _resource: &ExtForeignToplevelImageCaptureSourceManagerV1,
+        request: <ExtForeignToplevelImageCaptureSourceManagerV1 as Resource>::Request,
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        match request {
+            ext_foreign_toplevel_image_capture_source_manager_v1::Request::CreateSource {
+                source,
+                toplevel_handle,
+            } => {
+                let protocol_state = state.foreign_toplevel_manager_state();
+                let surface = protocol_state
+                    .toplevels
+                    .iter()
+                    .find(|(_, data)| data.ext_list_instances.contains(&toplevel_handle))
+                    .map(|(surface, _)| surface.clone());
+                let dynamic_cast = protocol_state
+                    .dynamic_cast_toplevel
+                    .as_ref()
+                    .is_some_and(|data| data.ext_list_instances.contains(&toplevel_handle));
+
+                let capture_source = ImageCaptureSource::new();
+                if let Some(surface) = surface {
+                    capture_source
+                        .user_data()
+                        .insert_if_missing(|| surface.downgrade());
+                } else if dynamic_cast {
+                    capture_source
+                        .user_data()
+                        .insert_if_missing(|| DynamicCastSource);
+                }
+
+                let source = data_init.init(
+                    source,
+                    ImageCaptureSourceData {
+                        source: capture_source.clone(),
+                    },
+                );
+                capture_source.add_instance(&source);
+            }
+            ext_foreign_toplevel_image_capture_source_manager_v1::Request::Destroy => {}
+            _ => unreachable!(),
         }
     }
 }
