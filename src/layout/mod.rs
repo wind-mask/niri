@@ -64,6 +64,7 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::superres::SuperResElement;
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{BakedBuffer, RenderCtx};
@@ -113,6 +114,7 @@ pub struct SizeFrac;
 niri_render_elements! {
     LayoutElementRenderElement<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
+        SuperRes = SuperResElement<R>,
         SolidColor = SolidColorRenderElement,
         BackgroundEffect = BackgroundEffectElement,
     }
@@ -145,6 +147,14 @@ pub trait LayoutElement {
     /// This is what the user would consider the size, i.e. excluding CSD shadows and whatnot.
     /// Corresponds to the Wayland window geometry size.
     fn size(&self) -> Size<i32, Logical>;
+
+    /// Returns the size that this element visually occupies.
+    ///
+    /// This is the same as `size()` for everything except elements that magnify their content into
+    /// a larger area, which is what the `magnify` upscaling mode does.
+    fn visual_size(&self) -> Size<i32, Logical> {
+        self.size()
+    }
 
     /// Returns the location of the element's buffer relative to the element's visual geometry.
     ///
@@ -238,6 +248,9 @@ pub trait LayoutElement {
     fn output_enter(&self, output: &Output);
     fn output_leave(&self, output: &Output);
     fn set_offscreen_data(&self, data: Option<OffscreenData>);
+    fn set_render_view_rect(&self, view_rect: Option<Rectangle<f64, Logical>>) {
+        let _ = view_rect;
+    }
     fn set_activated(&mut self, active: bool);
     fn set_active_in_column(&mut self, active: bool);
     fn set_floating(&mut self, floating: bool);

@@ -25,7 +25,7 @@ use smithay::wayland::presentation::Refresh;
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
+use crate::render_helpers::{resources, shaders, superres, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output, WinitScale};
 
 pub struct Winit {
@@ -208,6 +208,11 @@ impl Winit {
                 None
             }
         };
+
+        // Probe super resolution capabilities once the render node is known.
+        let render_node = self.render_node.as_ref().and_then(|node| node.dev_path());
+        let renderer = self.backend.renderer();
+        superres::init(renderer, render_node.as_deref());
 
         self.create_dmabuf_global(niri);
 

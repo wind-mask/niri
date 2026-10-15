@@ -12,5 +12,6 @@ mod fullscreen;
 mod layer_shell;
 mod remove_output;
 mod transactions;
+mod upscaling;
 mod virtual_pointer;
 mod window_opening;

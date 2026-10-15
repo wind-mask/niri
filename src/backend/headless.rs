@@ -27,7 +27,7 @@ use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState};
-use crate::render_helpers::{resources, shaders};
+use crate::render_helpers::{resources, shaders, superres};
 use crate::utils::{get_monotonic_time, logical_output};
 
 pub struct Headless {
@@ -66,6 +66,7 @@ impl Headless {
 
         resources::init(&mut renderer);
         shaders::init(&mut renderer);
+        superres::init(&mut renderer, None);
 
         self.renderer = Some(renderer);
         Ok(())

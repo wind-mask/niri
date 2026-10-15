@@ -13,7 +13,7 @@ mod imp {
     use anyhow::{ensure, Context};
     use gtk::gdk;
     use niri::animation::Clock;
-    use niri::render_helpers::{resources, shaders};
+    use niri::render_helpers::{resources, shaders, superres};
     use smithay::backend::egl::ffi::egl;
     use smithay::backend::egl::EGLContext;
     use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
@@ -252,6 +252,7 @@ mod imp {
 
         resources::init(&mut renderer);
         shaders::init(&mut renderer);
+        superres::init(&mut renderer, None);
 
         Ok(RendererData {
             renderer,

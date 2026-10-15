@@ -47,6 +47,7 @@ pub mod shaders;
 pub mod shadow;
 pub mod snapshot;
 pub mod solid_color;
+pub mod superres;
 pub mod surface;
 pub mod texture;
 pub mod xray;
