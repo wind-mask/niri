@@ -18,6 +18,7 @@
 //
 //   0 - explicit bilinear sampling, which reproduces GL_LINEAR for the identity case
 //   1 - Catmull-Rom bicubic sampling
+//   2 - content digest for unchanged-frame detection
 //
 // We sample at explicit texel positions instead of relying on the renderer's filter, so that
 // the kernel does not depend on whatever filtering the driver happens to have set. Taps are
@@ -80,7 +81,55 @@ vec4 niri_catmull_rom(float t) {
 }
 #endif
 
+#if NIRI_RESAMPLE_FILTER == 2
+#ifndef NIRI_DIGEST_SIDE
+#define NIRI_DIGEST_SIDE 32.0
+#endif
+
+vec4 niri_digest_tap(vec2 pos) {
+    // Snap to integer texel corners so a single GL_LINEAR fetch averages a 2x2 texel block.
+    vec2 lo = niri_src_rect.xy + vec2(NIRI_HALF_TEXEL);
+    vec2 hi = niri_src_rect.xy + niri_src_rect.zw - vec2(NIRI_HALF_TEXEL);
+    pos = clamp(floor(pos + vec2(NIRI_HALF_TEXEL)), lo, hi);
+    vec4 s = texture2D(tex, pos / niri_tex_size);
+#if defined(NO_ALPHA)
+    s.a = 1.0;
+#endif
+    return s;
+}
+#endif
+
 void main() {
+#if NIRI_RESAMPLE_FILTER == 2
+    // Content digest: each output texel summarizes one cell of `niri_src_rect` with a 4x4 staggered
+    // grid of linear taps. RGB stores the cell average and A stores a position-weighted folded
+    // checksum so single-character or single-texel changes are not lost to 8-bit quantization.
+    vec2 center = v_coords * niri_tex_size;
+    vec2 cell = niri_src_rect.zw / NIRI_DIGEST_SIDE;
+    vec2 step_uv = cell * 0.25;
+    vec2 origin = center - cell * 0.375;
+
+    vec4 sum = vec4(0.0);
+    vec4 weighted = vec4(0.0);
+    float w = 1.0;
+
+    for (int iy = 0; iy < 4; iy++) {
+        float stagger = (iy == 1 || iy == 3) ? 0.125 : -0.125;
+        float py = origin.y + float(iy) * step_uv.y;
+        for (int ix = 0; ix < 4; ix++) {
+            float px = origin.x + (float(ix) + stagger) * step_uv.x;
+            vec4 s = niri_digest_tap(vec2(px, py));
+            sum += s;
+            weighted += s * w;
+            w += 0.0625;
+        }
+    }
+
+    vec3 avg = sum.rgb * (1.0 / 16.0);
+    float residue = fract(dot(weighted, vec4(3.125, 5.375, 7.625, 11.875)));
+    gl_FragColor = vec4(avg, residue);
+    return;
+#else
     // Position in texel space; subtract half a texel to get to the space where integer
     // coordinates are texel centers.
     vec2 pos = v_coords * niri_tex_size - NIRI_HALF_TEXEL;
@@ -148,4 +197,5 @@ void main() {
 #endif
 
     gl_FragColor = color;
+#endif
 }

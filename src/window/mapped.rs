@@ -746,12 +746,18 @@ impl LayoutElement for Mapped {
                         &mut |elem| elements.push(elem),
                     );
 
+                    let view_rect = self.superres.view_rect();
                     for elem in elements {
                         let renderer = ctx.renderer.as_gles_renderer();
+                        let raw_rect = elem.geometry(scale).to_f64().to_logical(scale);
                         let magnify = magnify.map(|magnify| {
-                            let rect = elem.geometry(scale).to_f64().to_logical(scale);
-                            magnify_element_rect(&magnify, window_location, rect)
+                            magnify_element_rect(&magnify, window_location, raw_rect)
                         });
+                        let elem_rect = match magnify {
+                            Some(rect) => Rectangle::new(rect.loc - window_location, rect.size),
+                            None => Rectangle::new(raw_rect.loc - window_location, raw_rect.size),
+                        };
+                        let on_screen = view_rect.is_none_or(|view| view.overlaps(elem_rect));
                         let elem = self.superres.element(
                             renderer,
                             elem,
@@ -759,6 +765,7 @@ impl LayoutElement for Mapped {
                             scale,
                             self.id.get(),
                             magnify,
+                            on_screen,
                         );
                         push(elem.into());
                     }
@@ -1135,6 +1142,10 @@ impl LayoutElement for Mapped {
                 existing.states.states.extend(data.states.states);
             }
         }
+    }
+
+    fn set_render_view_rect(&self, view_rect: Option<Rectangle<f64, Logical>>) {
+        self.superres.set_view_rect(view_rect);
     }
 
     fn is_urgent(&self) -> bool {

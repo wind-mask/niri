@@ -1107,6 +1107,11 @@ impl<W: LayoutElement> Tile<W> {
         let window_render_loc = location + window_loc;
         let area = Rectangle::new(window_render_loc, animated_window_size);
         xray_pos = xray_pos.offset(window_loc);
+        let view_rect = Rectangle::new(
+            Point::from((-xray_pos.pos_in_backdrop.x, -xray_pos.pos_in_backdrop.y)),
+            self.view_size.downscale(xray_pos.zoom),
+        );
+        self.window.set_render_view_rect(Some(view_rect));
 
         let rules = self.window.rules();
 
@@ -1286,6 +1291,7 @@ impl<W: LayoutElement> Tile<W> {
                     push(clip(elem))
                 });
         }
+        self.window.set_render_view_rect(None);
 
         if fullscreen_progress > 0. {
             let alpha = fullscreen_progress as f32;

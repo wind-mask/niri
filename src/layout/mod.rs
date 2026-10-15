@@ -248,6 +248,9 @@ pub trait LayoutElement {
     fn output_enter(&self, output: &Output);
     fn output_leave(&self, output: &Output);
     fn set_offscreen_data(&self, data: Option<OffscreenData>);
+    fn set_render_view_rect(&self, view_rect: Option<Rectangle<f64, Logical>>) {
+        let _ = view_rect;
+    }
     fn set_activated(&mut self, active: bool);
     fn set_active_in_column(&mut self, active: bool);
     fn set_floating(&mut self, floating: bool);
