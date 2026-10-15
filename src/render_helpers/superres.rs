@@ -48,7 +48,8 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::backend::tty::{native_texture, TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::renderer::{
-    AsGlesFrame as _, ClientBufferDebug, GpuDebug, NiriRenderer, TextureDebug, GPU_LOG_TARGET,
+    gpu_diagnostics, AsGlesFrame as _, ClientBufferDebug, GpuDebug, NiriRenderer, TextureDebug,
+    GPU_LOG_TARGET,
 };
 
 /// Resampling kernel for a window.
@@ -869,7 +870,7 @@ where
     ) where
         R::TextureId: PassSource,
     {
-        if !tracing::enabled!(target: GPU_LOG_TARGET, tracing::Level::DEBUG) {
+        if !gpu_diagnostics() {
             return;
         }
         let native = match self.inner.texture() {
@@ -2687,7 +2688,7 @@ impl SuperResolutionPipeline {
             commit = ?elem.current_commit(),
         )
         .entered();
-        if tracing::enabled!(target: GPU_LOG_TARGET, tracing::Level::DEBUG) {
+        if gpu_diagnostics() {
             let native = match elem.texture() {
                 WaylandSurfaceTexture::Texture(texture) => {
                     texture.pass_texture(&renderer.context_id())
