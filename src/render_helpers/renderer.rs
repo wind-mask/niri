@@ -80,6 +80,24 @@ impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer> for TtyFrame<'_, 'frame, 'buf
 /// `RUST_LOG=niri=info,niri::render_helpers::gpu=debug`.
 pub(crate) const GPU_LOG_TARGET: &str = "niri::render_helpers::gpu";
 
+/// Whether the GPU/buffer diagnostics are being recorded anywhere.
+///
+/// The expensive parts of the diagnostics check this instead of a log level: with per-layer
+/// filters a level check is only a hint and stays true even when no layer records the target.
+static GPU_DIAGNOSTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the recording of the GPU/buffer diagnostics on or off.
+///
+/// The compositor sets this when it is told where to write them.
+pub fn set_gpu_diagnostics(enabled: bool) {
+    GPU_DIAGNOSTICS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns whether the GPU/buffer diagnostics are being recorded.
+pub(crate) fn gpu_diagnostics() -> bool {
+    GPU_DIAGNOSTICS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Identifies the GLES execution context without querying GL or switching contexts.
 ///
 /// A ContextId is a texture-compatibility group, not a DRM device or a physical memory owner.
@@ -203,7 +221,7 @@ pub(crate) fn log_surface_buffer(
     use smithay::wayland::compositor::with_states;
     use wayland_server::Resource as _;
 
-    if !tracing::enabled!(target: GPU_LOG_TARGET, tracing::Level::DEBUG) {
+    if !gpu_diagnostics() {
         return;
     }
     with_states(surface, |states| {
