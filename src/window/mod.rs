@@ -4,7 +4,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::window_rule::{Match, OnXdgActivate, VrrRule, WindowRule};
 use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
-    ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
+    ResolvedPopupsRules, ShadowRule, TabIndicatorRule, Upscaling,
 };
 use niri_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -131,6 +131,9 @@ pub struct ResolvedWindowRules {
 
     /// Rules for this window's popups.
     pub popups: ResolvedPopupsRules,
+
+    /// Super resolution configuration.
+    pub upscaling: Upscaling,
 }
 
 impl<'a> WindowRef<'a> {
@@ -321,6 +324,8 @@ impl ResolvedWindowRules {
                     .merge_with(&rule.background_effect);
 
                 resolved.popups.merge_with(&rule.popups);
+
+                resolved.upscaling.merge_with(&rule.upscaling);
             }
 
             resolved.open_on_output = open_on_output.map(|x| x.to_owned());

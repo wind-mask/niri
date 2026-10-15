@@ -34,8 +34,10 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::superres::{SuperResElement, SuperResolutionPipeline};
 use crate::render_helpers::surface::{
-    push_elements_from_surface_tree, render_snapshot_from_surface_tree,
+    push_elements_from_surface_tree, push_superres_elements_from_surface_tree,
+    render_snapshot_from_surface_tree,
 };
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
@@ -105,6 +107,11 @@ pub struct Mapped {
 
     /// Buffer to draw instead of the window when it should be blocked out.
     block_out_buffer: RefCell<SolidColorBuffer>,
+
+    /// Super resolution state.
+    ///
+    /// The effect is disabled unless the window rules enable it.
+    superres: SuperResolutionPipeline,
 
     /// The blur config, passed for background effect rendering.
     blur_config: niri_config::Blur,
@@ -292,6 +299,7 @@ impl Mapped {
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
+            superres: SuperResolutionPipeline::new(),
             blur_config: config.blur,
             animate_next_configure: false,
             animate_serials: Vec::new(),
@@ -660,16 +668,38 @@ impl LayoutElement for Mapped {
         } else {
             let buf_pos = location - self.window.geometry().loc.to_f64();
             let surface = self.toplevel().wl_surface();
-            let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
-            push_elements_from_surface_tree(
-                ctx.renderer,
-                surface,
-                buf_pos.to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::ScanoutCandidate,
-                &mut push,
-            )
+            let location = buf_pos.to_physical_precise_round(scale);
+
+            // Super resolution only replaces how the client buffer is sampled. The window's
+            // display geometry, its input handling and everything else stays the same. It applies
+            // to every render target, so that screen captures show what is on the screen.
+            match self.superres.filter(&self.rules.upscaling) {
+                Some(filter) => {
+                    let mut push = |elem: SuperResElement<R>| push(elem.into());
+                    push_superres_elements_from_surface_tree(
+                        ctx.renderer,
+                        surface,
+                        location,
+                        scale,
+                        alpha,
+                        Kind::ScanoutCandidate,
+                        filter,
+                        &mut push,
+                    )
+                }
+                None => {
+                    let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
+                    push_elements_from_surface_tree(
+                        ctx.renderer,
+                        surface,
+                        location,
+                        scale,
+                        alpha,
+                        Kind::ScanoutCandidate,
+                        &mut push,
+                    )
+                }
+            }
         }
     }
 

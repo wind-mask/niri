@@ -7,6 +7,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Scale};
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
+use super::superres::{ResampleFilter, SuperResElement};
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
 
@@ -94,7 +95,67 @@ pub fn push_elements_from_surface_tree<R>(
     R: Renderer + ImportAll,
     R::TextureId: Clone + 'static,
 {
-    let _span = tracy_client::span!("push_elements_from_surface_tree");
+    push_elements_from_surface_tree_with(
+        renderer,
+        surface,
+        location,
+        scale,
+        alpha,
+        kind,
+        &mut |elem| elem,
+        push,
+    );
+}
+
+/// Like [`push_elements_from_surface_tree()`], but draws the surfaces with a super resolution
+/// resampling kernel.
+///
+/// Each surface in the tree is resampled on its own, since each one has its own buffer. Surfaces
+/// that cannot be resampled (single-pixel buffers) still fall back to the plain element.
+#[allow(clippy::too_many_arguments)]
+pub fn push_superres_elements_from_surface_tree<R>(
+    renderer: &mut R,
+    surface: &WlSurface,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    kind: Kind,
+    filter: ResampleFilter,
+    push: &mut dyn FnMut(SuperResElement<R>),
+) where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    push_elements_from_surface_tree_with(
+        renderer,
+        surface,
+        location,
+        scale,
+        alpha,
+        kind,
+        &mut |elem| SuperResElement::new(elem, filter),
+        push,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_elements_from_surface_tree_with<R, E>(
+    renderer: &mut R,
+    surface: &WlSurface,
+    // Fractional scale expects surface buffers to be aligned to physical pixels.
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    kind: Kind,
+    // Maps an element before pushing it. This lets callers wrap the elements, e.g. to draw them
+    // with a different resampling kernel.
+    map: &mut dyn FnMut(WaylandSurfaceRenderElement<R>) -> E,
+    push: &mut dyn FnMut(E),
+) where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let _span = tracy_client::span!("push_elements_from_surface_tree_with");
 
     let location = location.to_f64();
 
@@ -132,7 +193,7 @@ pub fn push_elements_from_surface_tree<R>(
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => push(surface),
+                        Ok(Some(surface)) => push(map(surface)),
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {
                             warn!("failed to import surface: {}", err);

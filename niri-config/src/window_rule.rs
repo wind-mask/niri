@@ -9,6 +9,122 @@ use crate::layout::DefaultPresetSize;
 use crate::utils::{MergeWith, RegexEq};
 use crate::FloatOrInt;
 
+/// Super resolution rules for a window.
+///
+/// Super resolution replaces the sampling that the compositor uses to draw a client buffer that
+/// is smaller than the area it is displayed in. It is off unless a rule enables it: either
+/// `mode` is set to something other than `"off"`, or `algorithm` is set, which enables `filter`
+/// mode with that algorithm.
+///
+/// As a rule of thumb, only enable it for windows that keep rendering at a lower resolution than
+/// their display area, since that is the only case where it can do anything.
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct UpscalingRule {
+    /// What to do with the window's content.
+    ///
+    /// - `"off"`: don't apply super resolution. This is the default.
+    /// - `"filter"`: keep the window's display geometry, but replace the sampling used to magnify
+    ///   its buffer.
+    /// - `"magnify"`: magnify the window's content to a larger display area. Not implemented yet;
+    ///   currently behaves like `"filter"`.
+    #[knuffel(child, unwrap(argument))]
+    pub mode: Option<UpscalingMode>,
+
+    /// Resampling algorithm to use.
+    ///
+    /// Algorithms other than `"bilinear"` and `"bicubic"` are not implemented yet and currently
+    /// fall back to `"bicubic"`.
+    #[knuffel(child, unwrap(argument))]
+    pub algorithm: Option<UpscalingAlgorithm>,
+}
+
+/// Resolved super resolution rules.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Upscaling {
+    /// What to do with the window's content. `None` means unset.
+    pub mode: Option<UpscalingMode>,
+
+    /// Resampling algorithm. `None` means unset.
+    pub algorithm: Option<UpscalingAlgorithm>,
+}
+
+impl Upscaling {
+    /// Returns whether super resolution should run for this window.
+    pub fn enabled(&self) -> bool {
+        match self.mode {
+            Some(UpscalingMode::Off) => false,
+            Some(UpscalingMode::Filter | UpscalingMode::Magnify) => true,
+            None => self.algorithm.is_some(),
+        }
+    }
+
+    /// Returns the mode to use, defaulting to `Off`.
+    pub fn mode(&self) -> UpscalingMode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// Returns the algorithm to use, defaulting to bilinear.
+    pub fn algorithm(&self) -> UpscalingAlgorithm {
+        self.algorithm.unwrap_or_default()
+    }
+}
+
+impl MergeWith<UpscalingRule> for Upscaling {
+    fn merge_with(&mut self, part: &UpscalingRule) {
+        if let Some(x) = part.mode {
+            self.mode = Some(x);
+        }
+
+        if let Some(x) = part.algorithm {
+            self.algorithm = Some(x);
+        }
+    }
+}
+
+/// What to do with a window's content.
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum UpscalingMode {
+    /// Don't apply super resolution.
+    Off,
+
+    /// Replace the sampling used to magnify the window's buffer, without changing where the
+    /// window is displayed.
+    #[default]
+    Filter,
+
+    /// Magnify the window's content to a larger display area.
+    Magnify,
+}
+
+/// Resampling algorithm for super resolution.
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum UpscalingAlgorithm {
+    /// Explicit bilinear resampling.
+    ///
+    /// Reproduces what the renderer does anyway, so it is mainly useful as a reference and as a
+    /// way to verify the execution path.
+    #[default]
+    Bilinear,
+
+    /// Catmull-Rom bicubic resampling.
+    Bicubic,
+
+    /// AMD FidelityFX Super Resolution 1.
+    ///
+    /// Not implemented yet.
+    Fsr1,
+
+    /// CuNNy2 neural network.
+    ///
+    /// Not implemented yet.
+    Cunny2,
+
+    /// Anime4K neural network.
+    ///
+    /// Not implemented yet.
+    Anime4k,
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct WindowRule {
     #[knuffel(children(name = "match"))]
@@ -84,6 +200,9 @@ pub struct WindowRule {
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
     pub popups: PopupsRule,
+
+    #[knuffel(child, default)]
+    pub upscaling: UpscalingRule,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
