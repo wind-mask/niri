@@ -148,6 +148,14 @@ pub trait LayoutElement {
     /// Corresponds to the Wayland window geometry size.
     fn size(&self) -> Size<i32, Logical>;
 
+    /// Returns the size that this element visually occupies.
+    ///
+    /// This is the same as `size()` for everything except elements that magnify their content into
+    /// a larger area, which is what the `magnify` upscaling mode does.
+    fn visual_size(&self) -> Size<i32, Logical> {
+        self.size()
+    }
+
     /// Returns the location of the element's buffer relative to the element's visual geometry.
     ///
     /// I.e. if the element has CSD shadows, its buffer location will have negative coordinates.
