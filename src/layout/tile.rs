@@ -839,7 +839,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn window_size(&self) -> Size<f64, Logical> {
-        let mut size = self.window.size().to_f64();
+        // The window's visual size, which is bigger than its own size when it magnifies its
+        // content.
+        let mut size = self.window.visual_size().to_f64();
         size = size
             .to_physical_precise_round(self.scale)
             .to_logical(self.scale);

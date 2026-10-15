@@ -3648,13 +3648,36 @@ impl Niri {
             let window = &mapped.window;
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
                 let win_pos_within_output = win_pos;
+
+                // A magnified window draws its content scaled into the area the layout gave it, so
+                // the pointer has to be mapped back into the client's own coordinates. That is both
+                // how the surface under it is found (pop-ups and subsurfaces have their own input
+                // regions, expressed in those coordinates) and what the client is sent.
+                let magnify = mapped.magnify_geometry();
+                let mut pos_within_window = pos_within_output - win_pos_within_output;
+                if let Some(magnify) = magnify {
+                    match magnify.to_source(pos_within_window) {
+                        Some(point) => pos_within_window = point,
+                        // The letterbox bars are not part of the window.
+                        None => return (None, (Some((window.clone(), hit)), None)),
+                    }
+                }
+
                 window
-                    .surface_under(
-                        pos_within_output - win_pos_within_output,
-                        WindowSurfaceType::ALL,
-                    )
-                    .map(|(s, pos_within_window)| {
-                        (s, pos_within_window.to_f64() + win_pos_within_output)
+                    .surface_under(pos_within_window, WindowSurfaceType::ALL)
+                    .map(|(s, pos_within_surface)| {
+                        let pos_within_surface = pos_within_surface.to_f64();
+
+                        // The client is sent `pointer - position`, and magnified content is sent
+                        // the client's own coordinates, which are not a
+                        // fixed offset from the pointer: the position has
+                        // to be derived from where the pointer is. It is
+                        // recomputed on every pointer move, as `contents_under` is.
+                        let surface_pos = match magnify {
+                            Some(_) => pos_within_output - (pos_within_window - pos_within_surface),
+                            None => pos_within_surface + win_pos_within_output,
+                        };
+                        (s, surface_pos)
                     })
             } else {
                 None

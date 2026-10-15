@@ -41,7 +41,7 @@ use smithay::backend::renderer::{
     Renderer, Texture,
 };
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Physical, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{native_texture, TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
@@ -57,6 +57,138 @@ pub enum ResampleFilter {
 
     /// Catmull-Rom bicubic sampling.
     Bicubic,
+}
+
+/// Geometry for the `magnify` upscaling mode, in the output's logical coordinate space.
+///
+/// The window's own content has size `source` and is fitted (`contain`, centered) into `target`,
+/// which is the area the layout gave the window. Everything in `content` is relative to the origin
+/// of `target`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MagnifiedGeometry {
+    /// The window's own content size.
+    pub source: Size<f64, Logical>,
+    /// The area that the window is magnified into.
+    pub target: Size<f64, Logical>,
+    /// Where the scaled content lands inside `target`.
+    pub content: Rectangle<f64, Logical>,
+    /// Uniform scale factor from `source` to `content.size`.
+    pub scale: f64,
+}
+
+impl MagnifiedGeometry {
+    /// Fits `source` into `target`, preserving aspect ratio and centering the result.
+    ///
+    /// Returns `None` when `source` or `target` is empty, or when `source` is already at least as
+    /// large as `target` in both dimensions (so there is nothing to magnify).
+    pub fn new(source: Size<f64, Logical>, target: Size<f64, Logical>) -> Option<Self> {
+        if source.w <= 0. || source.h <= 0. || target.w <= 0. || target.h <= 0. {
+            return None;
+        }
+
+        // Only magnify. A window that is already as big as the target (or bigger) is not
+        // this mode's business.
+        if source.w >= target.w && source.h >= target.h {
+            return None;
+        }
+
+        let scale = f64::min(target.w / source.w, target.h / source.h);
+        let size = Size::from((source.w * scale, source.h * scale));
+        let loc = Point::from(((target.w - size.w) / 2., (target.h - size.h) / 2.));
+
+        Some(Self {
+            source,
+            target,
+            content: Rectangle::new(loc, size),
+            scale,
+        })
+    }
+
+    /// Maps a point in the window's visual area to the content's own coordinate space.
+    ///
+    /// Returns `None` for points in the letterbox bars, which are not part of the content and must
+    /// not receive input.
+    pub fn to_source(&self, point: Point<f64, Logical>) -> Option<Point<f64, Logical>> {
+        let point = point - self.content.loc;
+
+        if point.x < 0.
+            || point.y < 0.
+            || point.x >= self.content.size.w
+            || point.y >= self.content.size.h
+        {
+            return None;
+        }
+
+        Some(Point::from((point.x / self.scale, point.y / self.scale)))
+    }
+
+    /// Maps a rectangle given in the content's coordinate space, relative to the window's visual
+    /// origin, into the window's visual area.
+    ///
+    /// This is what drawing uses, including for pop-ups and subsurfaces, which live in the same
+    /// coordinate space as the window's own content.
+    pub fn to_target(&self, rect: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((
+                self.content.loc.x + rect.loc.x * self.scale,
+                self.content.loc.y + rect.loc.y * self.scale,
+            )),
+            Size::from((rect.size.w * self.scale, rect.size.h * self.scale)),
+        )
+    }
+}
+
+/// Returns whether a buffer of `src` texels has anything for the effect to recover in `dest`
+/// pixels.
+///
+/// A buffer that is one pixel short of its display area is what logical sizes that do not land on
+/// whole physical pixels produce with a fractional output scale, and there is nothing in a pixel
+/// for a kernel to reconstruct.
+fn has_something_to_magnify(src: Size<f64, Buffer>, dest: Size<i32, Physical>) -> bool {
+    src.w + 1.0 < f64::from(dest.w) || src.h + 1.0 < f64::from(dest.h)
+}
+
+/// How many texels a resampling kernel reads around the one it writes, in source pixels.
+///
+/// Catmull-Rom and FSR1's EASU both look two texels around the one they write, so anything within
+/// that footprint of a change is affected by it too.
+const KERNEL_RADIUS: i32 = 2;
+
+/// Maps a rectangle that is relative to an element's origin into the area that element is drawn in
+/// when its content is magnified.
+///
+/// Damage and opaque regions are given relative to the element they belong to, so this is a scale
+/// about the origin: the magnified element draws the same content over a larger area. `outward`
+/// picks which way to round, which has to over-approximate for damage and under-approximate for
+/// opaque regions, and `grow` is how far the resampling kernel reads beyond what changed.
+fn magnify_physical_rect(
+    rect: Rectangle<i32, Physical>,
+    inner: Rectangle<i32, Physical>,
+    dest: Rectangle<i32, Physical>,
+    outward: bool,
+    grow: i32,
+) -> Rectangle<i32, Physical> {
+    if inner.size.is_empty() {
+        // Nothing sensible to scale by; say that the whole area is affected.
+        return Rectangle::from_size(dest.size);
+    }
+
+    let factor = dest.size.to_f64() / inner.size.to_f64();
+    let mapped = rect.to_f64().upscale(factor);
+
+    // Round the edges rather than the location and the size on their own, so that the result
+    // covers everything that changed (or, for opaque regions, nothing that did not).
+    let mapped = if outward {
+        mapped.to_i32_up()
+    } else {
+        mapped.to_i32_down()
+    };
+
+    let grow = Size::from((grow, grow));
+    let loc = mapped.loc - grow.to_point();
+    let size = mapped.size + grow * 2;
+
+    Rectangle::new(loc, Size::from((size.w.max(0), size.h.max(0))))
 }
 
 /// How a window is drawn with super resolution.
@@ -523,11 +655,18 @@ pub fn capabilities(renderer: &mut GlesRenderer) -> Option<&Capabilities> {
 pub struct SuperResElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
     kernel: ElementKernel,
+    /// When set, draw the content into this rectangle (in the output's logical coordinate space)
+    /// instead of the element's own geometry. This is the `magnify` mode.
+    magnify: Option<Rectangle<f64, Logical>>,
 }
 
 /// What an element draws with.
 #[derive(Debug, Clone)]
 pub enum ElementKernel {
+    /// Draw the client buffer with the renderer's own sampling. This is what magnified pop-ups
+    /// use, they are still drawn at their element's geometry.
+    Plain,
+
     /// The client buffer, resampled with a single-pass filter.
     Filter(ResampleFilter),
 
@@ -548,7 +687,23 @@ impl<R: Renderer> SuperResElement<R> {
         Self {
             inner,
             kernel: ElementKernel::Filter(filter),
+            magnify: None,
         }
+    }
+
+    /// Creates an element that draws the client buffer with the renderer's own sampling.
+    pub fn plain(inner: WaylandSurfaceRenderElement<R>) -> Self {
+        Self {
+            inner,
+            kernel: ElementKernel::Plain,
+            magnify: None,
+        }
+    }
+
+    /// Draws the content into `rect` rather than at the element's own geometry.
+    pub fn with_magnify(mut self, rect: Rectangle<f64, Logical>) -> Self {
+        self.magnify = Some(rect);
+        self
     }
 
     /// Creates an element that draws a cached FSR1 result.
@@ -565,6 +720,7 @@ impl<R: Renderer> SuperResElement<R> {
                 context_id,
                 sharpness_scale,
             },
+            magnify: None,
         }
     }
 }
@@ -654,7 +810,10 @@ impl<R: Renderer + ImportAll> Element for SuperResElement<R> {
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        self.inner.geometry(scale)
+        match self.magnify {
+            Some(rect) => rect.to_physical_precise_round(scale),
+            None => self.inner.geometry(scale),
+        }
     }
 
     fn transform(&self) -> Transform {
@@ -670,11 +829,48 @@ impl<R: Renderer + ImportAll> Element for SuperResElement<R> {
         scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        self.inner.damage_since(scale, commit)
+        let damage = self.inner.damage_since(scale, commit);
+
+        let Some(rect) = self.magnify else {
+            return damage;
+        };
+
+        let inner = self.inner.geometry(scale);
+        let dest = rect.to_physical_precise_round(scale);
+
+        // The damage is relative to the element, and this element draws the wrapped one's content
+        // over a larger area, so the rects are scaled about the origin; the tracker adds the
+        // geometry location back. Growing them by the kernel's footprint keeps the edge of a
+        // repainted region from showing what the old frame had there.
+        if inner.size.is_empty() {
+            return DamageSet::from_slice(&[Rectangle::from_size(dest.size)]);
+        }
+
+        let factor = dest.size.to_f64() / inner.size.to_f64();
+        let grow = (f64::from(KERNEL_RADIUS) * factor.x.max(factor.y)).ceil() as i32;
+
+        damage
+            .into_iter()
+            .map(|rect| magnify_physical_rect(rect, inner, dest, true, grow))
+            .collect()
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        self.inner.opaque_regions(scale)
+        let regions = self.inner.opaque_regions(scale);
+
+        let Some(rect) = self.magnify else {
+            return regions;
+        };
+
+        let inner = self.inner.geometry(scale);
+        let dest = rect.to_physical_precise_round(scale);
+
+        // These are relative to the element as well, and they round inwards: covering less than we
+        // actually do only costs a redraw.
+        regions
+            .into_iter()
+            .map(|rect| magnify_physical_rect(rect, inner, dest, false, 0))
+            .collect()
     }
 
     fn alpha(&self) -> f32 {
@@ -759,6 +955,9 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
         match &self.kernel {
+            ElementKernel::Plain => {
+                draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
+            }
             ElementKernel::Filter(_) => {
                 let Some((program, uniforms)) = self.resample_program(frame, src) else {
                     // Fall back to the renderer's own sampling.
@@ -819,6 +1018,15 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
         match &self.kernel {
+            ElementKernel::Plain => RenderElement::<TtyRenderer<'render>>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
             ElementKernel::Filter(_) => {
                 let program = self.resample_program(frame.as_gles_frame(), src);
 
@@ -952,6 +1160,8 @@ pub struct SuperResolutionPipeline {
     warned_pass_failure: Cell<bool>,
     /// Cached result of the EASU pass.
     fsr1: RefCell<Option<Fsr1Result>>,
+    /// The size that this window's content is magnified into, when it is being magnified.
+    magnify_target: Cell<Option<Size<i32, Logical>>>,
 }
 
 impl SuperResolutionPipeline {
@@ -961,6 +1171,7 @@ impl SuperResolutionPipeline {
             warned_fallback: Cell::new(false),
             warned_pass_failure: Cell::new(false),
             fsr1: RefCell::new(None),
+            magnify_target: Cell::new(None),
         }
     }
 
@@ -989,19 +1200,22 @@ impl SuperResolutionPipeline {
         if !self.warned_fallback.get() {
             self.warned_fallback.set(true);
 
-            if mode == UpscalingMode::Magnify {
-                warn!(
-                    "upscaling mode \"magnify\" is not implemented yet, \
-                     treating it as \"filter\""
-                );
-            }
-
             if fell_back {
                 warn!("upscaling algorithm {algorithm:?} is not implemented yet, using {kernel:?}");
             }
         }
 
         Some(kernel)
+    }
+
+    /// Records that this window's content is magnified into `target`, or that it is not anymore.
+    pub fn set_magnify_target(&self, target: Option<Size<i32, Logical>>) {
+        self.magnify_target.set(target);
+    }
+
+    /// Returns the size that this window's content is magnified into, if it is being magnified.
+    pub fn magnify_target(&self) -> Option<Size<i32, Logical>> {
+        self.magnify_target.get()
     }
 
     /// Wraps a surface element, running the EASU pass first if the cached result is stale.
@@ -1016,26 +1230,59 @@ impl SuperResolutionPipeline {
         elem: WaylandSurfaceRenderElement<R>,
         kernel: SuperResKernel,
         scale: Scale<f64>,
+        magnify: Option<Rectangle<f64, Logical>>,
     ) -> SuperResElement<R>
     where
         R::TextureId: PassSource,
     {
+        // With magnify, the content is drawn into a rect inside the area the layout gave the
+        // window, so that is the size the effect has to produce.
+        let dest_size = match magnify {
+            Some(rect) => rect.size.to_physical_precise_round(scale),
+            None => elem.geometry(scale).size,
+        };
+
+        // A buffer that already matches its display area has nothing for the effect to recover: the
+        // client is rendering at the physical resolution of the output, which is what Wayland
+        // clients that handle fractional scaling do. There is at most a pixel in it, so draw the
+        // window the normal way rather than paying for a pass that cannot change anything. The
+        // magnify mode is a different thing, since its content is drawn into a bigger area on
+        // purpose.
+        if magnify.is_none() && !has_something_to_magnify(elem.src().size, dest_size) {
+            return SuperResElement::plain(elem);
+        }
+
         let params = match kernel {
-            SuperResKernel::Filter(filter) => return SuperResElement::new(elem, filter),
+            SuperResKernel::Filter(filter) => {
+                let mut element = SuperResElement::new(elem, filter);
+                element = match magnify {
+                    Some(rect) => element.with_magnify(rect),
+                    None => element,
+                };
+                return element;
+            }
             SuperResKernel::Fsr1(params) => params,
         };
 
-        let Some(texture) = self.fsr1_result(renderer, &elem, scale) else {
+        let Some(texture) = self.fsr1_result(renderer, &elem, dest_size) else {
             // Fall back to the best single-pass kernel that we have.
-            return SuperResElement::new(elem, ResampleFilter::Bicubic);
+            let element = SuperResElement::new(elem, ResampleFilter::Bicubic);
+            return match magnify {
+                Some(rect) => element.with_magnify(rect),
+                None => element,
+            };
         };
 
-        SuperResElement::fsr1(
+        let mut element = SuperResElement::fsr1(
             elem,
             texture.texture.clone(),
             texture.context_id.clone(),
             params.sharpness_scale(),
-        )
+        );
+        if let Some(rect) = magnify {
+            element = element.with_magnify(rect);
+        }
+        element
     }
 
     /// Returns the cached EASU result, running the pass if it is stale.
@@ -1043,12 +1290,11 @@ impl SuperResolutionPipeline {
         &self,
         renderer: &mut GlesRenderer,
         elem: &WaylandSurfaceRenderElement<R>,
-        scale: Scale<f64>,
+        size: Size<i32, Physical>,
     ) -> Option<Fsr1Result>
     where
         R::TextureId: PassSource,
     {
-        let size = elem.geometry(scale).size;
         if size.w <= 0 || size.h <= 0 {
             return None;
         }
@@ -1531,6 +1777,184 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nothing_to_magnify_when_the_buffer_matches_the_area() {
+        let area = Size::<i32, Physical>::from((2560, 1440));
+
+        // A client that renders at the physical resolution of the output, and one that lands a
+        // pixel short of it, leave the effect nothing to recover.
+        assert!(!has_something_to_magnify(Size::from((2560., 1440.)), area));
+        assert!(!has_something_to_magnify(Size::from((2559., 1439.)), area));
+
+        // Two pixels short is real magnification, as is a buffer that is only short in one axis.
+        assert!(has_something_to_magnify(Size::from((2558., 1438.)), area));
+        assert!(has_something_to_magnify(Size::from((1920., 1440.)), area));
+        assert!(has_something_to_magnify(Size::from((2560., 1080.)), area));
+
+        // A big window in a small area is not this mode's business, but it is not a reason to skip
+        // the effect either: the window rule enabled it.
+        assert!(!has_something_to_magnify(Size::from((3840., 2160.)), area));
+    }
+
+    #[test]
+    fn magnify_contain_fits_and_centers() {
+        let source = Size::from((1280., 720.));
+
+        // A 16:9 content in a 16:9 area fits exactly, no letterbox.
+        let m = MagnifiedGeometry::new(source, Size::from((2560., 1440.))).unwrap();
+        assert_eq!(m.scale, 2.);
+        assert_eq!(m.content.loc, Point::from((0., 0.)));
+        assert_eq!(m.content.size, Size::from((2560., 1440.)));
+
+        // A 16:9 content in a 4:3 area gets bars above and below.
+        let m = MagnifiedGeometry::new(source, Size::from((1920., 1440.))).unwrap();
+        assert_eq!(m.scale, 1.5);
+        assert_eq!(m.content.loc, Point::from((0., 180.)));
+        assert_eq!(m.content.size, Size::from((1920., 1080.)));
+
+        // A 4:3 content in a 16:9 area gets bars on the sides.
+        let m =
+            MagnifiedGeometry::new(Size::from((1280., 960.)), Size::from((2560., 1440.))).unwrap();
+        assert_eq!(m.scale, 1.5);
+        assert_eq!(m.content.loc, Point::from((320., 0.)));
+        assert_eq!(m.content.size, Size::from((1920., 1440.)));
+    }
+
+    #[test]
+    fn magnify_nothing_to_do() {
+        // Same size: the window can just be drawn normally.
+        assert_eq!(
+            MagnifiedGeometry::new(Size::from((100., 100.)), Size::from((100., 100.))),
+            None
+        );
+
+        // Bigger content is not magnified, it would be a shrink.
+        assert_eq!(
+            MagnifiedGeometry::new(Size::from((200., 200.)), Size::from((100., 100.))),
+            None
+        );
+
+        // Degenerate sizes.
+        assert_eq!(
+            MagnifiedGeometry::new(Size::from((0., 100.)), Size::from((100., 100.))),
+            None
+        );
+        assert_eq!(
+            MagnifiedGeometry::new(Size::from((100., 100.)), Size::from((100., 0.))),
+            None
+        );
+    }
+
+    #[test]
+    fn magnify_maps_points_both_ways() {
+        let m =
+            MagnifiedGeometry::new(Size::from((1280., 720.)), Size::from((1920., 1440.))).unwrap();
+
+        // The first content pixel maps to the first pixel of the content area.
+        assert_eq!(
+            m.to_source(Point::from((0., 180.))),
+            Some(Point::from((0., 0.)))
+        );
+        // And the last one to the last content pixel.
+        let last = m.to_source(Point::from((1919.5, 1259.5))).unwrap();
+        assert!(
+            (last.x - 1279.667).abs() < 1e-3 && (last.y - 719.667).abs() < 1e-3,
+            "{last:?}"
+        );
+
+        // The letterbox bars are not part of the window.
+        assert_eq!(m.to_source(Point::from((100., 0.))), None);
+        assert_eq!(m.to_source(Point::from((100., 1439.))), None);
+        assert_eq!(m.to_source(Point::from((-1., 500.))), None);
+        assert_eq!(m.to_source(Point::from((500., 1440.))), None);
+
+        // Drawing maps the content's own rect onto the whole content area.
+        assert_eq!(
+            m.to_target(Rectangle::from_size(Size::from((1280., 720.)))),
+            m.content
+        );
+
+        // A point inside the content maps back to where it came from.
+        let point = Point::from((700., 900.));
+        let source = m.to_source(point).unwrap();
+        let back = m
+            .to_target(Rectangle::new(source, Size::from((0., 0.))))
+            .loc;
+        assert!((back.x - point.x).abs() < 1e-6 && (back.y - point.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn magnify_maps_damage() {
+        let inner = Rectangle::new(Point::from((10, 20)), Size::from((100, 50)));
+        let dest = Rectangle::new(Point::from((0, 0)), Size::from((200, 100)));
+
+        // Doubling, and the rects are relative to the element, so half of it maps onto all of the
+        // destination. The inner element's own location does not take part: it cancels out,
+        // because both the damage and the result are relative to their element.
+        assert_eq!(
+            magnify_physical_rect(
+                Rectangle::new(Point::from((0, 0)), Size::from((50, 25))),
+                inner,
+                dest,
+                true,
+                0,
+            ),
+            Rectangle::new(Point::from((0, 0)), Size::from((100, 50)))
+        );
+
+        // The bottom-right corner maps onto the destination's, without running past it.
+        assert_eq!(
+            magnify_physical_rect(
+                Rectangle::new(Point::from((50, 25)), Size::from((50, 25))),
+                inner,
+                dest,
+                true,
+                0,
+            ),
+            Rectangle::new(Point::from((100, 50)), Size::from((100, 50)))
+        );
+
+        // Fractional scaling rounds outwards for damage, so that nothing that changed is left
+        // out, and is grown by the kernel's footprint.
+        let inner = Rectangle::from_size(Size::from((100, 100)));
+        let dest = Rectangle::from_size(Size::from((214, 214)));
+        assert_eq!(
+            magnify_physical_rect(
+                Rectangle::new(Point::from((10, 10)), Size::from((10, 10))),
+                inner,
+                dest,
+                true,
+                5,
+            ),
+            Rectangle::new(Point::from((16, 16)), Size::from((32, 32)))
+        );
+
+        // Opaque regions round inwards instead, so that we never claim to cover something we do
+        // not actually cover.
+        assert_eq!(
+            magnify_physical_rect(
+                Rectangle::new(Point::from((10, 10)), Size::from((10, 10))),
+                inner,
+                dest,
+                false,
+                0,
+            ),
+            Rectangle::new(Point::from((22, 22)), Size::from((20, 20)))
+        );
+
+        // A degenerate inner element has nothing to scale by: the whole area is affected.
+        assert_eq!(
+            magnify_physical_rect(
+                Rectangle::new(Point::from((3, 4)), Size::from((5, 6))),
+                Rectangle::from_size(Size::from((0, 0))),
+                dest,
+                true,
+                5,
+            ),
+            Rectangle::from_size(dest.size)
+        );
     }
 
     /// A grayscale pattern with hard edges and gradients.

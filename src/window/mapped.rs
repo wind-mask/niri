@@ -1,9 +1,9 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
-use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
+use niri_config::{Color, Config, CornerRadius, GradientInterpolation, UpscalingMode, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Element as _, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
@@ -34,7 +34,9 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::superres::SuperResolutionPipeline;
+use crate::render_helpers::superres::{
+    MagnifiedGeometry, SuperResElement, SuperResolutionPipeline,
+};
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
 };
@@ -336,6 +338,12 @@ impl Mapped {
             return false;
         }
 
+        // If the magnify upscaling mode was turned off, stop magnifying right away instead of
+        // waiting for the next size request.
+        if new_rules.upscaling.mode() != self.rules.upscaling.mode() {
+            self.superres.set_magnify_target(None);
+        }
+
         // If the opacity window rule no longer makes the window semitransparent, reset the ignore
         // flag to reduce surprises down the line.
         if !new_rules.opacity.is_some_and(|o| o < 1.) {
@@ -564,6 +572,15 @@ impl Mapped {
         );
     }
 
+    /// Returns the geometry for the magnify upscaling mode, if this window is in it.
+    ///
+    /// This is what both drawing and input use to agree on where the window's content ends up.
+    pub fn magnify_geometry(&self) -> Option<MagnifiedGeometry> {
+        let target = self.superres.magnify_target()?;
+        let source = self.window.geometry().size;
+        MagnifiedGeometry::new(source.to_f64(), target.to_f64())
+    }
+
     pub fn get_focus_timestamp(&self) -> Option<Duration> {
         self.focus_timestamp
     }
@@ -641,12 +658,32 @@ impl LayoutElement for Mapped {
         self.window.geometry().size
     }
 
+    fn visual_size(&self) -> Size<i32, Logical> {
+        // In the magnify mode the window occupies the whole area it was given, even though the
+        // client only ever renders its own size.
+        self.superres
+            .magnify_target()
+            .unwrap_or_else(|| self.size())
+    }
+
     fn buf_loc(&self) -> Point<i32, Logical> {
         Point::from((0, 0)) - self.window.geometry().loc
     }
 
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
-        let surface_local = point + self.window.geometry().loc.to_f64();
+        let Some(magnify) = self.magnify_geometry() else {
+            let surface_local = point + self.window.geometry().loc.to_f64();
+            return self.window.is_in_input_region(&surface_local);
+        };
+
+        // The point is relative to the area the window was given, which is bigger than its
+        // content. Map it back into the client's own coordinates. The letterbox bars are not part
+        // of the window and must not take input.
+        let Some(surface_point) = magnify.to_source(point) else {
+            return false;
+        };
+
+        let surface_local = surface_point + self.window.geometry().loc.to_f64();
         self.window.is_in_input_region(&surface_local)
     }
 
@@ -667,7 +704,10 @@ impl LayoutElement for Mapped {
         } else {
             let buf_pos = location - self.window.geometry().loc.to_f64();
             let surface = self.toplevel().wl_surface();
+            // The window's visual location, which is what magnified content is positioned against.
+            let window_location = location;
             let location = buf_pos.to_physical_precise_round(scale);
+            let magnify = self.magnify_geometry();
 
             // Super resolution only replaces how the client buffer is sampled. The window's
             // display geometry, its input handling and everything else stays the same. It applies
@@ -689,7 +729,13 @@ impl LayoutElement for Mapped {
 
                     for elem in elements {
                         let renderer = ctx.renderer.as_gles_renderer();
-                        let elem = self.superres.element(renderer, elem, kernel, scale);
+                        let magnify = magnify.map(|magnify| {
+                            let rect = elem.geometry(scale).to_f64().to_logical(scale);
+                            magnify_element_rect(&magnify, window_location, rect)
+                        });
+                        let elem = self
+                            .superres
+                            .element(renderer, elem, kernel, scale, magnify);
                         push(elem.into());
                     }
                 }
@@ -723,6 +769,7 @@ impl LayoutElement for Mapped {
         }
 
         let surface = self.toplevel().wl_surface();
+        let magnify = self.magnify_geometry();
         for (popup, offset) in PopupManager::popups_for_surface(surface) {
             let popup_rules = match popup {
                 PopupKind::Xdg(_) => self.rules.popups,
@@ -735,6 +782,17 @@ impl LayoutElement for Mapped {
             let popup_geo = popup.geometry();
             let surface_loc = location + (offset - popup.geometry().loc).to_f64();
 
+            // Pop-ups live in the same coordinate space as the window's own content, so they are
+            // magnified along with it. They are drawn with the renderer's own sampling rather than
+            // with the configured kernel, which is fine for menus and tooltips.
+            let mut push_popup = |elem: WaylandSurfaceRenderElement<R>| match magnify {
+                Some(magnify) => {
+                    let rect = elem.geometry(scale).to_f64().to_logical(scale);
+                    let rect = magnify_element_rect(&magnify, location, rect);
+                    push(SuperResElement::plain(elem).with_magnify(rect).into());
+                }
+                None => push(elem.into()),
+            };
             push_elements_from_surface_tree(
                 ctx.renderer,
                 surface,
@@ -742,10 +800,17 @@ impl LayoutElement for Mapped {
                 scale,
                 alpha,
                 Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
+                &mut push_popup,
             );
 
-            let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
+            let geometry = match magnify {
+                Some(magnify) => {
+                    let rect = Rectangle::new(offset.to_f64(), popup_geo.size.to_f64());
+                    let rect = magnify.to_target(rect);
+                    Rectangle::new(location + rect.loc, rect.size)
+                }
+                None => Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64()),
+            };
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
             let surface_anim_scale = Scale::from(1.);
             let mut effect = popup_rules.background_effect;
@@ -805,11 +870,25 @@ impl LayoutElement for Mapped {
 
     fn request_size(
         &mut self,
-        size: Size<i32, Logical>,
+        mut size: Size<i32, Logical>,
         mode: SizingMode,
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        // In the magnify upscaling mode, niri draws the window's content scaled up into the area
+        // the layout asked for, so the client keeps its own size and does not need to know about
+        // the area. Nothing has to be restored when this is unset, since the client was never
+        // resized.
+        let client_size = self.window.geometry().size;
+        let magnify = mode.is_fullscreen()
+            && self.rules.upscaling.mode() == UpscalingMode::Magnify
+            && client_size.w > 0
+            && client_size.h > 0;
+        self.superres.set_magnify_target(magnify.then_some(size));
+        if magnify {
+            size = client_size;
+        }
+
         // Going into real fullscreen resets windowed fullscreen.
         if mode == SizingMode::Fullscreen {
             self.is_pending_windowed_fullscreen = false;
@@ -1464,4 +1543,19 @@ impl LayoutElement for Mapped {
             }
         });
     }
+}
+
+/// Maps an element's rectangle into the area that magnified content is drawn in.
+///
+/// `origin` is the window's visual location on the output, and `rect` is the element's rectangle in
+/// output coordinates, as the surface tree walker produced it. Everything the window draws, which
+/// includes its subsurfaces and pop-ups, goes through this.
+fn magnify_element_rect(
+    magnify: &MagnifiedGeometry,
+    origin: Point<f64, Logical>,
+    rect: Rectangle<f64, Logical>,
+) -> Rectangle<f64, Logical> {
+    let relative = Rectangle::new(rect.loc - origin, rect.size);
+    let mapped = magnify.to_target(relative);
+    Rectangle::new(origin + mapped.loc, mapped.size)
 }
