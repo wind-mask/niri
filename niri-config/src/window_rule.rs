@@ -295,6 +295,12 @@ pub enum UpscalingAlgorithm {
     /// Runs EASU into an offscreen texture and then RCAS on the result, using `sharpness`.
     Fsr1,
 
+    /// The larger CuNNy network.
+    ///
+    /// `CuNNy-3x12-NVL`: the same kind of reconstruction as `"cunny2"`, with one more convolution,
+    /// so it is noticeably more expensive and worth trying where the extra detail shows.
+    Cunny2Large,
+
     /// CuNNy2 neural network.
     ///
     /// A network trained on illustrations, which reconstructs the image instead of resampling it.
