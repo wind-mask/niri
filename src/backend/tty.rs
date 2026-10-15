@@ -2159,11 +2159,24 @@ impl Tty {
     }
 
     pub fn early_import(&mut self, surface: &WlSurface) {
-        debug!(
-            target: GPU_LOG_TARGET,
-            requested_render_node = %self.primary_render_node,
-            "early import destination (actual importer/copy path is Smithay internal)",
-        );
+        // The destination is the same for every commit of every surface, and this runs for all of
+        // them, so it is written once and everything after it goes to TRACE.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        let message = "early import destination (actual importer/copy path is Smithay internal)";
+        if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            trace!(
+                target: GPU_LOG_TARGET,
+                requested_render_node = %self.primary_render_node,
+                "{message}",
+            );
+        } else {
+            debug!(
+                target: GPU_LOG_TARGET,
+                requested_render_node = %self.primary_render_node,
+                "{message}",
+            );
+        }
         if let Err(err) = self.gpu_manager.early_import(
             // We always render on the primary GPU.
             self.primary_render_node,
