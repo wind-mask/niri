@@ -348,7 +348,8 @@ impl Mapped {
         // If the magnify upscaling mode was turned off, stop magnifying right away instead of
         // waiting for the next size request.
         if new_rules.upscaling.mode() != self.rules.upscaling.mode() {
-            self.superres.set_magnify_target(None);
+            let size = self.window.geometry().size;
+            self.superres.set_magnify_target(self.id.get(), size, None);
         }
 
         // The scale that the client is told to render at changed without the output's scale
@@ -730,7 +731,7 @@ impl LayoutElement for Mapped {
             // Super resolution only replaces how the client buffer is sampled. The window's
             // display geometry, its input handling and everything else stays the same. It applies
             // to every render target, so that screen captures show what is on the screen.
-            match self.superres.kernel(&self.rules.upscaling) {
+            match self.superres.kernel(&self.rules.upscaling, self.id.get()) {
                 Some(kernel) => {
                     // Collect the surface elements first, because running the offscreen pass needs
                     // the renderer again.
@@ -751,9 +752,14 @@ impl LayoutElement for Mapped {
                             let rect = elem.geometry(scale).to_f64().to_logical(scale);
                             magnify_element_rect(&magnify, window_location, rect)
                         });
-                        let elem = self
-                            .superres
-                            .element(renderer, elem, kernel, scale, magnify);
+                        let elem = self.superres.element(
+                            renderer,
+                            elem,
+                            kernel,
+                            scale,
+                            self.id.get(),
+                            magnify,
+                        );
                         push(elem.into());
                     }
                 }
@@ -916,7 +922,8 @@ impl LayoutElement for Mapped {
             // tiled window to its own content, so it is never bigger than the area it is given.
             && (mode.is_fullscreen() || virtual_size.is_some())
             && (content_size.w < size.w || content_size.h < size.h);
-        self.superres.set_magnify_target(magnify.then_some(size));
+        self.superres
+            .set_magnify_target(self.id.get(), content_size, magnify.then_some(size));
         if magnify {
             size = content_size;
         }
