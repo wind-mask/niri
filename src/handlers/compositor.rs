@@ -41,8 +41,10 @@ impl CompositorHandler for State {
         }
 
         if let Some(output) = self.niri.output_for_root(&root) {
-            let scale = output.current_scale();
+            let output_scale = output.current_scale();
             let transform = output.current_transform();
+            // Subsurfaces belong to their window, so they get the same client scale as it.
+            let scale = self.niri.client_scale_for_root(&root, output_scale);
             with_states(surface, |data| {
                 send_scale_transform(surface, data, scale, transform);
             });

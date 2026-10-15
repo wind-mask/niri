@@ -138,6 +138,12 @@ pub struct Mapped {
     /// State of an ongoing interactive resize.
     interactive_resize: Option<InteractiveResize>,
 
+    /// The output scale and transform that the layout last asked this window's surfaces to use.
+    ///
+    /// These are the values *before* the client-scale window rule is applied, so that a rule
+    /// change can send the client a new scale even though the output's scale did not change.
+    sent_scale_transform: Cell<(output::Scale, Transform)>,
+
     /// Last time interactive resize was started.
     ///
     /// Used for double-resize-click tracking.
@@ -309,6 +315,7 @@ impl Mapped {
             transaction_for_next_configure: None,
             pending_transactions: Vec::new(),
             interactive_resize: None,
+            sent_scale_transform: Cell::new((output::Scale::Integer(1), Transform::Normal)),
             last_interactive_resize_start: Cell::new(None),
             is_windowed_fullscreen: false,
             is_pending_windowed_fullscreen: false,
@@ -344,6 +351,11 @@ impl Mapped {
             self.superres.set_magnify_target(None);
         }
 
+        // The scale that the client is told to render at changed without the output's scale
+        // changing, so the layout will not send it again on its own.
+        let client_scale_changed =
+            new_rules.upscaling.client_scale() != self.rules.upscaling.client_scale();
+
         // If the opacity window rule no longer makes the window semitransparent, reset the ignore
         // flag to reduce surprises down the line.
         if !new_rules.opacity.is_some_and(|o| o < 1.) {
@@ -351,6 +363,11 @@ impl Mapped {
         }
 
         self.rules = new_rules;
+
+        if client_scale_changed {
+            let (scale, transform) = self.sent_scale_transform.get();
+            self.set_preferred_scale_transform(scale, transform);
+        }
         true
     }
 
@@ -659,10 +676,11 @@ impl LayoutElement for Mapped {
     }
 
     fn visual_size(&self) -> Size<i32, Logical> {
-        // In the magnify mode the window occupies the whole area it was given, even though the
-        // client only ever renders its own size.
-        self.superres
-            .magnify_target()
+        // In the magnify mode the window occupies the area the layout gave it, even though the
+        // client only ever renders the content size that was asked of it. When there is nothing to
+        // magnify (no target, or content that does not fit), the window is drawn at its own size.
+        self.magnify_geometry()
+            .map(|geometry| geometry.target.to_i32_round())
             .unwrap_or_else(|| self.size())
     }
 
@@ -879,18 +897,28 @@ impl LayoutElement for Mapped {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
-        // In the magnify upscaling mode, niri draws the window's content scaled up into the area
-        // the layout asked for, so the client keeps its own size and does not need to know about
-        // the area. Nothing has to be restored when this is unset, since the client was never
-        // resized.
-        let client_size = self.window.geometry().size;
-        let magnify = mode.is_fullscreen()
-            && self.rules.upscaling.mode() == UpscalingMode::Magnify
-            && client_size.w > 0
-            && client_size.h > 0;
+        // In the magnify upscaling mode, niri draws the window's content scaled into the area the
+        // layout asked for, so the client is asked for the content size instead of the area. That
+        // size is either the client's own size or the `virtual-size` a rule configured, and nothing
+        // has to be restored when this is unset, since the client was never resized.
+        //
+        // A content size that fits in the area is the whole point: it is what makes the effect
+        // magnify (and the window occupy the area). One that does not fit in both dimensions would
+        // only make the window overflow the area, so the client is given the area's size instead.
+        let virtual_size = self.rules.upscaling.virtual_size();
+        let content_size = virtual_size
+            .map(|(width, height)| Size::from((width, height)))
+            .unwrap_or(self.window.geometry().size);
+        let magnify = self.rules.upscaling.mode() == UpscalingMode::Magnify
+            && content_size.w > 0
+            && content_size.h > 0
+            // Without a virtual size, only fullscreen has anything to magnify: the layout sizes a
+            // tiled window to its own content, so it is never bigger than the area it is given.
+            && (mode.is_fullscreen() || virtual_size.is_some())
+            && (content_size.w < size.w || content_size.h < size.h);
         self.superres.set_magnify_target(magnify.then_some(size));
         if magnify {
-            size = client_size;
+            size = content_size;
         }
 
         // Going into real fullscreen resets windowed fullscreen.
@@ -1039,6 +1067,15 @@ impl LayoutElement for Mapped {
     }
 
     fn set_preferred_scale_transform(&self, scale: output::Scale, transform: Transform) {
+        // Remember the output's scale and transform as the layout sent them, so that a client-scale
+        // rule change can send the client a new scale even though the output's scale did not
+        // change.
+        self.sent_scale_transform.set((scale, transform));
+
+        // A window rule can override the scale that this window's client renders at, which is what
+        // makes it render fewer pixels for super resolution to magnify.
+        let scale = self.rules.client_scale(scale);
+
         self.window.with_surfaces(|surface, data| {
             send_scale_transform(surface, data, scale, transform);
         });
@@ -1342,6 +1379,15 @@ impl LayoutElement for Mapped {
     }
 
     fn expected_size(&self) -> Option<Size<i32, Logical>> {
+        // In the magnify mode the window occupies the area the layout gave it rather than the
+        // content size its client renders at, which is what the callers of this function care about
+        // (interactive resizes and the size to restore when unfloating). Fullscreen windows have no
+        // expected size, which the logic below handles.
+        if !self.sizing_mode().is_fullscreen() {
+            if let Some(geometry) = self.magnify_geometry() {
+                return Some(geometry.target.to_i32_round());
+            }
+        }
         // We can only use current size if it's not maximized or fullscreen.
         let current_size = (self.sizing_mode().is_normal()).then(|| self.window.geometry().size);
 

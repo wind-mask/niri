@@ -883,8 +883,11 @@ impl<W: LayoutElement> Workspace<W> {
         is_floating: bool,
         rules: &ResolvedWindowRules,
     ) {
+        // The client-scale window rule can make this window's client render at a different pixel
+        // density than the output's scale, including before the window is mapped.
+        let scale = rules.client_scale(self.scale);
         window.with_surfaces(|surface, data| {
-            send_scale_transform(surface, data, self.scale, self.transform);
+            send_scale_transform(surface, data, scale, self.transform);
         });
 
         let toplevel = window.toplevel().expect("no x11 support");

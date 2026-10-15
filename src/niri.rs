@@ -3969,6 +3969,23 @@ impl Niri {
         self.layout.outputs().find(has_layer_surface)
     }
 
+    /// Returns the scale to advertise to a client for a root surface.
+    ///
+    /// This is normally the scale of the output the surface is on, but a window rule can override
+    /// it for one window, so that its client renders at a different pixel density: a scale
+    /// below the output's makes it render fewer pixels than its display area has, which is what
+    /// super resolution magnifies.
+    pub fn client_scale_for_root(
+        &self,
+        root: &WlSurface,
+        output_scale: output::Scale,
+    ) -> output::Scale {
+        match self.layout.find_window_and_output(root) {
+            Some((window, _)) => window.rules().client_scale(output_scale),
+            None => output_scale,
+        }
+    }
+
     pub fn lock_surface_focus(&self) -> Option<WlSurface> {
         let output_under_cursor = self.output_under_cursor();
         let output = output_under_cursor
