@@ -32,7 +32,9 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer, MultiTexture};
-use smithay::backend::renderer::{ContextId, DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::{
+    ContextId, DebugFlags, ImportDma, ImportEgl, Renderer as _, RendererSuper,
+};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -66,7 +68,9 @@ use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::render_helpers::renderer::{
+    AsGlesRenderer, DmabufDebug, GpuDebug, TextureDebug, GPU_LOG_TARGET,
+};
 use crate::render_helpers::{resources, shaders, superres, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
@@ -1921,6 +1925,37 @@ impl Tty {
             }
         };
 
+        let _gpu_span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "output-render",
+            output = %output.name(),
+            render_node = %self.primary_render_node,
+            target_node = %device.render_node.unwrap_or(self.primary_render_node),
+            scanout_node = %tty_state.node,
+        )
+        .entered();
+        let cross_gpu_output = renderer.target_as_ref().is_some();
+        // Rendering through a second GPU is what the Hybrid work looks at, so that case keeps its
+        // DEBUG entry; the same route is logged for every frame of every other output, which is
+        // only interesting when the diagnostics are turned all the way up.
+        macro_rules! render_route {
+            ($level:ident) => {
+                $level!(
+                    target: GPU_LOG_TARGET,
+                    render_gpu = ?GpuDebug::renderer(renderer.as_ref()),
+                    target_gpu = ?renderer.target_as_ref().map(GpuDebug::renderer),
+                    cross_gpu_output,
+                    format = ?surface.compositor.format(),
+                    "output render route (render GPU executes passes; target GPU receives output)",
+                );
+            };
+        }
+        if cross_gpu_output {
+            render_route!(debug);
+        } else {
+            render_route!(trace);
+        }
+
         // Render the elements.
         let ctx = RenderCtx {
             renderer: &mut renderer,
@@ -1977,9 +2012,21 @@ impl Tty {
                         .borrow()
                         .debug
                         .wait_for_frame_completion_before_queueing;
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    empty = res.is_empty,
+                    primary_is_swapchain = matches!(&res.primary_element, PrimaryPlaneElement::Swapchain(_)),
+                    ?needs_sync,
+                    "DRM frame prepared (swapchain composition vs direct primary-plane scanout)",
+                );
                 if needs_sync {
                     if let PrimaryPlaneElement::Swapchain(element) = res.primary_element {
                         let _span = tracy_client::span!("wait for completion");
+                        trace!(
+                            target: GPU_LOG_TARGET,
+                            completion_fence = element.sync.contains_fence(),
+                            "existing DRM submission path entering CPU completion wait",
+                        );
                         if let Err(err) = element.sync.wait() {
                             warn!("error waiting for frame completion: {err:?}");
                         }
@@ -2079,21 +2126,44 @@ impl Tty {
             }
         };
 
+        let _span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "dmabuf-validation",
+            requested_render_gpu = ?GpuDebug::renderer(renderer.as_ref()),
+            original_buffer = ?DmabufDebug(dmabuf),
+        )
+        .entered();
+        // MultiRenderer may import on another device before copying to this context.
+        // Success and node() alone do not identify that internal path or physical ownership.
         match renderer.import_dmabuf(dmabuf, None) {
-            Ok(_texture) => {
+            Ok(texture) => {
                 if dmabuf.node().is_none() {
                     dmabuf.set_node(Some(self.primary_render_node));
                 }
+                debug!(
+                    target: GPU_LOG_TARGET,
+                    import_node_hint_after = ?dmabuf.node().map(|node| node.to_string()),
+                    native_texture_in_requested_context = ?native_texture(&texture, &renderer.as_ref().context_id()).as_ref().map(TextureDebug),
+                    accepted = true,
+                    "dmabuf validation complete; exporter and copy path unknown",
+                );
+                trace!(target: GPU_LOG_TARGET, smithay_texture = ?texture, "raw validation import state (not a stable path classifier)");
                 true
             }
             Err(err) => {
                 debug!("error importing dmabuf: {err:?}");
+                debug!(target: GPU_LOG_TARGET, accepted = false, ?err, "dmabuf validation failed");
                 false
             }
         }
     }
 
     pub fn early_import(&mut self, surface: &WlSurface) {
+        debug!(
+            target: GPU_LOG_TARGET,
+            requested_render_node = %self.primary_render_node,
+            "early import destination (actual importer/copy path is Smithay internal)",
+        );
         if let Err(err) = self.gpu_manager.early_import(
             // We always render on the primary GPU.
             self.primary_render_node,

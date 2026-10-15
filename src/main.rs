@@ -31,7 +31,8 @@ use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LOG_FILTER: &str = "niri=debug,smithay::backend::renderer::gles=error";
+const DEFAULT_LOG_FILTER: &str =
+    "niri=debug,niri::render_helpers::gpu=off,smithay::backend::renderer::gles=error";
 
 #[cfg(feature = "profile-with-tracy-allocations")]
 #[global_allocator]
@@ -425,5 +426,30 @@ impl Drop for ShutdownTracy {
         unsafe {
             tracy_client::sys::___tracy_shutdown_profiler();
         }
+    }
+}
+
+#[cfg(test)]
+mod gpu_log_filter_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_diagnostics_are_opt_in_by_default() {
+        let filter = EnvFilter::new(DEFAULT_LOG_FILTER);
+        let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "niri", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "niri::render_helpers::gpu", tracing::Level::DEBUG));
+        });
+    }
+
+    #[test]
+    fn gpu_debug_filter_works_without_enabling_all_niri_debug_logs() {
+        let filter = EnvFilter::new("niri=info,niri::render_helpers::gpu=debug");
+        let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "niri::render_helpers::gpu", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "niri", tracing::Level::DEBUG));
+        });
     }
 }

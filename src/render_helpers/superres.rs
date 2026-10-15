@@ -47,7 +47,9 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{native_texture, TtyFrame, TtyRenderer, TtyRendererError};
-use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
+use crate::render_helpers::renderer::{
+    AsGlesFrame as _, ClientBufferDebug, GpuDebug, NiriRenderer, TextureDebug, GPU_LOG_TARGET,
+};
 
 /// Resampling kernel for a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,6 +663,7 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
     };
 
     info!("super resolution: {}", capabilities.summary());
+    debug!("super resolution capabilities: {capabilities:#?}");
 
     let programs = SuperResPrograms::compile(renderer);
 
@@ -671,6 +674,11 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
     if !data.insert_if_missing(|| programs) {
         error!("super resolution: the programs were already compiled");
     }
+    debug!(
+        target: GPU_LOG_TARGET,
+        gpu = ?GpuDebug::renderer(renderer),
+        "initialized super-resolution execution context; texture IDs are context-local",
+    );
 }
 
 /// Returns the capabilities probed for this renderer context, if any.
@@ -725,6 +733,17 @@ pub enum ElementKernel {
     },
 }
 
+impl ElementKernel {
+    fn draw_pass(&self) -> &'static str {
+        match self {
+            Self::Plain => "renderer-default",
+            Self::Filter(ResampleFilter::Bilinear) => "bilinear",
+            Self::Filter(ResampleFilter::Bicubic) => "bicubic",
+            Self::Fsr1 { .. } => "rcas",
+            Self::Cunny { .. } => "cunny-upscale",
+        }
+    }
+}
 
 impl<R: Renderer> SuperResElement<R> {
     /// Creates an element that draws the client buffer with a resampling filter.
@@ -840,6 +859,50 @@ impl<R: Renderer + ImportAll> SuperResElement<R>
 where
     R::TextureId: Texture,
 {
+    /// Logs the selected draw path after issuing commands, without querying/waiting for the GPU.
+    fn log_draw(
+        &self,
+        frame: &GlesFrame<'_, '_>,
+        executed_pass: &'static str,
+        dst: Rectangle<i32, Physical>,
+        success: bool,
+    ) where
+        R::TextureId: PassSource,
+    {
+        if !tracing::enabled!(target: GPU_LOG_TARGET, tracing::Level::DEBUG) {
+            return;
+        }
+        let native = match self.inner.texture() {
+            WaylandSurfaceTexture::Texture(texture) => texture.pass_texture(&frame.context_id()),
+            WaylandSurfaceTexture::SolidColor(_) => None,
+        };
+        let cached = match &self.kernel {
+            ElementKernel::Fsr1 {
+                texture,
+                context_id,
+                ..
+            } => Some((context_id, TextureDebug(texture))),
+            ElementKernel::Cunny {
+                residuals,
+                context_id,
+            } => Some((context_id, TextureDebug(residuals))),
+            _ => None,
+        };
+        trace!(
+            target: GPU_LOG_TARGET,
+            element = ?self.inner.id(),
+            commit = ?self.inner.current_commit(),
+            gpu = ?GpuDebug::frame(frame),
+            selected_pass = self.kernel.draw_pass(),
+            executed_pass,
+            draw_fallback = executed_pass != self.kernel.draw_pass(),
+            success,
+            native_source = ?native.as_ref().map(TextureDebug),
+            cached_context_and_texture = ?cached,
+            ?dst,
+            "final draw commands issued (not a GPU completion notification)",
+        );
+    }
 
     /// Returns the program that applies the residuals, with the uniforms and the texture binding
     /// it needs.
@@ -858,6 +921,14 @@ where
             // This happens when the same window is drawn on another GPU, where the cached result is
             // not valid. It is not an error, we just cannot use the cache here.
             trace!("super resolution: not applying residuals from another renderer context");
+            debug!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::frame(frame),
+                cached_context = ?context_id,
+                cached_texture = ?TextureDebug(residuals),
+                reason = "different texture-compatible context",
+                "CuNNy upscale unavailable; renderer-default fallback",
+            );
             return None;
         }
 
@@ -910,7 +981,12 @@ where
             return None;
         };
 
-        let program = SuperResPrograms::get_from_frame(frame)?.program(filter)?;
+        let Some(program) =
+            SuperResPrograms::get_from_frame(frame).and_then(|programs| programs.program(filter))
+        else {
+            debug!(target: GPU_LOG_TARGET, gpu = ?GpuDebug::frame(frame), ?filter, reason = "resampling shader unavailable in execution context", "renderer-default fallback");
+            return None;
+        };
         let uniforms = self.resample_uniforms(src)?;
         Some((program, uniforms.to_vec()))
     }
@@ -1032,6 +1108,14 @@ fn draw_fsr1(
         // This happens when the same window is drawn on another GPU, where the cached result is
         // not valid. It is not an error, we just cannot use the cache here.
         trace!("super resolution: not drawing a result from another renderer context");
+        debug!(
+            target: GPU_LOG_TARGET,
+            gpu = ?GpuDebug::frame(frame),
+            cached_context = ?context_id,
+            cached_texture = ?TextureDebug(texture),
+            reason = "different texture-compatible context",
+            "RCAS unavailable; renderer-default fallback",
+        );
         return None;
     }
 
@@ -1040,7 +1124,12 @@ fn draw_fsr1(
         return None;
     }
 
-    let program = SuperResPrograms::get_from_frame(frame)?.rcas.clone()?;
+    let Some(program) =
+        SuperResPrograms::get_from_frame(frame).and_then(|programs| programs.rcas.clone())
+    else {
+        debug!(target: GPU_LOG_TARGET, gpu = ?GpuDebug::frame(frame), reason = "RCAS shader unavailable in execution context", "renderer-default fallback");
+        return None;
+    };
     let uniforms = [
         Uniform::new("niri_tex_size", (size.w as f32, size.h as f32)),
         Uniform::new("niri_src_rect", [0f32, 0., size.w as f32, size.h as f32]),
@@ -1072,10 +1161,13 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
     ) -> Result<(), GlesError> {
         // The element draws with the renderer's own sampling, so there is nothing to measure.
         if matches!(self.kernel, ElementKernel::Plain) {
-            return draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+            let res = draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+            self.log_draw(frame, "renderer-default", dst, res.is_ok());
+            return res;
         }
 
         self.timings.begin(frame, Pass::Draw);
+        let mut executed_pass = "renderer-default";
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
@@ -1085,6 +1177,7 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                     draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
                 }
                 Some((program, uniforms)) => {
+                    executed_pass = self.kernel.draw_pass();
                     frame.override_default_tex_program(program, uniforms);
                     let res = draw_inner_gles(
                         &self.inner,
@@ -1104,6 +1197,7 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                 context_id,
             } => match self.cunny_program(frame, residuals, context_id.clone(), src, dst) {
                 Some((program, uniforms)) => {
+                    executed_pass = self.kernel.draw_pass();
                     frame.override_default_tex_program(program, uniforms);
                     let res = draw_inner_gles(
                         &self.inner,
@@ -1136,7 +1230,10 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                 opaque_regions,
                 self.inner.alpha(),
             ) {
-                Some(res) => res,
+                Some(res) => {
+                    executed_pass = "rcas";
+                    res
+                }
                 None => {
                     draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
                 }
@@ -1144,6 +1241,7 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
         };
 
         self.timings.end(frame);
+        self.log_draw(frame, executed_pass, dst, res.is_ok());
         res
     }
 
@@ -1166,7 +1264,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
     ) -> Result<(), TtyRendererError<'render>> {
         // The element draws with the renderer's own sampling, so there is nothing to measure.
         if matches!(self.kernel, ElementKernel::Plain) {
-            return RenderElement::<TtyRenderer<'render>>::draw(
+            let res = RenderElement::<TtyRenderer<'render>>::draw(
                 &self.inner,
                 frame,
                 src,
@@ -1175,9 +1273,12 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 opaque_regions,
                 cache,
             );
+            self.log_draw(frame.as_gles_frame(), "renderer-default", dst, res.is_ok());
+            return res;
         }
 
         self.timings.begin(frame.as_gles_frame(), Pass::Draw);
+        let mut executed_pass = "renderer-default";
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
@@ -1194,6 +1295,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                         cache,
                     ),
                     Some((program, uniforms)) => {
+                        executed_pass = self.kernel.draw_pass();
                         frame
                             .as_gles_frame()
                             .override_default_tex_program(program, uniforms);
@@ -1223,6 +1325,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                     dst,
                 ) {
                     Some((program, uniforms)) => {
+                        executed_pass = self.kernel.draw_pass();
                         frame
                             .as_gles_frame()
                             .override_default_tex_program(program, uniforms);
@@ -1269,7 +1372,10 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                     opaque_regions,
                     self.inner.alpha(),
                 ) {
-                    Some(res) => res.map_err(TtyRendererError::Render),
+                    Some(res) => {
+                        executed_pass = "rcas";
+                        res.map_err(TtyRendererError::Render)
+                    }
                     None => RenderElement::<TtyRenderer<'render>>::draw(
                         &self.inner,
                         frame,
@@ -1284,6 +1390,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         };
 
         self.timings.end(frame.as_gles_frame());
+        self.log_draw(frame.as_gles_frame(), executed_pass, dst, res.is_ok());
         res
     }
 
@@ -1377,6 +1484,10 @@ fn damage_since<R: ImportAll>(
 /// about (an algorithm that is not implemented, a failing pass), which are logged at `warn!`. The
 /// logger target is this module, so the whole feature can be filtered with, for example,
 /// `RUST_LOG=niri=info,niri::render_helpers::superres=debug`.
+/// Detailed GPU/buffer provenance uses the opt-in [`GPU_LOG_TARGET`] instead; that is where the
+/// DEBUG entries are, and the output that repeats for every window and every frame — the raw
+/// Smithay cache snapshots, the per-pass completions and the cache hits — is one level below them,
+/// at TRACE.
 #[derive(Debug)]
 pub struct SuperResolutionPipeline {
     /// The mode, algorithm and sharpness that the current decision was made for.
@@ -1698,6 +1809,14 @@ fn run_cunny(
                 })
                 .context("error configuring pass textures")?;
 
+            debug!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::renderer(renderer),
+                ?variant,
+                features = ?features.iter().map(TextureDebug).collect::<Vec<_>>(),
+                residuals = ?TextureDebug(&residuals),
+                "allocated CuNNy intermediates in execution context (not exported as DMA-BUF by these passes)",
+            );
             (features, residuals)
         }
     };
@@ -1714,6 +1833,13 @@ fn run_cunny(
             for group in 0..pass.shaders.len() {
                 let pass_number = pass_index + 1;
                 let group_number = group + 1;
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    ?variant,
+                    pass = pass_number,
+                    group = group_number,
+                    "running a CuNNy pass",
+                );
                 let program =
                     cunny_program(renderer, variant, pass_index, group).with_context(|| {
                         format!("error compiling pass {pass_number} group {group_number}")
@@ -1798,9 +1924,21 @@ fn run_cunny(
                 if last {
                     timings.end(&mut frame);
                 }
-                let _ = frame.finish().with_context(|| {
+                let sync = frame.finish().with_context(|| {
                     format!("error finishing pass {pass_number} group {group_number}")
                 })?;
+                drop(fb);
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    gpu = ?GpuDebug::renderer(renderer),
+                    pass = pass_index + 1,
+                    group,
+                    reads = ?pass.reads,
+                    writes = ?pass.writes[group],
+                    target = ?TextureDebug(&target),
+                    completion_fence = sync.contains_fence(),
+                    "CuNNy finish returned; diagnostics add no waits (renderer may synchronize internally)",
+                );
             }
         }
         Ok(())
@@ -2075,7 +2213,10 @@ impl Timings {
     fn begin(&self, frame: &mut GlesFrame<'_, '_>, pass: Pass) {
         // Measuring costs GL calls and, on some drivers, flushes work. Only do it when the numbers
         // are going to be logged anyway, and when the driver can measure at all.
-        if !self.enabled || !tracing::enabled!(tracing::Level::DEBUG) {
+        if !self.enabled
+            || !(tracing::enabled!(tracing::Level::DEBUG)
+                || tracing::enabled!(target: GPU_LOG_TARGET, tracing::Level::DEBUG))
+        {
             return;
         }
         if !matches!(frame.with_context(can_time), Ok(true)) {
@@ -2360,11 +2501,28 @@ impl SuperResolutionPipeline {
     where
         R::TextureId: PassSource,
     {
+        let _span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "cunny",
+            window = id,
+            element = ?elem.id(),
+            commit = ?elem.current_commit(),
+            ?variant,
+        )
+        .entered();
         // The passes read and write axis-aligned texel grids, and the residuals only line up with
         // the client buffer when it is not flipped, so other buffers keep the plain kernels.
         if elem.transform() != Transform::Normal
             || buffer_y_inverted(elem.buffer()).unwrap_or(false)
         {
+            trace!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::renderer(renderer),
+                buffer_transform = ?elem.transform(),
+                y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false),
+                reason = "unsupported CuNNy buffer orientation",
+                "selecting resampling fallback",
+            );
             if self.log_once(logged::CUNNY_ORIENTATION) {
                 debug!(
                     "super resolution: window {id} has a buffer the {variant:?} network cannot \
@@ -2392,6 +2550,13 @@ impl SuperResolutionPipeline {
             if let Some((cached, result)) = cache.as_ref() {
                 if *cached == key && result.context_id == renderer.context_id() {
                     trace!("super resolution: reusing the {variant:?} result for window {id}");
+                    trace!(
+                        target: GPU_LOG_TARGET,
+                        cache = "hit",
+                        gpu = ?GpuDebug::renderer(renderer),
+                        result = ?TextureDebug(&result.texture),
+                        "reusing CuNNy residuals; network not rerun",
+                    );
                     return Some(result.clone());
                 }
 
@@ -2407,6 +2572,15 @@ impl SuperResolutionPipeline {
                     && result.context_id == renderer.context_id()
                     && damage_since(elem, scale, cached.commit).is_empty()
                 {
+                    trace!(
+                        target: GPU_LOG_TARGET,
+                        cache = "unchanged",
+                        window = id,
+                        commit = ?key.commit,
+                        made_for = ?cached.commit,
+                        gpu = ?GpuDebug::renderer(renderer),
+                        "the window has no damage since the network ran; reusing its residuals",
+                    );
                     return Some(result.clone());
                 }
             }
@@ -2415,7 +2589,15 @@ impl SuperResolutionPipeline {
         let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
             return None;
         };
-        let source = texture.pass_texture(&renderer.context_id())?;
+        let Some(source) = texture.pass_texture(&renderer.context_id()) else {
+            debug!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::renderer(renderer),
+                reason = "no native texture for execution context",
+                "offscreen pass unavailable; falling back",
+            );
+            return None;
+        };
         let tex_size = source.size();
 
         trace!(
@@ -2424,6 +2606,13 @@ impl SuperResolutionPipeline {
             h = size.h,
         );
 
+        debug!(
+            target: GPU_LOG_TARGET,
+            cache = "miss",
+            gpu = ?GpuDebug::renderer(renderer),
+            source = ?TextureDebug(&source),
+            "submitting CuNNy network",
+        );
         let reuse = self
             .cunny
             .borrow_mut()
@@ -2445,6 +2634,16 @@ impl SuperResolutionPipeline {
         ) {
             Ok(out) => out,
             Err(err) => {
+                // Logged every time rather than once: a pass that fails every frame is exactly what
+                // the Hybrid work has to be able to see, and the file this goes to keeps everything.
+                debug!(
+                    target: GPU_LOG_TARGET,
+                    window = id,
+                    ?variant,
+                    source = ?TextureDebug(&source),
+                    error = ?err,
+                    "CuNNy run failed; drawing this window with the fallback",
+                );
                 if self.log_once(logged::PASS_FAILURE) {
                     warn!("super resolution: error running the pass for window {id}: {err:?}");
                 }
@@ -2480,6 +2679,55 @@ impl SuperResolutionPipeline {
     where
         R::TextureId: PassSource,
     {
+        let _span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "superres",
+            window = id,
+            element = ?elem.id(),
+            commit = ?elem.current_commit(),
+        )
+        .entered();
+        if tracing::enabled!(target: GPU_LOG_TARGET, tracing::Level::DEBUG) {
+            let native = match elem.texture() {
+                WaylandSurfaceTexture::Texture(texture) => {
+                    texture.pass_texture(&renderer.context_id())
+                }
+                WaylandSurfaceTexture::SolidColor(_) => None,
+            };
+            // A client texture with no native texture in this context is the window that goes
+            // through Smithay's import/copy path, which is what the Hybrid work has to see. The
+            // healthy case is the same entry for every window of every frame, so it stays out of
+            // the default file.
+            let native_is_missing =
+                native.is_none() && matches!(elem.texture(), WaylandSurfaceTexture::Texture(_));
+            macro_rules! log_input {
+                ($level:ident) => {
+                    $level!(
+                        target: GPU_LOG_TARGET,
+                        gpu = ?GpuDebug::renderer(renderer),
+                        kernel = %kernel,
+                        client_buffer = ?ClientBufferDebug(elem.buffer()),
+                        native_texture = ?native.as_ref().map(TextureDebug),
+                        src = ?elem.src(),
+                        copy_path = "unknown (Smithay internal; native availability is not zero-copy)",
+                        sync_state = "not inspected; native lookup does not wait",
+                        "super-resolution input in execution context",
+                    );
+                };
+            }
+            if native_is_missing {
+                log_input!(debug);
+            } else {
+                log_input!(trace);
+            }
+            if let WaylandSurfaceTexture::Texture(texture) = elem.texture() {
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    smithay_texture = ?texture,
+                    "raw import/cache state (not a stable path classifier)",
+                );
+            }
+        }
         // With magnify, the content is drawn into a rect inside the area the layout gave the
         // window, so that is the size the effect has to produce.
         let dest_size = match magnify {
@@ -2490,7 +2738,7 @@ impl SuperResolutionPipeline {
         // The passes run in this renderer's context, which is where their timings belong.
         self.timings
             .set_context(context_address(renderer.egl_context()));
-        self.log_timings(id, kernel, dest_size);
+        self.log_timings(id, kernel, dest_size, renderer);
 
         // A buffer that already matches its display area has nothing for the effect to recover: the
         // client is rendering at the physical resolution of the output, which is what Wayland
@@ -2499,6 +2747,13 @@ impl SuperResolutionPipeline {
         // magnify mode is a different thing, since its content is drawn into a bigger area on
         // purpose.
         if magnify.is_none() && !has_something_to_magnify(elem.src().size, dest_size) {
+            trace!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::renderer(renderer),
+                src = ?elem.src(),
+                ?dest_size,
+                "nothing to magnify; selecting renderer-default sampling",
+            );
             let src = elem.src().size;
             if self.log_once(logged::NOTHING_TO_MAGNIFY) {
                 debug!(
@@ -2518,6 +2773,13 @@ impl SuperResolutionPipeline {
         let params = match kernel {
             SuperResKernel::Cunny(variant) => {
                 let Some(result) = self.cunny_result(renderer, variant, &elem, scale, id) else {
+                    trace!(
+                        target: GPU_LOG_TARGET,
+                        requested_kernel = %kernel,
+                        fallback_kernel = "bicubic",
+                        gpu = ?GpuDebug::renderer(renderer),
+                        "CuNNy result unavailable; selecting single-pass fallback",
+                    );
                     if self.log_once(logged::NO_PASS) {
                         debug!(
                             "super resolution: cannot run {kernel} for window {id}, \
@@ -2552,6 +2814,13 @@ impl SuperResolutionPipeline {
         };
 
         let Some(texture) = self.fsr1_result(renderer, &elem, dest_size, scale, id) else {
+            trace!(
+                target: GPU_LOG_TARGET,
+                requested_kernel = %kernel,
+                fallback_kernel = "bicubic",
+                gpu = ?GpuDebug::renderer(renderer),
+                "EASU result unavailable; selecting single-pass fallback",
+            );
             if self.log_once(logged::NO_PASS) {
                 debug!(
                     "super resolution: cannot run {kernel} for window {id}, \
@@ -2581,19 +2850,35 @@ impl SuperResolutionPipeline {
     }
 
     /// Logs how long this window's passes took, once per interval.
-    fn log_timings(&self, id: u64, kernel: SuperResKernel, size: Size<i32, Physical>) {
+    fn log_timings(
+        &self,
+        id: u64,
+        kernel: SuperResKernel,
+        size: Size<i32, Physical>,
+        renderer: &GlesRenderer,
+    ) {
         let Some(report) = self.timings.take_report() else {
             return;
         };
 
         debug!(
+            gpu = ?GpuDebug::renderer(renderer),
             "super resolution: window {id} {kernel}, {w}×{h}: {timings}",
             w = size.w,
             h = size.h,
             timings = format_timings(&report),
         );
+        debug!(
+            target: GPU_LOG_TARGET,
+            window = id,
+            gpu = ?GpuDebug::renderer(renderer),
+            kernel = %kernel,
+            ?size,
+            timings = format_timings(&report),
+            coverage = "EASU + final draw; excludes CuNNy network/import/copy/output waits",
+            "GPU timer-query report (not end-to-end latency or GPU utilization)",
+        );
     }
-
 
     /// Returns the cached EASU result, running the pass if it is stale.
     fn fsr1_result<R: NiriRenderer>(
@@ -2607,6 +2892,14 @@ impl SuperResolutionPipeline {
     where
         R::TextureId: PassSource,
     {
+        let _span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "easu",
+            window = id,
+            element = ?elem.id(),
+            commit = ?elem.current_commit(),
+        )
+        .entered();
         if size.w <= 0 || size.h <= 0 {
             return None;
         }
@@ -2624,6 +2917,13 @@ impl SuperResolutionPipeline {
             if let Some(result) = cache.as_ref() {
                 if result.key == key && result.context_id == renderer.context_id() {
                     // The cached result is still what this window would be drawn with.
+                    trace!(
+                        target: GPU_LOG_TARGET,
+                        cache = "hit",
+                        gpu = ?GpuDebug::renderer(renderer),
+                        result = ?TextureDebug(&result.texture),
+                        "reusing EASU result; EASU not rerun",
+                    );
                     trace!(
                         "super resolution: reusing the result for window {id}, \
                          {w}×{h}",
@@ -2645,6 +2945,15 @@ impl SuperResolutionPipeline {
                     && result.context_id == renderer.context_id()
                     && damage_since(elem, scale, result.key.commit).is_empty()
                 {
+                    trace!(
+                        target: GPU_LOG_TARGET,
+                        cache = "unchanged",
+                        window = id,
+                        commit = ?key.commit,
+                        made_for = ?result.key.commit,
+                        gpu = ?GpuDebug::renderer(renderer),
+                        "the window has no damage since the pass ran; reusing its result",
+                    );
 
                     return Some(Fsr1Result {
                         texture: result.texture.clone(),
@@ -2669,11 +2978,33 @@ impl SuperResolutionPipeline {
         let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
             return None;
         };
-        let source = texture.pass_texture(&renderer.context_id())?;
+        let Some(source) = texture.pass_texture(&renderer.context_id()) else {
+            debug!(
+                target: GPU_LOG_TARGET,
+                gpu = ?GpuDebug::renderer(renderer),
+                reason = "no native texture for execution context",
+                "offscreen pass unavailable; falling back",
+            );
+            return None;
+        };
 
         let y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false);
         let uniforms = resample_uniforms(&source, src, y_inverted)?;
-        let program = SuperResPrograms::get(renderer)?.easu.clone()?;
+        let Some(program) =
+            SuperResPrograms::get(renderer).and_then(|programs| programs.easu.clone())
+        else {
+            debug!(target: GPU_LOG_TARGET, gpu = ?GpuDebug::renderer(renderer), reason = "EASU shader unavailable in execution context", "offscreen pass unavailable; falling back");
+            return None;
+        };
+
+        debug!(
+            target: GPU_LOG_TARGET,
+            cache = "miss",
+            reason = self.cache_miss_reason(&key, renderer),
+            gpu = ?GpuDebug::renderer(renderer),
+            source = ?TextureDebug(&source),
+            "submitting EASU",
+        );
         let texture = match run_easu_pass(
             renderer,
             &source,
@@ -2686,6 +3017,13 @@ impl SuperResolutionPipeline {
         ) {
             Ok(texture) => texture,
             Err(err) => {
+                debug!(
+                    target: GPU_LOG_TARGET,
+                    window = id,
+                    ?size,
+                    error = ?err,
+                    "EASU run failed; drawing this window with the fallback",
+                );
                 if self.log_once(logged::PASS_FAILURE) {
                     warn!("super resolution: error running the pass for window {id}: {err:?}");
                 }
@@ -2747,6 +3085,14 @@ fn run_easu_pass(
     let mut texture = renderer
         .create_buffer(Fourcc::Abgr8888, buffer_size)
         .context("error creating texture")?;
+    debug!(
+        target: GPU_LOG_TARGET,
+        pass = "easu",
+        gpu = ?GpuDebug::renderer(renderer),
+        source = ?TextureDebug(source),
+        intermediate = ?TextureDebug(&texture),
+        "allocated offscreen result in execution context (not exported as DMA-BUF by these passes)",
+    );
 
     let rect = Rectangle::from_size(size);
 
@@ -2785,7 +3131,16 @@ fn run_easu_pass(
         timings.end(&mut frame);
         result?;
 
-        let _ = frame.finish().context("error finishing frame")?;
+        let sync = frame.finish().context("error finishing frame")?;
+        drop(target);
+        trace!(
+            target: GPU_LOG_TARGET,
+            pass = "easu",
+            gpu = ?GpuDebug::renderer(renderer),
+            result = ?TextureDebug(&texture),
+            completion_fence = sync.contains_fence(),
+            "EASU finish returned; diagnostics add no waits (renderer may synchronize internally)",
+        );
     }
 
     Ok(texture)
@@ -2801,6 +3156,18 @@ impl Default for SuperResolutionPipeline {
 mod tests {
     use super::*;
 
+    #[test]
+    fn diagnostics_names_the_selected_single_pass() {
+        assert_eq!(ElementKernel::Plain.draw_pass(), "renderer-default");
+        assert_eq!(
+            ElementKernel::Filter(ResampleFilter::Bilinear).draw_pass(),
+            "bilinear"
+        );
+        assert_eq!(
+            ElementKernel::Filter(ResampleFilter::Bicubic).draw_pass(),
+            "bicubic"
+        );
+    }
 
     #[test]
     fn parse_es_version_mesa() {
