@@ -476,16 +476,12 @@ fn cunny_network_runs_vulkan() {
         .expect("error importing the client buffer");
 
     let src = Rectangle::from_size(size.to_f64());
-    let run =
-        superres::vulkan_run_cunny(&mut renderer, CunnyVariant::Fast, &client, src, size, None)
-            .expect("the network must run on the Vulkan renderer");
+    let pipeline = superres::SuperResolutionPipeline::new();
+    let residuals = pipeline
+        .test_vulkan_cunny(&mut renderer, CunnyVariant::Fast, &client, src)
+        .expect("the network must run on the Vulkan renderer");
 
-    assert_eq!(
-        run.features.len(),
-        6,
-        "a network needs six feature textures"
-    );
-    assert_eq!(run.residuals.size(), size, "the residuals are source-sized");
+    assert_eq!(residuals.size(), size, "the residuals are source-sized");
 }
 
 /// The element applies the residuals over the client buffer on the Vulkan renderer.
@@ -541,17 +537,87 @@ fn cunny_draws_vulkan() {
         WaylandSurfaceTexture::SolidColor(_) => return,
     };
     let src = element.src();
-    let size = src.size.to_i32_round();
-    let run =
-        superres::vulkan_run_cunny(&mut renderer, CunnyVariant::Fast, &client, src, size, None)
-            .expect("the network must run on the Vulkan renderer");
+    let pipeline = superres::SuperResolutionPipeline::new();
+    let residuals = pipeline
+        .test_vulkan_cunny(&mut renderer, CunnyVariant::Fast, &client, src)
+        .expect("the network must run on the Vulkan renderer");
 
-    let element = SuperResElement::cunny_vulkan(element, run.residuals, context_id);
+    let element = SuperResElement::cunny_vulkan_for_test(element, residuals, context_id);
     let size = element.geometry(Scale::from(1.)).size;
 
     gpu::render_offscreen_audited(&mut renderer, size, 1., &[element])
         .expect("error drawing the CuNNy element")
         .assert_drew_texture(&["cunny-upscale"]);
+}
+
+/// A stale CuNNy run is recorded into the draw's own frame, and the next draw reuses it.
+///
+/// This is the path the compositor takes: `element()` only decides, and the draw records the
+/// network's passes into the frame it draws in, so nothing is submitted on its own and nothing
+/// waits. The second draw finds the cached run and only composites.
+#[test]
+fn cunny_run_records_into_the_draw_frame() {
+    use niri_config::{Upscaling, UpscalingAlgorithm};
+    use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+    use smithay::wayland::compositor::with_states;
+
+    let Some(mut renderer) = gpu::vulkan_renderer() else {
+        return;
+    };
+    superres::init_vulkan(&mut renderer);
+
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    add_window(&mut f);
+    settle(&mut f);
+
+    let surface = f
+        .niri()
+        .layout
+        .windows()
+        .next()
+        .expect("expected a mapped window")
+        .1
+        .toplevel()
+        .wl_surface()
+        .clone();
+
+    // At scale 2 the buffer is half the display area, which is what the effect is for.
+    let scale = Scale::from(2.);
+    let rules = Upscaling {
+        algorithm: Some(UpscalingAlgorithm::Cunny2),
+        ..Default::default()
+    };
+
+    let pipeline = superres::SuperResolutionPipeline::new();
+    let kernel = pipeline
+        .kernel(&rules, 1)
+        .expect("the rule must select the network");
+
+    for draw in ["stale", "cached"] {
+        // The element is not cloneable, so each draw builds its own from the surface.
+        let surface_element = with_states(&surface, |states| {
+            WaylandSurfaceRenderElement::from_surface(
+                &mut renderer,
+                &surface,
+                states,
+                Point::<f64, Physical>::from((0., 0.)),
+                1.,
+                Kind::Unspecified,
+            )
+        })
+        .expect("error importing the window surface")
+        .expect("the window surface should be mapped");
+
+        let element =
+            pipeline.element(&mut renderer, surface_element, kernel, scale, 1, None, true);
+        let size = element.geometry(scale).size;
+
+        gpu::render_offscreen_audited(&mut renderer, size, 2., &[element])
+            .unwrap_or_else(|err| panic!("error drawing the {draw} run: {err:?}"))
+            .assert_drew_texture(&["cunny-upscale"]);
+    }
 }
 
 /// Name of a resampling kernel, for assertions.
