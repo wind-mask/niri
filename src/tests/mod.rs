@@ -2,7 +2,7 @@ use fixture::Fixture;
 
 mod client;
 mod fixture;
-mod gpu;
+pub(crate) mod gpu;
 mod server;
 mod test_input_backend;
 

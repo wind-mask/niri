@@ -4981,6 +4981,377 @@ mod tests {
         }
     }
 
+    /// Largest per-channel difference the Vulkan and GLES CuNNy composites may show.
+    ///
+    /// The residuals are computed by the same shaders on both, but the drivers round the
+    /// half-float intermediates and the source goes through one extra copy on Vulkan, so this
+    /// tolerates a few counts of noise while still catching a wrong transform or a missing
+    /// residual, which move whole regions and blow through the mean bound instead.
+    const MAX_CUNNY_PIXEL_DIFF: u32 = 8;
+
+    /// Largest mean per-channel difference, which a structural mistake would blow through.
+    const MAX_CUNNY_MEAN_DIFF: f64 = 1.0;
+
+    /// A Vulkan renderer for the parity tests, set up like the TTY backend does.
+    fn vulkan_renderer() -> Option<VulkanRenderer> {
+        use smithay::backend::vulkan::version::Version;
+        use smithay::backend::vulkan::{Instance, PhysicalDevice};
+
+        crate::tests::gpu::init_logging();
+
+        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+        let devices = PhysicalDevice::enumerate(&instance).ok()?;
+        for phd in devices {
+            if let Ok(mut renderer) = VulkanRenderer::new(&phd) {
+                crate::render_helpers::shaders::init_vulkan(&mut renderer);
+                init_vulkan(&mut renderer);
+                return Some(renderer);
+            }
+        }
+        None
+    }
+
+    /// Reads a Vulkan texture back in top-down order, converted to 8-bit RGBA.
+    fn read_back_vulkan(
+        renderer: &mut VulkanRenderer,
+        texture: &VulkanTexture,
+        size: Size<i32, Physical>,
+    ) -> Vec<u8> {
+        use smithay::backend::renderer::ExportMem as _;
+
+        let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+        let region = Rectangle::from_size(buffer_size);
+        assert!(
+            Rectangle::from_size(texture.size()).contains_rect(region),
+            "region outside the texture",
+        );
+        let mapping = renderer
+            .copy_texture(texture, region, Fourcc::Abgr8888)
+            .expect("error copying the texture back");
+        let data = renderer
+            .map_texture(&mapping)
+            .expect("error mapping the texture")
+            .to_vec();
+        assert_eq!(data.len(), (size.w * size.h * 4) as usize);
+        data
+    }
+
+    /// Renders `texture` into a `dest_size` texture with one of our kernels on Vulkan, and reads
+    /// the result back in top-down order.
+    ///
+    /// The custom quad interpolates `v_coords` across the destination, so passing the source's
+    /// size and its full rect makes the kernel see the coordinates it gets from a surface draw.
+    fn resample_vulkan(
+        renderer: &mut VulkanRenderer,
+        texture: &VulkanTexture,
+        src_size: Size<i32, Buffer>,
+        dest_size: Size<i32, Physical>,
+        filter: ResampleFilter,
+    ) -> Vec<u8> {
+        use smithay::backend::renderer::Offscreen as _;
+
+        let program = renderer
+            .user_data()
+            .get::<VulkanSuperResPrograms>()
+            .and_then(|programs| programs.program(filter))
+            .expect("the resampling shader must compile");
+
+        let dest_buffer = dest_size.to_logical(1).to_buffer(1, Transform::Normal);
+        let mut dest = renderer
+            .create_buffer(Fourcc::Abgr8888, dest_buffer)
+            .expect("error creating the destination texture");
+
+        {
+            let mut target = renderer.bind(&mut dest).expect("error binding the target");
+            let mut frame = renderer
+                .render(&mut target, dest_size, Transform::Normal)
+                .expect("error starting the frame");
+            let dest_rect = Rectangle::from_size(dest_size);
+            frame
+                .clear(Color32F::TRANSPARENT, &[dest_rect])
+                .expect("error clearing the target");
+
+            let uniforms = [
+                CustomUniform {
+                    name: "niri_tex_size",
+                    value: CustomUniformValue::Vec2([src_size.w as f32, src_size.h as f32]),
+                },
+                CustomUniform {
+                    name: "niri_src_rect",
+                    value: CustomUniformValue::Vec4([0., 0., src_size.w as f32, src_size.h as f32]),
+                },
+            ];
+
+            frame
+                .render_custom(
+                    &program,
+                    dest_rect,
+                    &[dest_rect],
+                    &uniforms,
+                    &[("tex", texture)],
+                    1.0,
+                )
+                .expect("error drawing the resample");
+            let sync = frame.finish().expect("error finishing the frame");
+            renderer.wait(&sync).expect("error waiting for the frame");
+        }
+
+        read_back_vulkan(renderer, &dest, dest_size)
+    }
+
+    /// The Vulkan resamplers produce the same pixels as the kernels the GLES path is verified
+    /// against.
+    #[test]
+    fn vulkan_resample_matches_the_kernels() {
+        let Some(mut renderer) = vulkan_renderer() else {
+            return;
+        };
+
+        let src_size = Size::<i32, Buffer>::from((4, 4));
+        let src_pixels = source_pixels(src_size);
+        let texture = renderer
+            .import_memory(&src_pixels, Fourcc::Abgr8888, src_size, false)
+            .expect("error importing the source");
+
+        let src = read_back_vulkan(
+            &mut renderer,
+            &texture,
+            src_size.to_logical(1, Transform::Normal).to_physical(1),
+        );
+        assert_eq!(src, src_pixels, "the harness must not change the source");
+
+        let dest_size = Size::<i32, Physical>::from((8, 8));
+        for filter in [ResampleFilter::Bilinear, ResampleFilter::Bicubic] {
+            let scaled = resample_vulkan(&mut renderer, &texture, src_size, dest_size, filter);
+            for y in 0..dest_size.h {
+                for x in 0..dest_size.w {
+                    for channel in 0..4 {
+                        let index = ((y * dest_size.w + x) * 4) as usize + channel;
+                        let got = f64::from(scaled[index]);
+                        let want = expected_pixel(&src, src_size, dest_size, filter, x, y, channel);
+                        assert!(
+                            (got - want).abs() <= 1.5,
+                            "{filter:?} at ({x}, {y}) channel {channel}: {got} != {want}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Vulkan CuNNy composite produces the same pixels as the GLES one for the same input.
+    ///
+    /// Both networks run the same generated passes, so their residuals agree; compositing them
+    /// over the client buffer is what turns them into what the screen shows, and that is what this
+    /// compares.
+    #[test]
+    fn vulkan_cunny_matches_gles() {
+        use smithay::backend::renderer::Offscreen as _;
+
+        let Some(mut gles) = surfaceless_renderer() else {
+            return;
+        };
+        crate::render_helpers::resources::init(&mut gles);
+        crate::render_helpers::shaders::init(&mut gles);
+        init(&mut gles, None);
+
+        let Some(mut vulkan) = vulkan_renderer() else {
+            return;
+        };
+
+        let size = Size::<i32, Buffer>::from((32, 18));
+        let out_size = Size::<i32, Physical>::from((size.w * 2, size.h * 2));
+        let src_rect = Rectangle::from_size(size.to_f64());
+        let pixels = source_pixels(size);
+
+        let timings = Timings::disabled();
+
+        // GLES: run the network, then apply the residuals the way the element does.
+        let gles_bytes = {
+            let source = gles
+                .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+                .expect("error importing the source");
+            let (_, residuals) = run_cunny(
+                &mut gles,
+                CunnyVariant::Fast,
+                &source,
+                src_rect,
+                size,
+                Transform::Normal,
+                &timings,
+                None,
+            )
+            .expect("the GLES network must run");
+
+            let upscale = SuperResPrograms::get(&gles)
+                .expect("superres::init() must be called on this renderer")
+                .cunny_upscale
+                .clone()
+                .expect("the CuNNy upscale shader must compile");
+
+            let out_buf = out_size.to_logical(1).to_buffer(1, Transform::Normal);
+            let mut out = gles
+                .create_buffer(Fourcc::Abgr8888, out_buf)
+                .expect("error creating the output texture");
+            {
+                let rect = Rectangle::from_size(out_size);
+                let mut target = gles.bind(&mut out).expect("error binding the output");
+                let mut frame = gles
+                    .render(&mut target, out_size, Transform::Normal)
+                    .expect("error starting the frame");
+                frame
+                    .clear(Color32F::TRANSPARENT, &[rect])
+                    .expect("error clearing the output");
+                frame
+                    .with_context(|gl| unsafe {
+                        gl.ActiveTexture(ffi::TEXTURE1);
+                        configure_pass_texture(gl, residuals.tex_id(), ffi::NEAREST);
+                        gl.ActiveTexture(ffi::TEXTURE0);
+                    })
+                    .expect("error binding the residuals");
+                frame
+                    .render_texture_from_to(
+                        &source,
+                        src_rect,
+                        rect,
+                        &[rect],
+                        &[rect],
+                        Transform::Normal,
+                        1.0,
+                        Some(&upscale),
+                        &[
+                            Uniform::new("niri_tex_size", (size.w as f32, size.h as f32)),
+                            Uniform::new("niri_src_rect", [0.0, 0.0, size.w as f32, size.h as f32]),
+                            Uniform::new(
+                                "niri_footprint",
+                                [
+                                    2.0 * (size.w as f32 / out_size.w as f32),
+                                    2.0 * (size.h as f32 / out_size.h as f32),
+                                ],
+                            ),
+                            Uniform::new("niri_tex1", 1i32),
+                        ],
+                    )
+                    .expect("error drawing the composite");
+                let _ = frame.finish().expect("error finishing the frame");
+            }
+            read_back(&mut gles, &mut out, out_size)
+        };
+
+        // Vulkan: the same input through the multi-pass chain and the same composite shader.
+        let vulkan_bytes = {
+            let client = vulkan
+                .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+                .expect("error importing the source");
+            let run = vulkan_run_cunny(
+                &mut vulkan,
+                CunnyVariant::Fast,
+                &client,
+                src_rect,
+                size,
+                None,
+            )
+            .expect("the Vulkan network must run");
+
+            let program = vulkan
+                .user_data()
+                .get::<VulkanSuperResPrograms>()
+                .and_then(VulkanSuperResPrograms::cunny_upscale)
+                .expect("the CuNNy upscale shader must compile");
+
+            let out_buf = out_size.to_logical(1).to_buffer(1, Transform::Normal);
+            let mut out = vulkan
+                .create_buffer(Fourcc::Abgr8888, out_buf)
+                .expect("error creating the output texture");
+            {
+                let rect = Rectangle::from_size(out_size);
+                let mut target = vulkan.bind(&mut out).expect("error binding the output");
+                let mut frame = vulkan
+                    .render(&mut target, out_size, Transform::Normal)
+                    .expect("error starting the frame");
+                frame
+                    .clear(Color32F::TRANSPARENT, &[rect])
+                    .expect("error clearing the output");
+
+                // The custom quad interpolates `v_coords` across the destination, so the source
+                // covers it exactly: no uv offset and a unit scale.
+                let uniforms = [
+                    CustomUniform {
+                        name: "niri_tex_size",
+                        value: CustomUniformValue::Vec2([size.w as f32, size.h as f32]),
+                    },
+                    CustomUniform {
+                        name: "niri_src_rect",
+                        value: CustomUniformValue::Vec4([0., 0., size.w as f32, size.h as f32]),
+                    },
+                    CustomUniform {
+                        name: "niri_footprint",
+                        value: CustomUniformValue::Vec2([
+                            2.0 * (size.w as f32 / out_size.w as f32),
+                            2.0 * (size.h as f32 / out_size.h as f32),
+                        ]),
+                    },
+                    CustomUniform {
+                        name: "niri_uv_offset",
+                        value: CustomUniformValue::Vec2([0., 0.]),
+                    },
+                    CustomUniform {
+                        name: "niri_uv_scale",
+                        value: CustomUniformValue::Vec2([1., 1.]),
+                    },
+                ];
+
+                frame
+                    .render_custom(
+                        &program,
+                        rect,
+                        &[rect],
+                        &uniforms,
+                        &[("tex", &client), ("niri_tex1", &run.residuals)],
+                        1.0,
+                    )
+                    .expect("error drawing the composite");
+                let sync = frame.finish().expect("error finishing the frame");
+                vulkan.wait(&sync).expect("error waiting for the frame");
+            }
+            read_back_vulkan(&mut vulkan, &out, out_size)
+        };
+
+        assert_eq!(gles_bytes.len(), vulkan_bytes.len());
+
+        // The shaders and the residuals are the same on both sides, so the composites agree up to
+        // the drivers' rounding of the 8-bit output.
+        // The two networks run the same shaders, but through different drivers and different
+        // intermediate copies, so the residuals carry a little numeric noise. A structural mistake
+        // (a wrong uv transform, a flip, a missing residual) would move whole regions, which the
+        // mean difference catches while the per-pixel bound tolerates the noise.
+        let mut worst = 0u32;
+        let mut worst_at = 0usize;
+        let mut total = 0u64;
+        for (i, (a, b)) in gles_bytes.iter().zip(vulkan_bytes.iter()).enumerate() {
+            let diff = u32::from(*a).abs_diff(u32::from(*b));
+            total += u64::from(diff);
+            if diff > worst {
+                worst = diff;
+                worst_at = i;
+            }
+            assert!(
+                diff <= MAX_CUNNY_PIXEL_DIFF,
+                "composite differs at byte {i} ({}x{}): gles {a} != vulkan {b}, \
+                 worst so far {worst} at {worst_at}",
+                out_size.w,
+                out_size.h,
+            );
+        }
+
+        let mean = total as f64 / gles_bytes.len() as f64;
+        assert!(
+            mean <= MAX_CUNNY_MEAN_DIFF,
+            "the CuNNy composites differ too much on average: {mean:.3}/255 over {} bytes",
+            gles_bytes.len(),
+        );
+    }
+
     #[test]
     fn nothing_to_magnify_when_the_buffer_matches_the_area() {
         let area = Size::<i32, Physical>::from((2560, 1440));

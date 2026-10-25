@@ -125,7 +125,14 @@ void main() {
 
     // The client buffer, sampled the way the renderer's own shader would: one bilinear fetch, on
     // the coordinates the vertex shader already put the crop and the transform into.
-    vec4 base = texture2D(tex, uv);
+    //
+    // The taps are clamped into the source rect like the resampling kernels do, instead of relying
+    // on the sampler's wrap mode: the Vulkan renderer's custom textures clamp to a transparent
+    // border, which would fade the edge pixels out against nothing.
+    vec2 tex_lo = niri_src_rect.xy + vec2(0.5);
+    vec2 tex_hi = niri_src_rect.xy + niri_src_rect.zw - vec2(0.5);
+    vec2 base_texel = clamp(uv * niri_tex_size, tex_lo, tex_hi);
+    vec4 base = texture2D(tex, base_texel / niri_tex_size);
 
     // The network sees straight color: a window buffer is premultiplied, but a transparent window
     // is not what this effect is for, so the division is guarded.

@@ -26,4 +26,4 @@ pub mod utils;
 pub mod window;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
