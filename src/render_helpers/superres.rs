@@ -5443,6 +5443,168 @@ mod tests {
         data
     }
 
+    /// Measures one CuNNy run at a real window size on the Vulkan renderer.
+    ///
+    /// There are no GPU timer queries on Vulkan, so this times whole frames: record the chain into
+    /// a throwaway frame, submit, wait, and divide. Ignored by default; run with
+    /// `cargo test --lib --release bench_cunny -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_cunny_frames() {
+        // `NIRI_BENCH_GPU` picks the device by name, e.g. the one the display is attached to.
+        let filter = std::env::var("NIRI_BENCH_GPU").ok();
+        let Some(mut renderer) = vulkan_renderer_on(filter.as_deref()) else {
+            return;
+        };
+
+        bench_empty_frame(&mut renderer);
+        for variant in [CunnyVariant::Fast, CunnyVariant::ThreeByTwelve] {
+            bench_cunny_variant(&mut renderer, variant);
+        }
+    }
+
+    /// Measures the cost of submitting an empty frame, which is the floor of every number below.
+    fn bench_empty_frame(renderer: &mut VulkanRenderer) {
+        let _ = renderer;
+        let frames = 20;
+        let mut timings = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let start = Instant::now();
+            let mut target_texture = renderer
+                .create_buffer(Fourcc::Abgr8888, Size::from((1, 1)))
+                .expect("target");
+            let mut target = renderer.bind(&mut target_texture).expect("bind");
+            let frame = renderer
+                .render(&mut target, Size::from((1, 1)), Transform::Normal)
+                .expect("frame");
+            let sync = frame.finish().expect("finish");
+            sync.wait().expect("wait");
+            timings.push(start.elapsed());
+        }
+        timings.sort();
+        eprintln!(
+            "empty frame baseline: median {:.3} ms, max {:.3} ms",
+            timings[frames / 2].as_secs_f64() * 1e3,
+            timings[frames - 1].as_secs_f64() * 1e3,
+        );
+    }
+
+    /// Times the EASU + RCAS chain at the size the running game uses: 1280×720 into 2560×1440.
+    #[test]
+    #[ignore]
+    fn bench_fsr1_frames() {
+        let filter = std::env::var("NIRI_BENCH_GPU").ok();
+        let Some(mut renderer) = vulkan_renderer_on(filter.as_deref()) else {
+            return;
+        };
+        bench_empty_frame(&mut renderer);
+
+        let src_size = Size::<i32, Buffer>::from((1280, 720));
+        let dest = Size::<i32, Physical>::from((2560, 1440));
+        let src = Rectangle::from_size(src_size.to_f64());
+        let pixels = vec![128u8; (src_size.w * src_size.h * 4) as usize];
+        let client = renderer
+            .import_memory(&pixels, Fourcc::Abgr8888, src_size, false)
+            .expect("error importing the client buffer");
+
+        let key = Fsr1Key { src, size: dest };
+        let context_id = renderer.context_id();
+        let programs = Fsr1VulkanPrograms::compile(&mut renderer).expect("programs");
+        let cache = Arc::new(Mutex::new(None));
+        ensure_fsr1_texture(&mut renderer, &mut cache.lock().unwrap(), &key, &context_id)
+            .expect("texture");
+
+        let frames = 20;
+        let mut timings = Vec::with_capacity(frames);
+        let mut commit = CommitCounter::default();
+        for _ in 0..frames {
+            commit.increment();
+            let start = Instant::now();
+            let mut target_texture = renderer
+                .create_buffer(Fourcc::Abgr8888, Size::from((1, 1)))
+                .expect("target");
+            let mut target = renderer.bind(&mut target_texture).expect("bind");
+            let mut frame = renderer
+                .render(&mut target, Size::from((1, 1)), Transform::Normal)
+                .expect("frame");
+            record_fsr1_run(&mut frame, &client, src, dest, commit, &programs, &cache)
+                .expect("run");
+            let sync = frame.finish().expect("finish");
+            sync.wait().expect("wait");
+            timings.push(start.elapsed());
+        }
+
+        timings.sort();
+        eprintln!(
+            "FSR1 EASU {}x{} -> {}x{}: median {:.2} ms, max {:.2} ms",
+            src_size.w,
+            src_size.h,
+            dest.w,
+            dest.h,
+            timings[frames / 2].as_secs_f64() * 1e3,
+            timings[frames - 1].as_secs_f64() * 1e3,
+        );
+    }
+
+    /// Times `frames` CuNNy runs of `variant` at 1280×720.
+    fn bench_cunny_variant(renderer: &mut VulkanRenderer, variant: CunnyVariant) {
+        let renderer = renderer;
+        let size = Size::<i32, Buffer>::from((1280, 720));
+        let src = Rectangle::from_size(size.to_f64());
+        let pixels = vec![128u8; (size.w * size.h * 4) as usize];
+        let client = renderer
+            .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+            .expect("error importing the client buffer");
+
+        let key = CunnyKey { variant, src, size };
+        let context_id = renderer.context_id();
+        let programs = CunnyVulkanPrograms::compile(renderer, variant).expect("programs");
+        let cache = Arc::new(Mutex::new(None));
+        ensure_cunny_textures(
+            renderer,
+            &mut cache.lock().unwrap(),
+            &key,
+            variant,
+            &context_id,
+        )
+        .expect("textures");
+
+        let mut commit = CommitCounter::default();
+        let frames = 20;
+        let mut timings = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            commit.increment();
+            let start = Instant::now();
+            let mut target_texture = renderer
+                .create_buffer(Fourcc::Abgr8888, Size::from((1, 1)))
+                .expect("target");
+            let mut target = renderer.bind(&mut target_texture).expect("bind");
+            let mut frame = renderer
+                .render(&mut target, Size::from((1, 1)), Transform::Normal)
+                .expect("frame");
+            record_cunny_run(
+                &mut frame, variant, &client, src, size, commit, &programs, &cache,
+            )
+            .expect("run");
+            let sync = frame.finish().expect("finish");
+            // `renderer.wait()` only schedules the wait for the next submission on this very
+            // renderer, so blocking on the sync point is what puts the GPU work into the timing.
+            sync.wait().expect("wait");
+            timings.push(start.elapsed());
+        }
+
+        timings.sort();
+        eprintln!(
+            "CuNNy {:?} at {}x{}: min {:.2} ms, median {:.2} ms, max {:.2} ms",
+            variant,
+            size.w,
+            size.h,
+            timings[0].as_secs_f64() * 1e3,
+            timings[frames / 2].as_secs_f64() * 1e3,
+            timings[frames - 1].as_secs_f64() * 1e3,
+        );
+    }
+
     /// The Vulkan FSR1 output matches the GLES one for the same input.
     ///
     /// EASU runs offscreen on both sides and RCAS sharpens the result; this runs both and compares
@@ -5850,6 +6012,33 @@ mod tests {
         let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
         let devices = PhysicalDevice::enumerate(&instance).ok()?;
         for phd in devices {
+            if let Ok(mut renderer) = VulkanRenderer::new(&phd) {
+                crate::render_helpers::shaders::init_vulkan(&mut renderer);
+                init_vulkan(&mut renderer);
+                return Some(renderer);
+            }
+        }
+        None
+    }
+
+    /// A Vulkan renderer on a device whose name contains `device_name_contains`.
+    ///
+    /// The tests take whatever device comes first; a benchmark has to be able to pick the one the
+    /// display is attached to, otherwise the numbers belong to a GPU that is not doing the work.
+    fn vulkan_renderer_on(device_name_contains: Option<&str>) -> Option<VulkanRenderer> {
+        use smithay::backend::vulkan::version::Version;
+        use smithay::backend::vulkan::{Instance, PhysicalDevice};
+
+        crate::tests::gpu::init_logging();
+
+        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+        let devices = PhysicalDevice::enumerate(&instance).ok()?;
+        for phd in devices {
+            if let Some(filter) = device_name_contains {
+                if !phd.name().contains(filter) {
+                    continue;
+                }
+            }
             if let Ok(mut renderer) = VulkanRenderer::new(&phd) {
                 crate::render_helpers::shaders::init_vulkan(&mut renderer);
                 init_vulkan(&mut renderer);
