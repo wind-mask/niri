@@ -3181,7 +3181,7 @@ fn minimized_windows_are_not_in_any_workspace_but_stay_queryable() {
     );
 
     // Must not panic for a window that is in no workspace.
-    let _ = layout.popup_target_rect(&1);
+    let _ = layout.popup_target_rect(&1, false);
     let _ = layout.should_trigger_focus_follows_mouse_on(&1);
 
     // These are reachable over IPC with an explicit window id, and are no-ops while minimized.

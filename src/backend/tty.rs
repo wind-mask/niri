@@ -523,6 +523,18 @@ enum GammaMode {
     },
 }
 
+impl GammaMode {
+    /// 是否已保存驱动原有的 gamma 状态（有则可恢复，合成器应当视 gamma LUT 为占用）。
+    fn has_previous_state(&self) -> bool {
+        match self {
+            Self::Lut { previous_blob, .. } | Self::Ctm { previous_blob, .. } => {
+                previous_blob.is_some()
+            }
+            Self::Legacy { previous_ramp, .. } => previous_ramp.is_some(),
+        }
+    }
+}
+
 /// Read-only snapshot of a connector's DRM properties.
 struct ConnectorProperties {
     properties: Vec<(property::Info, property::RawValue)>,
@@ -808,22 +820,6 @@ impl Tty {
                         // state another chance after resume.
                         surface.failed_color_state = None;
 
-                        if let Ok(mut props) =
-                            ConnectorProperties::try_new(&device.drm, surface.connector)
-                        {
-                            let max_bpc = self
-                                .config
-                                .borrow()
-                                .outputs
-                                .find(&surface.name)
-                                .and_then(effective_max_bpc);
-                            set_connector_properties(&mut props, max_bpc, true);
-                            // The connector's HDR state was just reset to SDR; keep the render
-                            // loop's view in sync so it re-applies HDR if content still needs it.
-                            surface.current_hdr = None;
-                        } else {
-                            warn!("failed to get connector properties");
-                        }
 
                         if let Some(gamma_props) = &mut surface.gamma_props {
                             if let Some(ramp) = surface.pending_gamma_change.take() {
@@ -2234,11 +2230,12 @@ impl Tty {
         let gamma_deferred = surface.pending_gamma_change.is_some();
         if gamma_deferred && !surface.compositor.post_blend_encode_owns_gamma() {
             let ramp = surface.pending_gamma_change.take().unwrap();
-            let ramp = ramp.as_deref();
             let res = if let Some(gamma_props) = &mut surface.gamma_props {
                 gamma_props.set_gamma(&device.drm, ramp)
             } else {
-                set_gamma_for_crtc(&device.drm, crtc, ramp)
+                // 没有 GammaProps 时走旧式 CRTC gamma，长度从 ramp 推断；重置时用最小通用尺寸。
+                let gamma_length = ramp.as_ref().map_or(256, |r| (r.len() / 3) as u32);
+                set_gamma_for_crtc(&device.drm, crtc, gamma_length, ramp.as_deref())
             };
             if let Err(err) = res {
                 warn!("error applying deferred gamma change: {err:?}");
@@ -2497,7 +2494,7 @@ impl Tty {
             || surface
                 .gamma_props
                 .as_ref()
-                .is_some_and(|props| props.previous_blob.is_some());
+                .is_some_and(|props| props.mode.has_previous_state());
         let post_blend =
             (blend_hdr && !gamma_in_use && self.config.borrow().debug.scanout_post_blend_encode)
                 .then(|| blend::hdr_post_blend_encode(peak_luminance));
