@@ -38,6 +38,7 @@ struct TestWindowInner {
     sizing_mode: Cell<SizingMode>,
     is_windowed_fullscreen: Cell<bool>,
     is_pending_windowed_fullscreen: Cell<bool>,
+    is_minimized: Cell<bool>,
     animate_next_configure: Cell<bool>,
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
@@ -90,6 +91,7 @@ impl TestWindow {
             sizing_mode: Cell::new(SizingMode::Normal),
             is_windowed_fullscreen: Cell::new(false),
             is_pending_windowed_fullscreen: Cell::new(false),
+            is_minimized: Cell::new(false),
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
@@ -230,6 +232,18 @@ impl LayoutElement for TestWindow {
     fn set_active_in_column(&mut self, _active: bool) {}
 
     fn set_floating(&mut self, _floating: bool) {}
+
+    fn set_minimized(&mut self, minimized: bool) {
+        self.0.is_minimized.set(minimized);
+    }
+
+    fn is_minimized(&self) -> bool {
+        self.0.is_minimized.get()
+    }
+
+    fn is_blocking_minimize(&self) -> bool {
+        false
+    }
 
     fn sizing_mode(&self) -> SizingMode {
         self.0.sizing_mode.get()
@@ -613,6 +627,18 @@ enum Op {
         id: Option<usize>,
     },
     ExpandColumnToAvailableWidth,
+    MinimizeWindow {
+        #[proptest(strategy = "1..=5usize")]
+        id: usize,
+    },
+    UnminimizeWindow {
+        #[proptest(strategy = "1..=5usize")]
+        id: usize,
+    },
+    ToggleWindowMinimized {
+        #[proptest(strategy = "1..=5usize")]
+        id: usize,
+    },
     ToggleWindowFloating {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
         id: Option<usize>,
@@ -1350,6 +1376,24 @@ impl Op {
                 layout.reset_window_height(id.as_ref());
             }
             Op::ExpandColumnToAvailableWidth => layout.expand_column_to_available_width(),
+            Op::MinimizeWindow { id } => {
+                if !layout.has_window(&id) {
+                    return;
+                }
+                layout.minimize_window(&id);
+            }
+            Op::UnminimizeWindow { id } => {
+                if !layout.has_window(&id) {
+                    return;
+                }
+                layout.unminimize_window(&id);
+            }
+            Op::ToggleWindowMinimized { id } => {
+                if !layout.has_window(&id) {
+                    return;
+                }
+                layout.toggle_window_minimized(&id);
+            }
             Op::ToggleWindowFloating { id } => {
                 let id = id.filter(|id| layout.has_window(id));
                 layout.toggle_window_floating(id.as_ref());
@@ -1868,6 +1912,9 @@ fn operations_dont_panic() {
         Op::ConsumeOrExpelWindowRight { id: None },
         Op::MoveWorkspaceToOutput(1),
         Op::ToggleColumnTabbedDisplay,
+        Op::MinimizeWindow { id: 1 },
+        Op::UnminimizeWindow { id: 1 },
+        Op::ToggleWindowMinimized { id: 1 },
     ];
 
     for third in &every_op {
@@ -2047,6 +2094,9 @@ fn operations_from_starting_state_dont_panic() {
         Op::ConsumeOrExpelWindowLeft { id: None },
         Op::ConsumeOrExpelWindowRight { id: None },
         Op::ToggleColumnTabbedDisplay,
+        Op::MinimizeWindow { id: 1 },
+        Op::UnminimizeWindow { id: 1 },
+        Op::ToggleWindowMinimized { id: 1 },
     ];
 
     for third in &every_op {
@@ -3064,6 +3114,231 @@ fn add_window_next_to_only_interactively_moved_without_outputs() {
     ];
 
     check_ops(ops);
+}
+
+#[test]
+fn minimize_takes_window_out_of_the_layout_and_restores_it() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+        ],
+    );
+
+    let ws_id = layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&1))
+        .map(|(_, _, ws)| ws.id())
+        .unwrap();
+
+    check_ops_on_layout(&mut layout, [Op::MinimizeWindow { id: 1 }]);
+
+    assert!(layout.is_minimized(&1), "window 1 should be minimized");
+    assert!(
+        !layout.workspaces().any(|(_, _, ws)| ws.has_window(&1)),
+        "a minimized window must not be in any workspace"
+    );
+    // It's still a known window, just not a laid-out one.
+    assert!(layout.has_window(&1));
+    assert!(!layout.is_minimized(&2));
+
+    check_ops_on_layout(&mut layout, [Op::UnminimizeWindow { id: 1 }]);
+
+    assert!(!layout.is_minimized(&1));
+    let restored_ws_id = layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&1))
+        .map(|(_, _, ws)| ws.id())
+        .unwrap();
+    assert_eq!(
+        ws_id, restored_ws_id,
+        "a restored window should return to its original workspace"
+    );
+}
+
+#[test]
+fn minimized_windows_are_not_in_any_workspace_but_stay_queryable() {
+    // Regression test: a minimized window is in no workspace, and code that looked windows up
+    // across workspaces used to unwrap that lookup. XWayland clients reposition popups while
+    // minimized, which took down the compositor.
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::MinimizeWindow { id: 1 },
+        ],
+    );
+
+    // Must not panic for a window that is in no workspace.
+    let _ = layout.popup_target_rect(&1, false);
+    let _ = layout.should_trigger_focus_follows_mouse_on(&1);
+
+    // These are reachable over IPC with an explicit window id, and are no-ops while minimized.
+    layout.center_window(Some(&1));
+    layout.move_floating_window(
+        Some(&1),
+        PositionChange::SetFixed(0.),
+        PositionChange::SetFixed(0.),
+        false,
+    );
+    layout.verify_invariants();
+
+    assert!(layout.is_minimized(&1), "window should still be minimized");
+}
+
+#[test]
+fn activating_a_minimized_window_restores_it() {
+    // Docks and taskbars ask to activate a window to bring it up; there is no separate unminimize
+    // request on most paths that reach activate_window(). Without restoring here, a dock click on
+    // a minimized entry silently does nothing.
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::MinimizeWindow { id: 1 },
+        ],
+    );
+    assert!(layout.is_minimized(&1));
+
+    // Op::FocusWindow is Layout::activate_window, which is what niri IPC FocusWindow,
+    // xdg-activation and wlr-foreign-toplevel activation all funnel into.
+    check_ops_on_layout(&mut layout, [Op::FocusWindow(1)]);
+
+    assert!(
+        !layout.is_minimized(&1),
+        "activating should have restored it"
+    );
+    assert!(
+        layout.workspaces().any(|(_, _, ws)| ws.has_window(&1)),
+        "a restored window must be back in a workspace"
+    );
+    assert_eq!(
+        layout.focus().map(|win| *win.id()),
+        Some(1),
+        "the restored window should end up focused"
+    );
+}
+
+#[test]
+fn minimizing_preserves_the_fullscreen_state() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::FullscreenWindow(1),
+            // Apply the configure, so the committed sizing mode actually becomes fullscreen.
+            Op::Communicate(1),
+        ],
+    );
+
+    let fullscreen_before = layout
+        .windows()
+        .find(|(_, win)| *win.id() == 1)
+        .map(|(_, win)| win.sizing_mode().is_fullscreen())
+        .unwrap();
+    assert!(fullscreen_before, "window should be fullscreen to start");
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::MinimizeWindow { id: 1 }, Op::Communicate(1)],
+    );
+
+    // IPC reports is_fullscreen from the sizing mode, so a minimized window keeps whatever state
+    // it will be restored with.
+    let fullscreen_while_minimized = layout
+        .minimized_windows()
+        .find(|win| *win.id() == 1)
+        .map(|win| win.sizing_mode().is_fullscreen())
+        .unwrap();
+    assert!(
+        fullscreen_while_minimized,
+        "a minimized window should keep its fullscreen state"
+    );
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::UnminimizeWindow { id: 1 }, Op::Communicate(1)],
+    );
+
+    let fullscreen_after = layout
+        .windows()
+        .find(|(_, win)| *win.id() == 1)
+        .map(|(_, win)| win.sizing_mode().is_fullscreen())
+        .unwrap();
+    assert!(
+        fullscreen_after,
+        "restoring should bring the window back fullscreen"
+    );
+}
+
+#[test]
+fn minimized_window_survives_output_removal() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::MinimizeWindow { id: 1 },
+            // The workspace the window came from goes away with the output.
+            Op::RemoveOutput(1),
+            Op::AddOutput(2),
+        ],
+    );
+
+    assert!(layout.is_minimized(&1));
+
+    // Restoring should fall back to a live workspace rather than dropping the window.
+    check_ops_on_layout(&mut layout, [Op::UnminimizeWindow { id: 1 }]);
+
+    assert!(!layout.is_minimized(&1));
+    assert!(
+        layout.workspaces().any(|(_, _, ws)| ws.has_window(&1)),
+        "a restored window must land on some workspace"
+    );
+}
+
+#[test]
+fn closing_a_minimized_window_removes_it_from_the_pool() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::MinimizeWindow { id: 1 },
+            Op::CloseWindow(1),
+        ],
+    );
+
+    assert!(!layout.is_minimized(&1));
+    assert!(!layout.has_window(&1));
 }
 
 #[test]

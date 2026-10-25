@@ -177,6 +177,7 @@ impl Winit {
 
         resources::init(renderer);
         shaders::init(renderer);
+        crate::render_helpers::blend::FrameBlendState::init(renderer);
 
         let config = self.config.borrow();
         if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
@@ -309,6 +310,10 @@ impl Winit {
         self.render_node
     }
 
+    pub fn renderer(&mut self) -> &mut GlesRenderer {
+        self.backend.renderer()
+    }
+
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let _span = tracy_client::span!("Winit::render");
 
@@ -374,6 +379,7 @@ impl Winit {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
+            RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
         }

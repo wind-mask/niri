@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
+use smithay::backend::renderer::Bind;
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
@@ -255,14 +256,14 @@ fn dynamic_cast_placeholder_size(niri: &Niri) -> Size<i32, BufferCoords> {
 /// xdg-desktop-portal-luminous) capture through their dmabuf path, and fail hard when the
 /// session doesn't offer one.
 fn dynamic_cast_placeholder_constraints(
-    renderer: &mut GlesRenderer,
+    render_formats: Option<&FormatSet>,
     render_node: Option<DrmNode>,
     size: Size<i32, BufferCoords>,
 ) -> BufferConstraints {
     BufferConstraints {
         size,
         shm: vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888],
-        dma: capture_dmabuf_constraints(renderer, render_node),
+        dma: capture_dmabuf_constraints(render_formats, render_node),
     }
 }
 
@@ -343,17 +344,17 @@ pub fn refresh_dynamic_cast_constraints(
     let render_node = backend.primary_render_node();
     // We can't drop the session if this fails: it just keeps showing nothing until the
     // constraints can be updated.
-    let _ = refresh_session_constraints(backend, s, |renderer| match &target {
+    let _ = refresh_session_constraints(backend, s, |render_formats| match &target {
         None => Some(dynamic_cast_placeholder_constraints(
-            renderer,
+            render_formats,
             render_node,
             dynamic_cast_placeholder_size(niri),
         )),
         Some(DynamicCastTarget::Output(output)) => {
-            output_capture_constraints(renderer, render_node, output)
+            output_capture_constraints(render_formats, render_node, output)
         }
         Some(DynamicCastTarget::Window { mapped, output }) => Some(window_capture_constraints(
-            renderer, render_node, mapped, output,
+            render_formats, render_node, mapped, output,
         )),
     });
 }
@@ -367,8 +368,12 @@ pub fn refresh_dynamic_cast_constraints(
 /// clears the display's EGLDevice once a second EGLDisplay is created for the
 /// same GBM device, which the TTY backend does during initialization. See
 /// https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44351.
+///
+/// `render_formats` are the dmabuf formats the primary renderer can draw into
+/// (`Bind::<Dmabuf>::supported_formats()`), queried generically so that this
+/// works on both the GLES and Vulkan renderers.
 pub fn output_capture_constraints(
-    renderer: &GlesRenderer,
+    render_formats: Option<&FormatSet>,
     render_node: Option<DrmNode>,
     output: &Output,
 ) -> Option<BufferConstraints> {
@@ -378,13 +383,13 @@ pub fn output_capture_constraints(
     Some(BufferConstraints {
         size,
         shm: vec![wl_shm::Format::Xrgb8888],
-        dma: capture_dmabuf_constraints(renderer, render_node),
+        dma: capture_dmabuf_constraints(render_formats, render_node),
     })
 }
 
 /// Buffer constraints for capturing a window.
 pub fn window_capture_constraints(
-    renderer: &GlesRenderer,
+    render_formats: Option<&FormatSet>,
     render_node: Option<DrmNode>,
     mapped: &Mapped,
     output: &Output,
@@ -394,7 +399,7 @@ pub fn window_capture_constraints(
     BufferConstraints {
         size: Size::from((size.w, size.h)),
         shm: vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888],
-        dma: capture_dmabuf_constraints(renderer, render_node),
+        dma: capture_dmabuf_constraints(render_formats, render_node),
     }
 }
 
@@ -409,17 +414,17 @@ pub fn window_capture_bbox(mapped: &Mapped, output: &Output) -> Rectangle<i32, P
 
 /// Dmabuf constraints of the capture source.
 fn capture_dmabuf_constraints(
-    renderer: &GlesRenderer,
+    render_formats: Option<&FormatSet>,
     render_node: Option<DrmNode>,
 ) -> Option<DmabufConstraints> {
     let node = render_node?;
-    let egl = renderer.egl_context();
+    let render_formats = render_formats?;
 
     // Offer all formats the renderer can draw into to avoid unnecessary conversions, preserving the
     // original order (many clients depend on the order being stable to select the same format when
     // renegotiating).
     let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
-    for format in egl.dmabuf_render_formats().iter() {
+    for format in render_formats.iter() {
         if let Some((_, modifiers)) = formats.iter_mut().find(|(code, _)| *code == format.code) {
             modifiers.push(format.modifier)
         } else {
@@ -445,9 +450,13 @@ fn capture_dmabuf_constraints(
 pub fn refresh_session_constraints(
     backend: &mut Backend,
     s: &mut ImageCopySession,
-    build: impl FnOnce(&mut GlesRenderer) -> Option<BufferConstraints>,
+    build: impl FnOnce(Option<&FormatSet>) -> Option<BufferConstraints>,
 ) -> bool {
-    let Some(constraints) = backend.with_primary_renderer(build).flatten() else {
+    // 按渲染器无关的方式取 dmabuf 格式，GLES 与 Vulkan 后端都适用。
+    let Some(render_formats) = primary_render_formats(backend) else {
+        return false;
+    };
+    let Some(constraints) = build(render_formats.as_ref()) else {
         return false;
     };
 
@@ -658,44 +667,32 @@ impl ImageCopyCaptureHandler for State {
                 _ => None,
             };
 
-            if target.is_none() {
-                // Nothing picked yet: hand out the placeholder constraints. Try to include the
-                // dmabuf formats: clients that feed a PipeWire stream capture through their
-                // dmabuf path.
-                let size = dynamic_cast_placeholder_size(&self.niri);
-                let render_node = self.backend.primary_render_node();
-                return self
-                    .backend
-                    .with_primary_renderer(|renderer| {
-                        dynamic_cast_placeholder_constraints(renderer, render_node, size)
-                    })
-                    .or_else(|| Some(dynamic_cast_placeholder_constraints_shm_only(size)));
-            }
-
             let render_node = self.backend.primary_render_node();
-            return self
-                .backend
-                .with_primary_renderer(|renderer| match &target {
-                    None => Some(dynamic_cast_placeholder_constraints(
-                        renderer,
-                        render_node,
-                        dynamic_cast_placeholder_size(&self.niri),
-                    )),
-                    Some(DynamicCastTarget::Output(output)) => {
-                        output_capture_constraints(renderer, render_node, output)
-                    }
-                    Some(DynamicCastTarget::Window { mapped, output }) => {
-                        Some(window_capture_constraints(renderer, render_node, mapped, output))
-                    }
-                })
-                .flatten()
-                // Like with the target not being picked, keep the session alive when we can't
-                // build the real constraints (e.g. no renderer).
-                .or_else(|| {
-                    Some(dynamic_cast_placeholder_constraints_shm_only(
-                        dynamic_cast_placeholder_size(&self.niri),
-                    ))
-                });
+            let size = dynamic_cast_placeholder_size(&self.niri);
+            // Nothing picked yet 时也尽量给出 dmabuf 格式：走 PipeWire 的客户端依赖它。
+            let fallback = || Some(dynamic_cast_placeholder_constraints_shm_only(size));
+
+            // 没有主渲染器时无法给出 dmabuf 约束，退化为 shm-only。
+            let Some(render_formats) = primary_render_formats(&mut self.backend) else {
+                return fallback();
+            };
+
+            return match &target {
+                None => Some(dynamic_cast_placeholder_constraints(
+                    render_formats.as_ref(),
+                    render_node,
+                    size,
+                )),
+                Some(DynamicCastTarget::Output(output)) => {
+                    output_capture_constraints(render_formats.as_ref(), render_node, output)
+                }
+                Some(DynamicCastTarget::Window { mapped, output }) => Some(
+                    window_capture_constraints(render_formats.as_ref(), render_node, mapped, output),
+                ),
+            }
+            // Like with the target not being picked, keep the session alive when we can't
+            // build the real constraints.
+            .or_else(fallback);
         }
 
         if let Some((mapped, Some(output))) = source_window(&self.niri, source) {
@@ -704,9 +701,13 @@ impl ImageCopyCaptureHandler for State {
             }
 
             let render_node = self.backend.primary_render_node();
-            return self.backend.with_primary_renderer(|renderer| {
-                window_capture_constraints(renderer, render_node, mapped, &output)
-            });
+            let render_formats = primary_render_formats(&mut self.backend)?;
+            return Some(window_capture_constraints(
+                render_formats.as_ref(),
+                render_node,
+                mapped,
+                &output,
+            ));
         }
 
         let output = source_output(source)?;
@@ -715,11 +716,8 @@ impl ImageCopyCaptureHandler for State {
         }
 
         let render_node = self.backend.primary_render_node();
-        self.backend
-            .with_primary_renderer(|renderer| {
-                output_capture_constraints(renderer, render_node, &output)
-            })
-            .flatten()
+        let render_formats = primary_render_formats(&mut self.backend)?;
+        output_capture_constraints(render_formats.as_ref(), render_node, &output)
     }
 
     fn cursor_capture_constraints(
@@ -887,4 +885,12 @@ impl ImageCopyCaptureHandler for State {
         }
         self.niri.image_copy_capture_state.cleanup();
     }
+}
+
+/// The dmabuf formats the primary renderer can draw into, or `Some(None)` if the renderer doesn't
+/// report any. `None` if there is no primary renderer.
+pub fn primary_render_formats(backend: &mut Backend) -> Option<Option<FormatSet>> {
+    crate::with_primary_renderer_any!(backend, |renderer| {
+        Bind::<Dmabuf>::supported_formats(renderer)
+    })
 }

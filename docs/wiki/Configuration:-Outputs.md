@@ -13,9 +13,11 @@ output "eDP-1" {
     transform "90"
     position x=1280 y=0
     variable-refresh-rate // on-demand=true
+    allow-tearing "fullscreen"
     focus-at-startup
     backdrop-color "#001100"
     // max-bpc 8
+    // hdr
 
     hot-corners {
         // off
@@ -226,6 +228,51 @@ output "HDMI-A-1" {
 }
 ```
 
+### `allow-tearing`
+
+<sup>Since: next release</sup>
+
+Controls which windows are allowed to present with screen tearing (an immediate, non-vblank-synced
+page flip) on this output.
+
+This setting only *gates* tearing, it never requests it. A window still has to ask for a tearing
+presentation before anything tears, either by using the tearing-control protocol (most games and
+emulators do this, sometimes behind a "disable vsync" option), or by matching an
+[`allow-tearing` window rule](./Configuration:-Window-Rules.md#allow-tearing). What this setting
+decides is whose requests niri will honor.
+
+| Value | Behavior |
+| --- | --- |
+| `"fullscreen"` (default) | Honor tearing requests from the focused fullscreen window only. |
+| `true` / `"yes"` / `"always"` | Honor tearing requests from any window visible on the output. |
+| `false` / `"no"` / `"never"` | Never tear on this output. |
+
+The default is `"fullscreen"` because a tearing page flip updates the *whole* output, not just the
+window that asked for it. A tearing request from a window that doesn't cover the output — or that
+you aren't looking at — would tear your bar, your other tiles, and any animation running at the
+time. Restricting it to the focused fullscreen window gives games the latency benefit exactly where
+it's visible, and keeps the rest of the desktop tear-free.
+
+```kdl
+// Default: only a focused fullscreen game tears.
+output "DP-1" {
+    allow-tearing "fullscreen"
+}
+
+// Honor every tearing request on this output, fullscreen or not.
+output "DP-2" {
+    allow-tearing true
+}
+
+// Never tear here, no matter what a window asks for.
+output "eDP-1" {
+    allow-tearing false
+}
+```
+
+Note that the [`force-tearing` debug flag](./Configuration:-Debug-Options.md#force-tearing) bypasses
+this setting entirely, as it bypasses the window-side check too.
+
 ### `focus-at-startup`
 
 <sup>Since: 25.05</sup>
@@ -298,6 +345,85 @@ Valid values are `6`, `8`, `10`, `12`, `14`, `16`.
 // Set 8 max-bpc on HDMI-A-1 to lower the bandwidth.
 output "HDMI-A-1" {
     max-bpc 8
+}
+```
+
+### `hdr`
+
+<sup>Since: next release</sup>
+
+> [!CAUTION]
+> HDR support is experimental and currently limited to a **single fullscreen application**.
+> There is no color-managed compositing yet, so HDR will only look correct when one HDR
+> application is fullscreen and alone on the output.
+
+Opts this output into HDR. When present, niri:
+
+- tells clients on this output (through the always-advertised `wp-color-management-v1` protocol)
+  that it prefers HDR (PQ / BT.2020) content, so an HDR app, e.g. `mpv --vo=gpu-next` or gamescope,
+  can tell niri its content is HDR;
+- requests a 10-bit (or wider) scanout buffer, and at least 10 `max-bpc`;
+- while a fullscreen application is showing HDR (PQ / BT.2020) content, switches the output into HDR
+  mode (sets the connector to BT.2020 and attaches a PQ `HDR_OUTPUT_METADATA` infoframe), and reverts
+  to SDR when it stops.
+
+The `wp-color-management-v1` protocol itself is always advertised; without an `hdr` node, every
+description niri hands out is plain sRGB, so behavior is unchanged. Adding or removing `hdr` at
+runtime (via a config reload) notifies clients of the changed preference — this also covers HDR
+outputs that are unplugged or disabled at login and enabled later. HDR signalling only works on the
+TTY backend, and requires a GPU/display that exposes the HDR connector properties (amdgpu, recent
+Intel, and nvidia do).
+
+The optional `mode` property controls when the output is in HDR:
+
+- `mode="auto"` (the default): the output stays SDR and switches into HDR while a fullscreen
+  application shows HDR content (passthrough). Applications are told to prefer HDR (PQ / BT.2020)
+  once they are the active fullscreen window, so clients that listen for preference changes (SDL3
+  games, mpv with `--target-colorspace-hint`) switch to HDR when they go fullscreen. Entering and
+  leaving HDR is a modeset (expect a brief blank). The `HDR_OUTPUT_METADATA` is taken from the
+  application that engages HDR and kept until the output leaves HDR, even if other HDR content
+  becomes fullscreen in between.
+- `mode="on"`: the output is always in HDR. SDR content (the desktop, windowed applications) is
+  composited into the HDR blend space, windowed HDR content displays correctly alongside it, and
+  applications are told to prefer HDR upfront — use this for games that only probe HDR support once
+  at startup. The `HDR_OUTPUT_METADATA` always describes the display itself (from its EDID) and
+  never changes with the content, so there is no modeset when entering or leaving fullscreen (on
+  nvidia with DisplayPort, any metadata change would be one). Costs: SDR-only fullscreen
+  applications lose direct scanout on this output, and the cursor is rendered without the cursor
+  plane.
+
+The optional `reference-luminance` child (in cd/m²) is the luminance that SDR white (full white in
+an SDR application) is displayed at while the output is in HDR. Defaults to 203 (the BT.2408
+reference); raise it if the SDR desktop looks too dim next to HDR content.
+
+The optional `peak-luminance` child (in cd/m²) overrides the display's peak luminance from its EDID.
+Only set it for displays whose EDID doesn't provide HDR luminance data, which is common on TVs:
+without it niri assumes a conservative 500 cd/m². Use the peak brightness from the display's
+specifications. The value is used to tone map content brighter than the display, in the
+`HDR_OUTPUT_METADATA` sent to the display (max luminance and MaxCLL), and in the luminances
+advertised to applications. Setting it on a display with correct EDID data only replaces that data.
+
+Screenshots and screencasts of HDR outputs are rendered in SDR; HDR application content appears
+washed out in them.
+
+```kdl
+// Enable HDR on the internal display.
+output "eDP-1" {
+    hdr
+}
+
+// Games that only probe HDR at startup: advertise HDR upfront.
+output "DP-1" {
+    hdr mode="on" {
+        reference-luminance 203
+    }
+}
+
+// A TV whose EDID has no HDR luminance data.
+output "HDMI-A-1" {
+    hdr {
+        peak-luminance 800
+    }
 }
 ```
 

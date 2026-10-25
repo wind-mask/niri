@@ -53,6 +53,7 @@ use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::ui::minimized_strip;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -800,14 +801,14 @@ impl State {
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
-                self.backend.with_primary_renderer(|renderer| {
+                crate::with_primary_renderer_any!(self.backend, |renderer| {
                     self.niri.do_screen_transition(renderer, delay_ms);
                 });
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
                 let active = self.niri.layout.active_output().cloned();
                 if let Some(active) = active {
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         if let Err(err) = self.niri.screenshot(
                             renderer,
                             &active,
@@ -845,7 +846,7 @@ impl State {
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
                             output,
@@ -869,7 +870,7 @@ impl State {
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
                             output,
@@ -2205,6 +2206,65 @@ impl State {
                     }
                 }
             }
+            Action::MinimizeWindow => {
+                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                if let Some(window) = focus {
+                    self.niri.layout.minimize_window(&window);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MinimizeWindowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.minimize_window(&window);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UnminimizeWindow => {
+                // Without an id, restore the most recently minimized window.
+                let window = self
+                    .niri
+                    .layout
+                    .minimized_windows()
+                    .last()
+                    .map(|m| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.unminimize_window(&window);
+                    self.niri.layout.activate_window(&window);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UnminimizeWindowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.unminimize_window(&window);
+                    self.niri.layout.activate_window(&window);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowMinimized => {
+                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                if let Some(window) = focus {
+                    self.niri.layout.toggle_window_minimized(&window);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowMinimizedById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.toggle_window_minimized(&window);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
             Action::ToggleWindowFloating => {
                 self.niri.layout.toggle_window_floating(None);
                 // FIXME: granular
@@ -2856,6 +2916,40 @@ impl State {
         let mod_down = modifiers.contains(mod_key.to_modifiers());
 
         if ButtonState::Pressed == button_state {
+            // Clicking a minimized window's thumbnail restores it. Handle this before anything
+            // else so the strip stays clickable even when it overlaps a window.
+            if let Some(MouseButton::Left) = button {
+                if !pointer.is_grabbed()
+                    && !self.niri.screenshot_ui.is_open()
+                    && !self.niri.window_mru_ui.is_open()
+                {
+                    let location = pointer.current_location();
+                    if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                        let output = output.clone();
+                        let id =
+                            minimized_strip::window_under(&self.niri, &output, pos_within_output);
+
+                        if let Some(id) = id {
+                            let window = self
+                                .niri
+                                .layout
+                                .minimized_windows()
+                                .find(|m| m.id() == id)
+                                .map(|m| m.window.clone());
+
+                            if let Some(window) = window {
+                                self.niri.layout.unminimize_window(&window);
+                                self.niri.layout.activate_window(&window);
+                                self.niri.queue_redraw_all();
+                            }
+
+                            self.niri.suppressed_buttons.insert(button_code);
+                            return;
+                        }
+                    }
+                }
+            }
+
             let mut is_mru_open = false;
             if let Some(mru_output) = self.niri.window_mru_ui.output() {
                 is_mru_open = true;

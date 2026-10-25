@@ -7,13 +7,9 @@ use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesMapping, GlesRenderer, GlesTarget, GlesTexture,
-};
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _,
-};
+use smithay::backend::renderer::{Color32F, Frame, Offscreen, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::user_data::UserDataMap;
@@ -21,15 +17,20 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use smithay::wayland::shm;
 use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
-use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use self::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::renderer::AsGlesRenderer;
+use self::texture::{TextureBuffer, TextureRenderElement, UniversalTextureRenderElement};
+use crate::backend::tty_renderer::TtyOffscreen;
+use crate::render_helpers::blend::set_sdr_capture_blend;
+use crate::render_helpers::renderer::{
+    AsGlesRenderer, AsVulkanRenderer, HasOffscreen, NiriCaptureRenderer, NiriRenderer,
+};
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
+pub mod blend;
 pub mod blur;
 pub mod border;
 pub mod clipped_surface;
+pub mod colorimetry;
 pub mod damage;
 pub mod debug;
 pub mod effect_buffer;
@@ -73,13 +74,23 @@ impl<'a, R> RenderCtx<'a, R> {
     }
 }
 
-impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
-    pub fn as_gles<'b>(&'b mut self) -> RenderCtx<'b, GlesRenderer> {
-        RenderCtx {
-            renderer: self.renderer.as_gles_renderer(),
+impl<'a, R: AsGlesRenderer + AsVulkanRenderer> RenderCtx<'a, R> {
+    pub fn as_gles<'b>(&'b mut self) -> Option<RenderCtx<'b, GlesRenderer>> {
+        Some(RenderCtx {
+            renderer: self.renderer.as_gles_renderer()?,
             target: self.target,
             xray: self.xray,
-        }
+        })
+    }
+
+    pub fn as_vulkan<'b>(
+        &'b mut self,
+    ) -> Option<RenderCtx<'b, smithay::backend::renderer::vulkan::VulkanRenderer>> {
+        Some(RenderCtx {
+            renderer: self.renderer.as_vulkan_renderer()?,
+            target: self.target,
+            xray: self.xray,
+        })
     }
 }
 
@@ -127,8 +138,8 @@ impl RenderTarget {
     }
 }
 
-impl ToRenderElement for BakedBuffer<TextureBuffer<GlesTexture>> {
-    type RenderElement = PrimaryGpuTextureRenderElement;
+impl ToRenderElement for BakedBuffer<TextureBuffer<TtyOffscreen>> {
+    type RenderElement = UniversalTextureRenderElement;
 
     fn to_render_element(
         &self,
@@ -145,7 +156,7 @@ impl ToRenderElement for BakedBuffer<TextureBuffer<GlesTexture>> {
             self.dst.map(|dst| dst.to_f64()),
             kind,
         );
-        PrimaryGpuTextureRenderElement(elem)
+        UniversalTextureRenderElement(elem)
     }
 }
 
@@ -173,30 +184,33 @@ pub fn encompassing_geo(
         .unwrap_or_default()
 }
 
-pub fn create_texture(
-    renderer: &mut GlesRenderer,
+pub fn create_texture<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     fourcc: Fourcc,
-) -> Result<GlesTexture, GlesError> {
+) -> Result<<R as HasOffscreen>::Offscreen, R::Error> {
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
-    renderer.create_buffer(fourcc, buffer_size)
+    Offscreen::<<R as HasOffscreen>::Offscreen>::create_buffer(renderer, fourcc, buffer_size)
 }
 
-pub fn copy_framebuffer(
-    renderer: &mut GlesRenderer,
-    target: &GlesTarget,
+pub fn copy_framebuffer<R: NiriRenderer>(
+    renderer: &mut R,
+    target: &R::Framebuffer<'_>,
     fourcc: Fourcc,
-) -> Result<GlesMapping, GlesError> {
+) -> Result<R::TextureMapping, R::Error> {
     renderer.copy_framebuffer(target, Rectangle::from_size(target.size()), fourcc)
 }
 
-pub fn render_to_encompassing_texture(
-    renderer: &mut GlesRenderer,
+pub fn render_to_encompassing_texture<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
-) -> anyhow::Result<(GlesTexture, SyncPoint, Rectangle<i32, Physical>)> {
+    elements: &[impl RenderElement<R>],
+) -> anyhow::Result<(TtyOffscreen, SyncPoint, Rectangle<i32, Physical>)>
+where
+    R::Error: Send + Sync + 'static,
+{
     let geo = encompassing_geo(scale, elements.iter());
     let elements = elements.iter().rev().map(|ele| {
         RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
@@ -208,14 +222,17 @@ pub fn render_to_encompassing_texture(
     Ok((texture, sync_point, geo))
 }
 
-pub fn render_to_texture(
-    renderer: &mut GlesRenderer,
+pub fn render_to_texture<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<(GlesTexture, SyncPoint)> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<(TtyOffscreen, SyncPoint)>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
@@ -228,17 +245,20 @@ pub fn render_to_texture(
         render_elements(renderer, &mut target, size, scale, transform, elements)?
     };
 
-    Ok((texture, sync_point))
+    Ok((R::wrap_offscreen(texture), sync_point))
 }
 
-pub fn render_and_download(
-    renderer: &mut GlesRenderer,
+pub fn render_and_download<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<GlesMapping> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<R::TextureMapping>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
@@ -252,13 +272,16 @@ pub fn render_and_download(
     copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
 }
 
-pub fn render_and_download_with_damage(
-    renderer: &mut GlesRenderer,
+pub fn render_and_download_with_damage<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<R>],
     states: RenderElementStates,
-) -> anyhow::Result<GlesMapping> {
+) -> anyhow::Result<R::TextureMapping>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
@@ -281,14 +304,17 @@ pub fn render_and_download_with_damage(
     copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
 }
 
-pub fn render_to_vec(
-    renderer: &mut GlesRenderer,
+pub fn render_to_vec<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<Vec<u8>> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<Vec<u8>>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let mapping = render_and_download(renderer, size, scale, transform, fourcc, elements)
@@ -299,14 +325,19 @@ pub fn render_to_vec(
     Ok(copy.to_vec())
 }
 
-pub fn render_to_dmabuf(
-    renderer: &mut GlesRenderer,
+pub fn render_to_dmabuf<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<R>],
     states: RenderElementStates,
-) -> anyhow::Result<SyncPoint> {
+    reference_luminance: f64,
+) -> anyhow::Result<SyncPoint>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
+    set_sdr_capture_blend(renderer, reference_luminance);
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
     ensure!(
         dmabuf.width() == size.w as u32 && dmabuf.height() == size.h as u32,
@@ -327,15 +358,20 @@ pub fn render_to_dmabuf(
     Ok(res.sync)
 }
 
-pub fn render_to_shm(
-    renderer: &mut GlesRenderer,
+pub fn render_to_shm<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &WlBuffer,
     format: wl_shm::Format,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<R>],
     states: RenderElementStates,
-) -> anyhow::Result<()> {
+    reference_luminance: f64,
+) -> anyhow::Result<()>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
+    set_sdr_capture_blend(renderer, reference_luminance);
     // The pointer and length are the client's entire pool, which may hold other
     // buffers besides this one... buffer_data is the one we want.
     shm::with_buffer_contents_mut(buffer, |pool, pool_len, buffer_data| {
@@ -418,7 +454,13 @@ pub fn render_to_shm(
     .context("expected shm buffer, but didn't get one")?
 }
 
-pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
+pub fn clear_dmabuf<R: NiriRenderer>(
+    renderer: &mut R,
+    mut dmabuf: Dmabuf,
+) -> anyhow::Result<SyncPoint>
+where
+    R::Error: Send + Sync + 'static,
+{
     let size = dmabuf.size();
     let size = size.to_logical(1, Transform::Normal).to_physical(1);
     let mut target = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;
@@ -431,14 +473,17 @@ pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::
     frame.finish().context("error finishing frame")
 }
 
-fn render_elements(
-    renderer: &mut GlesRenderer,
-    target: &mut GlesTarget,
+fn render_elements<R: NiriRenderer>(
+    renderer: &mut R,
+    target: &mut R::Framebuffer<'_>,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<SyncPoint> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<SyncPoint>
+where
+    R::Error: Send + Sync + 'static,
+{
     let transform = transform.invert();
     let output_rect = Rectangle::from_size(transform.transform_size(size));
 

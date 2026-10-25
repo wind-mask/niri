@@ -1,22 +1,25 @@
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{import_surface, RendererSurfaceStateUserData};
 use smithay::backend::renderer::{ImportAll, Renderer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Scale};
+use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
 use super::superres::{ResampleFilter, SuperResElement};
+use super::blend::{BlendSurfaceRenderElement, ContentColor};
+use super::renderer::NiriRenderer;
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
+use crate::backend::tty_renderer::TtyOffscreen;
 
 /// Renders elements from a surface tree as textures into `storage`.
-pub fn render_snapshot_from_surface_tree(
-    renderer: &mut GlesRenderer,
+pub fn render_snapshot_from_surface_tree<R: NiriRenderer>(
+    renderer: &mut R,
     surface: &WlSurface,
     location: Point<f64, Logical>,
-    storage: &mut Vec<BakedBuffer<TextureBuffer<GlesTexture>>>,
+    storage: &mut Vec<BakedBuffer<TextureBuffer<TtyOffscreen>>>,
 ) {
     let _span = tracy_client::span!("render_snapshot_from_surface_tree");
 
@@ -66,7 +69,8 @@ pub fn render_snapshot_from_surface_tree(
                     f64::from(data.buffer_scale()),
                     data.buffer_transform(),
                     Vec::new(),
-                );
+                )
+                .map_texture(R::wrap_texture);
 
                 let baked = BakedBuffer {
                     buffer,
@@ -90,7 +94,7 @@ pub fn push_elements_from_surface_tree<R>(
     scale: Scale<f64>,
     alpha: f32,
     kind: Kind,
-    push: &mut dyn FnMut(WaylandSurfaceRenderElement<R>),
+    push: &mut dyn FnMut(BlendSurfaceRenderElement<R>),
 ) where
     R: Renderer + ImportAll,
     R::TextureId: Clone + 'static,
@@ -102,7 +106,7 @@ pub fn push_elements_from_surface_tree<R>(
         scale,
         alpha,
         kind,
-        &mut |elem| elem,
+        &mut |elem, content| BlendSurfaceRenderElement::new(elem, content),
         push,
     );
 }
@@ -133,7 +137,8 @@ pub fn push_superres_elements_from_surface_tree<R>(
         scale,
         alpha,
         kind,
-        &mut |elem| SuperResElement::new(elem, filter),
+        // 超分路径不经过 HDR 混合包装：元素由 SuperResElement 自行绘制。
+        &mut |elem, _content| SuperResElement::new(elem, filter),
         push,
     );
 }
@@ -147,9 +152,9 @@ fn push_elements_from_surface_tree_with<R, E>(
     scale: Scale<f64>,
     alpha: f32,
     kind: Kind,
-    // Maps an element before pushing it. This lets callers wrap the elements, e.g. to draw them
-    // with a different resampling kernel.
-    map: &mut dyn FnMut(WaylandSurfaceRenderElement<R>) -> E,
+    // Wraps an element together with the surface's content color before pushing it. This lets
+    // callers pick how the element is drawn, e.g. HDR blend wrapping or a resampling kernel.
+    wrap: &mut dyn FnMut(WaylandSurfaceRenderElement<R>, ContentColor) -> E,
     push: &mut dyn FnMut(E),
 ) where
     R: Renderer + ImportAll,
@@ -190,10 +195,21 @@ fn push_elements_from_surface_tree_with<R, E>(
                 };
 
                 if has_view {
+                    // Content carrying an HDR image description is already encoded in the
+                    // output blend space and must not be re-encoded when composited;
+                    // Windows-scRGB content instead needs the dedicated absolute encode.
+                    let content = ContentColor::from_description(
+                        states
+                            .cached_state
+                            .get::<ColorManagementSurfaceCachedState>()
+                            .current()
+                            .description,
+                    );
+
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => push(map(surface)),
+                        Ok(Some(surface)) => push(wrap(surface, content)),
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {
                             warn!("failed to import surface: {}", err);

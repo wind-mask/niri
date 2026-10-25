@@ -1,28 +1,28 @@
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
-};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
-use super::texture::TextureRenderElement;
+use super::blend::FrameBlendState;
+use super::texture::{TextureRenderElement, UniversalTextureRenderElement};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-use crate::render_helpers::renderer::AsGlesFrame as _;
-use crate::render_helpers::shaders::Shaders;
+use crate::backend::tty_renderer::TtyOffscreen;
+use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
+use crate::render_helpers::shaders::{NiriTexProgram, Shaders};
 
 #[derive(Debug, Clone)]
 pub struct GradientFadeTextureRenderElement {
-    inner: TextureRenderElement<GlesTexture>,
+    inner: UniversalTextureRenderElement,
     program: GradientFadeShader,
     cutoff: (f32, f32),
 }
 
 #[derive(Debug, Clone)]
-pub struct GradientFadeShader(GlesTexProgram);
+pub struct GradientFadeShader(NiriTexProgram);
 
 impl GradientFadeTextureRenderElement {
-    pub fn new(texture: TextureRenderElement<GlesTexture>, program: GradientFadeShader) -> Self {
+    pub fn new(texture: TextureRenderElement<TtyOffscreen>, program: GradientFadeShader) -> Self {
         let logical_w = texture.buffer().logical_size().w;
         let logical_src_w = texture.logical_src().size.w;
         let cutoff = if logical_src_w < logical_w {
@@ -35,14 +35,14 @@ impl GradientFadeTextureRenderElement {
             (1., 1.)
         };
         Self {
-            inner: texture,
+            inner: UniversalTextureRenderElement(texture),
             program,
             cutoff,
         }
     }
 
-    pub fn shader(renderer: &mut GlesRenderer) -> Option<GradientFadeShader> {
-        let program = Shaders::get(renderer).gradient_fade.clone();
+    pub fn shader<R: NiriRenderer>(renderer: &mut R) -> Option<GradientFadeShader> {
+        let program = Shaders::get(renderer).and_then(|s| s.gradient_fade.clone());
         program.map(GradientFadeShader)
     }
 }
@@ -99,9 +99,16 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
-        frame.override_default_tex_program(self.program.0.clone(), uniforms);
-        RenderElement::<GlesRenderer>::draw(
+        let NiriTexProgram::Gles(program) = &self.program.0 else {
+            return Ok(());
+        };
+        let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        uniforms.extend(FrameBlendState::uniforms(frame));
+        let saved = frame.take_tex_program_override();
+        crate::audit_texture_program!("gradient_fade");
+
+        frame.override_default_tex_program(program.clone(), uniforms);
+        let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -109,9 +116,9 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
             damage,
             opaque_regions,
             cache,
-        )?;
-        frame.clear_tex_program_override();
-        Ok(())
+        );
+        frame.set_tex_program_override(saved);
+        res
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -131,17 +138,69 @@ impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderE
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
+        let mut saved = None;
+        let mut saved_vk = None;
+        match (&self.program.0, &mut *frame) {
+            (NiriTexProgram::Gles(program), _) => {
+                if let Some(gles_frame) = frame.as_gles_frame() {
+                    let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+                    uniforms.extend(FrameBlendState::uniforms(gles_frame));
+                    saved = Some(gles_frame.take_tex_program_override());
+                    crate::audit_texture_program!("gradient_fade");
+
+                    gles_frame.override_default_tex_program(program.clone(), uniforms);
+                }
+            }
+            (NiriTexProgram::Vulkan(program), TtyFrame::Vulkan(multi)) => {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                let uniforms_src = [Uniform::new("cutoff", self.cutoff)];
+                let mut uniforms: Vec<_> = uniforms_src
+                    .iter()
+                    .filter_map(super::shader_element::uniform_to_custom_owned)
+                    .collect();
+                uniforms.extend(
+                    super::blend::vulkan_blend_custom_uniforms(
+                        vk_frame,
+                        super::blend::ContentColor::default(),
+                    )
+                    .into_iter()
+                    .map(|u| {
+                        smithay::backend::renderer::vulkan::OwnedCustomUniform {
+                            name: u.name.to_owned(),
+                            value: u.value,
+                        }
+                    }),
+                );
+                saved_vk = Some(vk_frame.take_tex_program_override());
+                crate::audit_texture_program!("gradient_fade");
+
+                vk_frame.set_tex_program_override(Some((program.clone(), uniforms)));
+            }
+            _ => {}
+        }
+        let res = RenderElement::<TtyRenderer>::draw(
+            &self.inner,
+            frame,
             src,
             dst,
             damage,
             opaque_regions,
             cache,
-        )?;
-        Ok(())
+        );
+        if let Some(saved) = saved {
+            if let Some(gles_frame) = frame.as_gles_frame() {
+                gles_frame.set_tex_program_override(saved);
+            }
+        }
+        if let Some(saved) = saved_vk {
+            if let TtyFrame::Vulkan(multi) = frame {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                vk_frame.set_tex_program_override(saved);
+            }
+        }
+        res
     }
 
     fn underlying_storage(

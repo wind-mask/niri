@@ -186,7 +186,7 @@ impl ShadowRenderElement {
 
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
         Shaders::get(renderer)
-            .program(ProgramType::Shadow)
+            .and_then(|s| s.program(ProgramType::Shadow))
             .is_some()
     }
 }
@@ -268,6 +268,35 @@ impl RenderElement<GlesRenderer> for ShadowRenderElement {
     }
 }
 
+impl RenderElement<smithay::backend::renderer::vulkan::VulkanRenderer> for ShadowRenderElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        RenderElement::<smithay::backend::renderer::vulkan::VulkanRenderer>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
+    }
+
+    fn underlying_storage(
+        &self,
+        _renderer: &mut smithay::backend::renderer::vulkan::VulkanRenderer,
+    ) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
 impl<'render> RenderElement<TtyRenderer<'render>> for ShadowRenderElement {
     fn draw(
         &self,
@@ -278,7 +307,20 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShadowRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
+        if let TtyFrame::Vulkan(_) = frame {
+            return RenderElement::<TtyRenderer>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            );
+        }
+        let Some(frame) = frame.as_gles_frame() else {
+            return Ok(());
+        };
         RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
         Ok(())
     }

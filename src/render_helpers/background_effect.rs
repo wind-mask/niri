@@ -1,11 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Point, Rectangle, Scale};
+use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
+use smithay::utils::user_data::UserDataMap;
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
 
+use super::renderer::NiriRenderer;
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
@@ -81,6 +84,70 @@ niri_render_elements! {
     }
 }
 
+impl RenderElement<VulkanRenderer> for BackgroundEffectElement {
+    fn capture_framebuffer(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), VulkanError> {
+        match self {
+            BackgroundEffectElement::FramebufferEffect(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            BackgroundEffectElement::Xray(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            BackgroundEffectElement::ExtraDamage(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+        }
+    }
+
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        match self {
+            BackgroundEffectElement::FramebufferEffect(elem) => {
+                RenderElement::<VulkanRenderer>::draw(
+                    elem,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+            }
+            BackgroundEffectElement::Xray(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            BackgroundEffectElement::ExtraDamage(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+        }
+    }
+}
+
 impl BackgroundEffect {
     pub fn new() -> Self {
         Self {
@@ -148,9 +215,9 @@ impl BackgroundEffect {
         self.options.is_visible()
     }
 
-    pub fn render(
+    pub fn render<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
@@ -281,8 +348,8 @@ pub fn damage_surface(states: &SurfaceData) {
 // Silence, Clippy
 // A Smithay user is talking
 #[allow(clippy::too_many_arguments)]
-pub fn render_for_tile(
-    ctx: RenderCtx<GlesRenderer>,
+pub fn render_for_tile<R: NiriRenderer>(
+    ctx: RenderCtx<R>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,

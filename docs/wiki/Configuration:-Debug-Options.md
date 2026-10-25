@@ -15,6 +15,8 @@ debug {
     // preview-render "screen-capture"
     enable-overlay-planes
     disable-cursor-plane
+    disable-cursor-plane-on-hdr
+    scanout-post-blend-encode
     disable-direct-scanout
     restrict-primary-scanout-to-matching-format
     force-disable-connectors-on-resume
@@ -35,6 +37,7 @@ debug {
     skip-cursor-only-updates-during-vrr
     deactivate-unfocused-windows
     disable-10bit-output
+    force-tearing
 }
 
 binds {
@@ -80,6 +83,44 @@ Useful to work around driver bugs on specific hardware.
 ```kdl
 debug {
     disable-cursor-plane
+}
+```
+
+### `disable-cursor-plane-on-hdr`
+
+Composite the cursor on the primary plane instead of using the cursor plane on outputs composited in an HDR blend space.
+
+By default niri uses the cursor plane on HDR outputs too.
+The plane bypasses the renderer, so its contents get a LUT-accelerated CPU sRGB-to-PQ encode on every cursor image change, and cursors whose content isn't plain SDR still fall back to compositing.
+Keeping the cursor on its plane also keeps direct scanout of fullscreen content working while the cursor is visible: a composited cursor is an extra element on top of the fullscreen surface, which forces the whole frame through the renderer.
+
+The encode still runs on the main thread once per cursor image change.
+No performance issues were observed on AMD even with frequently-changing cursors, but AMD also has a smaller cursor plane size limit; on Nvidia, whose cursor planes can be larger, it may be worth setting this flag if you notice stutter with rapidly animating cursors.
+
+Overridden by `disable-cursor-plane`, which disables the cursor plane everywhere.
+
+```kdl
+debug {
+    disable-cursor-plane-on-hdr
+}
+```
+
+### `scanout-post-blend-encode`
+
+On HDR outputs, let a fullscreen surface go direct scanout even when the display's plane color pipelines can't apply the final PQ encode, by moving that encode behind blending onto the CRTC gamma LUT.
+
+This is aimed at Nvidia, whose plane color pipelines can decode, scale and gamut-convert content but always end in linear light, so SDR or non-BT.2020 content on an HDR output is otherwise always composited.
+With this flag, when a single surface covers the whole output and nothing else is visible, the plane is programmed to output linear light normalized to the display's peak luminance, and the CRTC gamma LUT encodes it to PQ in the same atomic commit.
+A cursor on the cursor plane doesn't prevent this: on those frames its image is converted to the same linear light instead of PQ, so the gamma LUT encodes it along with the surface (cursor images in both forms are cached, so moving in and out of the offload doesn't re-convert them).
+A composited cursor does prevent direct scanout, so don't combine this with `disable-cursor-plane` or `disable-cursor-plane-on-hdr`.
+
+This is experimental.
+The gamma LUT is indexed by linear light, so it has little precision near black and dark gradients may band.
+While it is active, gamma adjustments from gamma-control clients (night light tools) are deferred until the offload is disabled again.
+
+```kdl
+debug {
+    scanout-post-blend-encode
 }
 ```
 
@@ -352,9 +393,34 @@ However, this can currently cause problems on some Intel + NVIDIA mixed-GPU setu
 
 Until this is fixed in Smithay, you can disable 10-bit color formats by setting this debug flag.
 
+In this tree, 10-bit formats are only attempted on outputs with HDR enabled; SDR outputs always use 8-bit.
+On HDR outputs, this flag keeps an 8-bit framebuffer while still sending the HDR signalling.
+
 ```kdl
 debug {
     disable-10bit-output
+}
+```
+
+### `force-tearing`
+
+Enables screen tearing unconditionally, overriding any [`allow-tearing`](./Configuration:-Window-Rules.md#allow-tearing) window rules and the [output `allow-tearing`](./Configuration:-Outputs.md#allow-tearing) setting.
+
+```kdl
+debug {
+    force-tearing
+}
+```
+
+### `vulkan-renderer`
+
+Renders using Vulkan instead of OpenGL ES on the TTY backend.
+
+This is experimental, but feature-complete: custom-shader effects (borders, shadows, rounded corners, blur, xray backgrounds, window animations, custom animation shaders, HDR tone mapping) all render on the Vulkan renderer. wl_drm (legacy EGL buffer sharing) is unavailable; clients use dmabuf.
+
+```kdl
+debug {
+    vulkan-renderer
 }
 ```
 

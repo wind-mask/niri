@@ -2,9 +2,7 @@ use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, UpscalingMode, WindowRule};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element as _, Kind};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::output::{self, Output};
@@ -29,6 +27,7 @@ use crate::layout::{
 };
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -99,6 +98,9 @@ pub struct Mapped {
 
     /// Whether this window is floating.
     is_floating: bool,
+
+    /// Whether this window is minimized, i.e. held outside the layout.
+    is_minimized: bool,
 
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
@@ -303,6 +305,7 @@ impl Mapped {
             is_focused: false,
             is_active_in_column: true,
             is_floating: false,
+            is_minimized: false,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
@@ -412,6 +415,26 @@ impl Mapped {
         self.is_floating
     }
 
+    pub fn is_minimized(&self) -> bool {
+        self.is_minimized
+    }
+
+    /// Whether the window is fullscreen, i.e. filling its whole output.
+    ///
+    /// Windowed fullscreen reports `false`, since such a window is laid out as an ordinary tile.
+    ///
+    /// Unlike the other `is_*` accessors here, this reads the committed toplevel state, so it
+    /// takes the surface state lock. Do not call it from inside `with_states()` or
+    /// `with_toplevel_role()` for the same surface: that deadlocks.
+    pub fn is_fullscreen(&self) -> bool {
+        LayoutElement::sizing_mode(self).is_fullscreen()
+    }
+
+    /// Whether a `block-minimize` window rule prevents the client from minimizing itself.
+    pub fn is_blocking_minimize(&self) -> bool {
+        self.rules.block_minimize.unwrap_or(false)
+    }
+
     pub fn is_window_cast_target(&self) -> bool {
         self.is_window_cast_target
     }
@@ -440,7 +463,7 @@ impl Mapped {
     }
 
     /// Renders a snapshot of the window without popups.
-    fn render_snapshot(&self, renderer: &mut GlesRenderer) -> LayoutElementRenderSnapshot {
+    fn render_snapshot<R: NiriRenderer>(&self, renderer: &mut R) -> LayoutElementRenderSnapshot {
         let _span = tracy_client::span!("Mapped::render_snapshot");
 
         let size = self.size().to_f64();
@@ -486,7 +509,7 @@ impl Mapped {
         should_animate
     }
 
-    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
+    pub fn store_animation_snapshot<R: NiriRenderer>(&mut self, renderer: &mut R) {
         self.animation_snapshot = Some(self.render_snapshot(renderer));
     }
 
@@ -636,6 +659,20 @@ impl Mapped {
         update_tiled_state(self.toplevel(), prefer_no_csd, self.rules.tiled_state);
     }
 
+    /// Sets the pending xdg-toplevel suspended state.
+    ///
+    /// Smithay drops the state for clients below xdg_wm_base v6. The configure is sent by the
+    /// regular refresh machinery, which dedups unchanged state.
+    pub fn set_suspended(&self, suspended: bool) {
+        self.toplevel().with_pending_state(|state| {
+            if suspended {
+                state.states.set(xdg_toplevel::State::Suspended);
+            } else {
+                state.states.unset(xdg_toplevel::State::Suspended);
+            }
+        });
+    }
+
     pub fn is_windowed_fullscreen(&self) -> bool {
         self.is_windowed_fullscreen
     }
@@ -731,7 +768,13 @@ impl LayoutElement for Mapped {
             // Super resolution only replaces how the client buffer is sampled. The window's
             // display geometry, its input handling and everything else stays the same. It applies
             // to every render target, so that screen captures show what is on the screen.
-            match self.superres.kernel(&self.rules.upscaling, self.id.get()) {
+            //
+            // 超分管线跑在 GLES 上，Vulkan 渲染器下退回渲染器自带采样。
+            let superres_kernel = match ctx.renderer.as_gles_renderer() {
+                Some(_) => self.superres.kernel(&self.rules.upscaling, self.id.get()),
+                None => None,
+            };
+            match superres_kernel {
                 Some(kernel) => {
                     // Collect the surface elements first, because running the offscreen pass needs
                     // the renderer again.
@@ -748,7 +791,12 @@ impl LayoutElement for Mapped {
 
                     let view_rect = self.superres.view_rect();
                     for elem in elements {
-                        let renderer = ctx.renderer.as_gles_renderer();
+                        // 超分元素包在 HDR 混合元素内层，绘制由超分管线接管。
+                        let elem = elem.into_inner();
+                        let renderer = ctx
+                            .renderer
+                            .as_gles_renderer()
+                            .expect("superres kernel implies a GLES renderer");
                         let raw_rect = elem.geometry(scale).to_f64().to_logical(scale);
                         let magnify = magnify.map(|magnify| {
                             magnify_element_rect(&magnify, window_location, raw_rect)
@@ -771,7 +819,7 @@ impl LayoutElement for Mapped {
                     }
                 }
                 None => {
-                    let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
+                    let mut push = |elem: BlendSurfaceRenderElement<R>| push(elem.into());
                     push_elements_from_surface_tree(
                         ctx.renderer,
                         surface,
@@ -820,8 +868,9 @@ impl LayoutElement for Mapped {
             // Pop-ups live in the same coordinate space as the window's own content, so they are
             // magnified along with it. They are drawn with the renderer's own sampling rather than
             // with the configured kernel, which is fine for menus and tooltips.
-            let mut push_popup = |elem: WaylandSurfaceRenderElement<R>| match magnify {
+            let mut push_popup = |elem: BlendSurfaceRenderElement<R>| match magnify {
                 Some(magnify) => {
+                    let elem = elem.into_inner();
                     let rect = elem.geometry(scale).to_f64().to_logical(scale);
                     let rect = magnify_element_rect(&magnify, location, rect);
                     push(SuperResElement::plain(elem).with_magnify(rect).into());
@@ -855,7 +904,7 @@ impl LayoutElement for Mapped {
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
             background_effect::render_for_tile(
-                ctx.as_gles(),
+                ctx.r(),
                 None,
                 geometry,
                 scale.x,
@@ -873,9 +922,9 @@ impl LayoutElement for Mapped {
         }
     }
 
-    fn render_background_effect(
+    fn render_background_effect<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         geometry: Rectangle<f64, Logical>,
         scale: f64,
         clip_to_geometry: bool,
@@ -1173,6 +1222,27 @@ impl LayoutElement for Mapped {
         let changed = self.is_floating != floating;
         self.is_floating = floating;
         self.need_to_recompute_rules |= changed;
+    }
+
+    fn set_minimized(&mut self, minimized: bool) {
+        if self.is_minimized == minimized {
+            return;
+        }
+
+        self.is_minimized = minimized;
+        self.need_to_recompute_rules = true;
+
+        // A minimized window is not visible anywhere, so let it stop rendering. This mirrors what
+        // we do for windows hidden by a screen lock or by DPMS.
+        self.set_suspended(minimized);
+    }
+
+    fn is_minimized(&self) -> bool {
+        self.is_minimized
+    }
+
+    fn is_blocking_minimize(&self) -> bool {
+        self.rules.block_minimize.unwrap_or(false)
     }
 
     fn set_bounds(&self, bounds: Size<i32, Logical>) {

@@ -1282,6 +1282,19 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        // Vulkan 渲染器上没有 GLES 帧，超分管线不可用，退回渲染器自带采样。
+        if frame.as_gles_frame().is_none() {
+            return RenderElement::<TtyRenderer<'render>>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            );
+        }
+
         // The element draws with the renderer's own sampling, so there is nothing to measure.
         if matches!(self.kernel, ElementKernel::Plain) {
             let res = RenderElement::<TtyRenderer<'render>>::draw(
@@ -1293,17 +1306,17 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 opaque_regions,
                 cache,
             );
-            self.log_draw(frame.as_gles_frame(), "renderer-default", dst, res.is_ok());
+            self.log_draw(frame.as_gles_frame().expect("gles frame checked above"), "renderer-default", dst, res.is_ok());
             return res;
         }
 
-        self.timings.begin(frame.as_gles_frame(), Pass::Draw);
+        self.timings.begin(frame.as_gles_frame().expect("gles frame checked above"), Pass::Draw);
         let mut executed_pass = "renderer-default";
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
             ElementKernel::Filter(_) => {
-                match self.resample_program(frame.as_gles_frame(), src) {
+                match self.resample_program(frame.as_gles_frame().expect("gles frame checked above"), src) {
                     // Fall back to the renderer's own sampling.
                     None => RenderElement::<TtyRenderer<'render>>::draw(
                         &self.inner,
@@ -1318,6 +1331,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                         executed_pass = self.kernel.draw_pass();
                         frame
                             .as_gles_frame()
+                            .expect("gles frame checked above")
                             .override_default_tex_program(program, uniforms);
                         let res = RenderElement::<TtyRenderer<'render>>::draw(
                             &self.inner,
@@ -1328,7 +1342,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                             opaque_regions,
                             cache,
                         );
-                        frame.as_gles_frame().clear_tex_program_override();
+                        frame.as_gles_frame().expect("gles frame checked above").clear_tex_program_override();
                         res
                     }
                 }
@@ -1338,7 +1352,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 context_id,
             } => {
                 match self.cunny_program(
-                    frame.as_gles_frame(),
+                    frame.as_gles_frame().expect("gles frame checked above"),
                     residuals,
                     context_id.clone(),
                     src,
@@ -1348,6 +1362,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                         executed_pass = self.kernel.draw_pass();
                         frame
                             .as_gles_frame()
+                            .expect("gles frame checked above")
                             .override_default_tex_program(program, uniforms);
                         let res = RenderElement::<TtyRenderer<'render>>::draw(
                             &self.inner,
@@ -1358,7 +1373,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                             opaque_regions,
                             cache,
                         );
-                        frame.as_gles_frame().clear_tex_program_override();
+                        frame.as_gles_frame().expect("gles frame checked above").clear_tex_program_override();
                         res
                     }
                     // Fall back to the renderer's own sampling.
@@ -1383,7 +1398,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 // This loses the multigpu frame's cross-GPU damage bookkeeping, which is why this
                 // has to be revisited together with mixed-GPU support.
                 match draw_fsr1(
-                    frame.as_gles_frame(),
+                    frame.as_gles_frame().expect("gles frame checked above"),
                     texture,
                     context_id.clone(),
                     *sharpness_scale,
@@ -1394,7 +1409,11 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 ) {
                     Some(res) => {
                         executed_pass = "rcas";
-                        res.map_err(TtyRendererError::Render)
+                        res.map_err(|err| {
+                            TtyRendererError::Gles(
+                                smithay::backend::renderer::multigpu::Error::Render(err),
+                            )
+                        })
                     }
                     None => RenderElement::<TtyRenderer<'render>>::draw(
                         &self.inner,
@@ -1409,8 +1428,8 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
             }
         };
 
-        self.timings.end(frame.as_gles_frame());
-        self.log_draw(frame.as_gles_frame(), executed_pass, dst, res.is_ok());
+        self.timings.end(frame.as_gles_frame().expect("gles frame checked above"));
+        self.log_draw(frame.as_gles_frame().expect("gles frame checked above"), executed_pass, dst, res.is_ok());
         res
     }
 
@@ -1435,6 +1454,13 @@ impl PassSource for GlesTexture {
     fn pass_texture(&self, _context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
         // The element was built with this renderer, so the texture belongs to its context.
         Some(self.clone())
+    }
+}
+
+impl PassSource for smithay::backend::renderer::vulkan::VulkanTexture {
+    fn pass_texture(&self, _context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
+        // 超分管线只在 GLES 上运行，Vulkan 纹理没有对应的 GLES 上下文纹理。
+        None
     }
 }
 

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::iter::zip;
 use std::num::NonZeroU64;
+use std::ops::RangeInclusive;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -14,46 +15,62 @@ use anyhow::{anyhow, bail, ensure, Context};
 use bytemuck::{bytes_of_mut, cast_slice_mut};
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::{MaxBpc, Modeline};
+use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
+use smithay::backend::drm::compositor::{
+    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement,
+};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
-    DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
+    ColorOpKind, ColorPipeline, Colorspace, ConnectorColorState, CtaCoordinate, DrmDevice,
+    DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, Eotf, HdrOutputMetadata,
+    NodeType, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::RenderElementPresentationState;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
-use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer, MultiTexture};
+use smithay::backend::renderer::multigpu::vulkan::VulkanBackend;
+use smithay::backend::renderer::multigpu::{GpuManager, MultiTexture};
 use smithay::backend::renderer::{
-    ContextId, DebugFlags, ImportDma, ImportEgl, Renderer as _, RendererSuper,
+    Bind, ContextId, DebugFlags, ImportDma, ImportEgl, PresentationMode, Renderer as _,
 };
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
+use smithay::backend::SwapBuffersError;
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties};
+use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::{Dispatcher, LoopHandle, RegistrationToken};
+use smithay::reexports::calloop::{
+    Dispatcher, Interest, LoopHandle, Mode as EventMode, PostAction, RegistrationToken,
+};
 use smithay::reexports::drm::control::atomic::AtomicModeReq;
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{
     self, connector, crtc, plane, property, AtomicCommitFlags, Device, Mode as DrmMode, ModeFlags,
     ModeTypeFlags, PlaneType, ResourceHandle,
 };
+use smithay::reexports::drm::Device as _;
 use smithay::reexports::gbm::Modifier;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{DeviceFd, Transform};
+use smithay::wayland::color::management::{
+    Chromaticities, ImageDescription, Primaries as CmPrimaries,
+    PrimariesOption as CmPrimariesOption, TransferFunction as CmTransferFunction,
+};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -63,30 +80,44 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
-use super::{IpcOutputMap, OutputId, RenderResult};
+use super::tty_renderer::TtyGpuManager;
+use super::{override_peak_luminance, IpcOutputMap, OutputHdrCaps, OutputId, RenderResult};
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
+use crate::render_helpers::blend::{self, set_frame_blend_tty, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::{
-    AsGlesRenderer, DmabufDebug, GpuDebug, TextureDebug, GPU_LOG_TARGET,
+    AsGlesRenderer, AsVulkanRenderer, DmabufDebug, GpuDebug, TextureDebug, GPU_LOG_TARGET,
 };
 use crate::render_helpers::{resources, shaders, superres, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
-// When copying from rendering Nvidia dGPU to target iGPU,
-// it only understands X/Abgr and not X/Argb.
-const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
-    [Fourcc::Abgr2101010, Fourcc::Argb8888, Fourcc::Abgr8888];
+/// Scanout formats offered on SDR outputs: 8-bit only. Requesting a 10-bit framebuffer is not
+/// free — some drivers (notably nvidia) hang the initial modeset when asked to scan out a 2101010
+/// buffer — so outputs that did not opt into HDR stay 8-bit.
+///
+/// Smithay should fall back to Xrgb/Xbgr automatically if needed.
+const SDR_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
 
-// Smithay should fall back to Xrgb/Xbgr automatically if needed.
-const SUPPORTED_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
+/// 10-bit scanout formats probed individually on HDR outputs, in order of preference. Each one
+/// that works is offered ahead of the 8-bit fallbacks, which are needed so the PQ signal isn't
+/// crushed.
+///
+/// When copying from rendering Nvidia dGPU to target iGPU, it only understands X/Abgr and not
+/// X/Argb, so those come first.
+const HDR_TEN_BIT_COLOR_FORMATS: [Fourcc; 4] = [
+    Fourcc::Abgr2101010,
+    Fourcc::Xbgr2101010,
+    Fourcc::Argb2101010,
+    Fourcc::Xrgb2101010,
+];
 
 pub struct Tty {
     config: Rc<RefCell<Config>>,
     session: LibSeatSession,
     udev_dispatcher: Dispatcher<'static, UdevBackend, State>,
     libinput: Libinput,
-    gpu_manager: GpuManager<GbmGlesBackend<GlesRenderer, DeviceFd>>,
+    gpu_manager: TtyGpuManager,
     // DRM node corresponding to the primary GPU. May or may not be the same as
     // primary_render_node.
     primary_node: DrmNode,
@@ -116,13 +147,10 @@ struct VirtualOutputs {
     outputs: HashMap<String, (Output, OutputId)>,
 }
 
+pub use super::tty_renderer::{TtyFrame, TtyFramebuffer, TtyRenderer};
+
 /// The GPU backend that the TTY renderer runs on.
 pub type TtyGpuBackend = GbmGlesBackend<GlesRenderer, DeviceFd>;
-
-pub type TtyRenderer<'render> = MultiRenderer<'render, 'render, TtyGpuBackend, TtyGpuBackend>;
-
-pub type TtyFrame<'render, 'frame, 'buffer> =
-    MultiFrame<'render, 'render, 'frame, 'buffer, TtyGpuBackend, TtyGpuBackend>;
 
 /// Returns the native GLES texture that a multigpu texture has for the given renderer context.
 ///
@@ -137,17 +165,28 @@ pub fn native_texture(
     texture.get::<TtyGpuBackend>(context_id)
 }
 
-pub type TtyRendererError<'render> = <TtyRenderer<'render> as RendererSuper>::Error;
+#[allow(dead_code)]
+pub type TtyRendererError<'render> = super::tty_renderer::TtyRendererError;
+
 
 type GbmDrmCompositor = DrmCompositor<
     GbmAllocator<DeviceFd>,
     GbmFramebufferExporter<DeviceFd>,
-    (OutputPresentationFeedback, Duration),
+    FrameUserData,
     DeviceFd,
 >;
 
+type FrameUserData = (OutputPresentationFeedback, Duration);
+
+struct PendingFrameSubmission {
+    remaining_sync_points: usize,
+    data: Option<FrameUserData>,
+}
+
 pub struct OutputDevice {
     token: RegistrationToken,
+    /// NVIDIA's KMS explicit-fence handling can occasionally scan out an unfinished frame.
+    is_nvidia: bool,
     // Can be None for display-only devices such as DisplayLink.
     render_node: Option<DrmNode>,
     drm_scanner: DrmScanner,
@@ -397,10 +436,34 @@ struct Surface {
     name: OutputName,
     compositor: GbmDrmCompositor,
     connector: connector::Handle,
+    /// Whether the driver and sink can do HDR on this connector: the connector exposes the
+    /// `Colorspace` (with BT2020_RGB) and `HDR_OUTPUT_METADATA` properties, and the sink's EDID
+    /// advertises the PQ EOTF.
+    hdr_supported: bool,
+    /// HDR capabilities parsed from the sink's EDID.
+    edid_hdr: EdidHdrInfo,
+    /// Valid range of the connector's `max bpc` property, if it has one.
+    max_bpc_range: Option<RangeInclusive<u32>>,
+    /// Whether the compositor was created offering 10-bit scanout formats (see
+    /// [`wants_10bit_formats`]). The format list is fixed for the compositor's lifetime, so a
+    /// config change that flips this recreates the output.
+    wants_10bit_formats: bool,
+    /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
+    /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
+    failed_color_state: Option<ConnectorColorState>,
+    /// The blend space of the last rendered frame: `Some((reference luminance, peak
+    /// luminance))` = HDR, `None` = SDR. Blend changes alter shader output without damaging
+    /// anything, so a change forces a full redraw.
+    last_blend: Option<Option<(f64, f64)>>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
+    /// Whether the last rendered frame did direct scan-out on the primary plane. `None` until
+    /// the first frame. Used to log scan-out transitions.
+    was_direct_scanout: Option<bool>,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// Whether the unsupported post-blend encode offload was already logged.
+    post_blend_unsupported_logged: bool,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -409,12 +472,61 @@ struct Surface {
     time_since_presentation_plot_name: tracy_client::PlotName,
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
+    /// Plot of how long before the target presentation time all frame fences completed.
+    frame_completion_margin_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
 }
 
 pub struct SurfaceDmabufFeedback {
     pub render: DmabufFeedback,
     pub scanout: DmabufFeedback,
+    pub r#async: DmabufFeedback,
+}
+
+/// HDR capabilities of the connected sink, parsed from its EDID (CTA HDR static metadata and
+/// colorimetry blocks).
+#[derive(Debug, Clone, Copy, Default)]
+struct EdidHdrInfo {
+    /// The sink accepts the SMPTE ST 2084 (PQ) EOTF.
+    pq: bool,
+    /// The sink supports BT.2020 RGB signal colorimetry.
+    bt2020_rgb: bool,
+    /// Desired content max luminance in cd/m² (0 = not provided).
+    max_luminance: u16,
+    /// Desired content min luminance in 0.0001 cd/m² units (0 = not provided).
+    min_luminance: u16,
+    /// Desired content max frame-average luminance in cd/m² (0 = not provided).
+    max_frame_avg_luminance: u16,
+}
+
+impl EdidHdrInfo {
+    fn from_edid(info: &libdisplay_info::info::Info) -> Self {
+        let hdr = info.hdr_static_metadata();
+        let colorimetry = info.supported_signal_colorimetry();
+        let lum_u16 = |v: f32| v.clamp(0.0, u16::MAX as f32).round() as u16;
+        Self {
+            pq: hdr.pq,
+            bt2020_rgb: colorimetry.bt2020_rgb,
+            max_luminance: lum_u16(hdr.desired_content_max_luminance),
+            // EDID reports cd/m²; the infoframe field is in 0.0001 cd/m² units.
+            min_luminance: lum_u16(hdr.desired_content_min_luminance * 10000.),
+            max_frame_avg_luminance: lum_u16(hdr.desired_content_max_frame_avg_luminance),
+        }
+    }
+
+    /// Applies the `peak-luminance` override from the output's HDR config, if any.
+    fn with_peak_luminance(self, peak_luminance: Option<f64>) -> Self {
+        let Some(peak) = peak_luminance else {
+            return self;
+        };
+        let (max_luminance, max_frame_avg_luminance) =
+            override_peak_luminance(peak, self.max_frame_avg_luminance);
+        Self {
+            max_luminance,
+            max_frame_avg_luminance,
+            ..self
+        }
+    }
 }
 
 struct GammaProps {
@@ -445,12 +557,21 @@ enum GammaMode {
     },
 }
 
-struct ConnectorProperties<'a> {
-    device: &'a DrmDevice,
-    connector: connector::Handle,
+impl GammaMode {
+    /// 是否已保存驱动原有的 gamma 状态（有则可恢复，合成器应当视 gamma LUT 为占用）。
+    fn has_previous_state(&self) -> bool {
+        match self {
+            Self::Lut { previous_blob, .. } | Self::Ctm { previous_blob, .. } => {
+                previous_blob.is_some()
+            }
+            Self::Legacy { previous_ramp, .. } => previous_ramp.is_some(),
+        }
+    }
+}
+
+/// Read-only snapshot of a connector's DRM properties.
+struct ConnectorProperties {
     properties: Vec<(property::Info, property::RawValue)>,
-    has_change: bool,
-    requests: AtomicModeReq,
 }
 
 impl Tty {
@@ -506,8 +627,14 @@ impl Tty {
             })
             .unwrap();
 
-        let api = GbmGlesBackend::with_context_priority(ContextPriority::High);
-        let gpu_manager = GpuManager::new(api).context("error creating the GPU manager")?;
+        let gpu_manager = if config.borrow().debug.vulkan_renderer {
+            let api = VulkanBackend::default();
+            TtyGpuManager::Vulkan(GpuManager::new(api).context("error creating the GPU manager")?)
+        } else {
+            let api: GbmGlesBackend<GlesRenderer, DeviceFd> =
+                GbmGlesBackend::with_context_priority(ContextPriority::High);
+            TtyGpuManager::Gles(GpuManager::new(api).context("error creating the GPU manager")?)
+        };
 
         let (primary_node, primary_render_node) = primary_node_from_config(&config.borrow())
             .ok_or(())
@@ -726,19 +853,11 @@ impl Tty {
                     // Apply pending gamma changes and restore our existing gamma.
                     let device = self.devices.get_mut(&node).unwrap();
                     for surface in device.surfaces.values_mut() {
-                        if let Ok(mut props) =
-                            ConnectorProperties::try_new(&device.drm, surface.connector)
-                        {
-                            let max_bpc = self
-                                .config
-                                .borrow()
-                                .outputs
-                                .find(&surface.name)
-                                .and_then(|o| o.max_bpc);
-                            set_connector_properties(&mut props, max_bpc, true);
-                        } else {
-                            warn!("failed to get connector properties");
-                        }
+                        // The connector color state (max bpc, HDR signalling) re-asserts itself
+                        // via the compositor's pending state on the next commit; give a rejected
+                        // state another chance after resume.
+                        surface.failed_color_state = None;
+
 
                         if let Some(gamma_props) = &mut surface.gamma_props {
                             if let Some(ramp) = surface.pending_gamma_change.take() {
@@ -819,6 +938,24 @@ impl Tty {
             let _span = tracy_client::span!("DrmDevice::new");
             DrmDevice::new(device_fd.clone(), false)
         }?;
+        let is_nvidia = drm
+            .get_driver()
+            .map(|driver| {
+                driver
+                    .name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("nvidia")
+                    || driver
+                        .description()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("nvidia")
+            })
+            .unwrap_or_else(|err| {
+                warn!("could not query DRM driver for {path:?}: {err}");
+                false
+            });
         let gbm = {
             let _span = tracy_client::span!("GbmDevice::new");
             GbmDevice::new(device_fd.device_fd())
@@ -842,7 +979,6 @@ impl Tty {
                 .flatten()
                 .unwrap_or(node);
             self.gpu_manager
-                .as_mut()
                 .add_node(render_node, gbm.clone())
                 .context("error adding render node to GPU manager")?;
 
@@ -876,23 +1012,30 @@ impl Tty {
                 debug!("bound legacy EGL to wl_display");
             }
 
-            let gles_renderer = renderer.as_gles_renderer();
-            resources::init(gles_renderer);
-            shaders::init(gles_renderer);
-            superres::init(
-                gles_renderer,
-                self.primary_render_node.dev_path().as_deref(),
-            );
+            if renderer.as_gles_renderer().is_some() {
+                let gles_renderer = renderer.as_gles_renderer().unwrap();
+                resources::init(gles_renderer);
+                shaders::init(gles_renderer);
+                blend::FrameBlendState::init(gles_renderer);
+                // 超分管线只在 GLES 上可用，Vulkan 渲染器下自动跳过。
+                superres::init(
+                    gles_renderer,
+                    self.primary_render_node.dev_path().as_deref(),
+                );
+            } else if renderer.as_vulkan_renderer().is_some() {
+                shaders::init_vulkan(renderer.as_vulkan_renderer().unwrap());
+                info!("running on the vulkan renderer");
+            }
 
             let config = self.config.borrow();
             if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
-                shaders::set_custom_resize_program(gles_renderer, Some(src));
+                shaders::set_custom_resize_program(&mut renderer, Some(src));
             }
             if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
-                shaders::set_custom_close_program(gles_renderer, Some(src));
+                shaders::set_custom_close_program(&mut renderer, Some(src));
             }
             if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
-                shaders::set_custom_open_program(gles_renderer, Some(src));
+                shaders::set_custom_open_program(&mut renderer, Some(src));
             }
             drop(config);
 
@@ -911,6 +1054,8 @@ impl Tty {
                     &default_feedback,
                 );
             assert!(self.dmabuf_global.replace(dmabuf_global).is_none());
+
+            niri.add_syncobj_state(drm.device_fd().clone());
 
             // Update the dmabuf feedbacks for all surfaces.
             for (node, device) in self.devices.iter_mut() {
@@ -950,7 +1095,9 @@ impl Tty {
                 match event {
                     DrmEvent::VBlank(crtc) => {
                         let meta = meta.expect("VBlank events must have metadata");
-                        tty.on_vblank(&mut state.niri, node, crtc, meta);
+                        if let Some(output) = tty.on_vblank(&mut state.niri, node, crtc, meta) {
+                            state.signal_fifo(&output);
+                        }
                     }
                     DrmEvent::Error(error) => warn!("DRM error: {error}"),
                 };
@@ -963,6 +1110,7 @@ impl Tty {
 
         let device = OutputDevice {
             token,
+            is_nvidia,
             render_node,
             drm,
             gbm,
@@ -1227,6 +1375,7 @@ impl Tty {
 
                 // Disable and destroy the dmabuf global.
                 if let Some(global) = self.dmabuf_global.take() {
+                    niri.remove_syncobj_state();
                     niri.dmabuf_state
                         .disable_global::<State>(&niri.display_handle, &global);
                     niri.event_loop
@@ -1254,9 +1403,9 @@ impl Tty {
             }
 
             if was_last {
-                self.gpu_manager.as_mut().remove_node(&render_node);
+                self.gpu_manager.remove_node(&render_node);
                 // Trigger re-enumeration in order to remove the device from gpu_manager.
-                let _ = self.gpu_manager.devices();
+                self.gpu_manager.refresh_devices();
             }
         }
 
@@ -1353,9 +1502,7 @@ impl Tty {
         debug!("picking mode: {mode:?}");
 
         let mut orientation = None;
-        if let Ok(mut props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
-            set_connector_properties(&mut props, config.max_bpc, true);
-
+        if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
             match props.get_panel_orientation() {
                 Ok(x) => orientation = Some(x),
                 Err(err) => {
@@ -1380,6 +1527,63 @@ impl Tty {
         let surface = device
             .drm
             .create_surface(crtc, mode, &[connector.handle()])?;
+
+        // Probe the connector's color/HDR capabilities: HDR signalling needs the Colorspace
+        // (with BT2020_RGB) and HDR_OUTPUT_METADATA properties from the driver, plus a sink
+        // that accepts the PQ EOTF per its EDID.
+        let max_bpc_range = surface
+            .max_bpc_range(connector.handle())
+            .map_err(|err| warn!("error querying max bpc range: {err:?}"))
+            .ok()
+            .flatten();
+        let supports_bt2020 = surface
+            .supported_colorspaces(connector.handle())
+            .map_err(|err| warn!("error querying supported colorspaces: {err:?}"))
+            .is_ok_and(|cs| cs.contains(&Colorspace::Bt2020Rgb));
+        let supports_hdr_metadata = surface
+            .hdr_metadata_supported(connector.handle())
+            .unwrap_or(false);
+        let edid_hdr = get_edid_info(&device.drm, connector.handle())
+            .map(|info| EdidHdrInfo::from_edid(&info))
+            .unwrap_or_default();
+        let hdr_supported = supports_bt2020 && supports_hdr_metadata && edid_hdr.pq;
+        debug!(
+            supports_bt2020,
+            supports_hdr_metadata,
+            edid_pq = edid_hdr.pq,
+            edid_bt2020_rgb = edid_hdr.bt2020_rgb,
+            ?max_bpc_range,
+            "connector color capabilities"
+        );
+        if config.hdr.is_some() && !hdr_supported {
+            warn!(
+                "output {connector_name}: hdr is enabled in the config, but the driver or \
+                 display does not support it (Colorspace BT2020_RGB: {supports_bt2020}, \
+                 HDR_OUTPUT_METADATA: {supports_hdr_metadata}, EDID PQ: {})",
+                edid_hdr.pq,
+            );
+        }
+
+        // Log the color pipelines (kernel drm_colorop API, Linux 6.19+) the primary plane
+        // offers. The DrmCompositor discovers them for every plane on its own and resolves the
+        // per-element scanout color transforms against them (see use_color_transforms), so that
+        // color-mismatched content (SDR or scRGB on a PQ output) can go direct scanout with the
+        // conversion done in the display hardware; this is diagnostics only.
+        match surface.plane_color_pipelines(surface.plane()) {
+            Ok(pipelines) if pipelines.is_empty() => {
+                debug!("primary plane offers no color pipelines");
+            }
+            Ok(pipelines) => {
+                for pipeline in &pipelines {
+                    debug!(
+                        id = pipeline.id,
+                        "primary plane color pipeline: {}",
+                        describe_color_pipeline(pipeline),
+                    );
+                }
+            }
+            Err(err) => warn!("error querying plane color pipelines: {err:?}"),
+        }
 
         // Try to enable VRR if requested.
         match surface.vrr_supported(connector.handle()) {
@@ -1432,14 +1636,20 @@ impl Tty {
             .user_data()
             .insert_if_missing(|| TtyOutputState { node, crtc });
         output.user_data().insert_if_missing(|| output_name.clone());
+        output.user_data().insert_if_missing(|| OutputHdrCaps {
+            supported: hdr_supported,
+            max_luminance: edid_hdr.max_luminance,
+            min_luminance: edid_hdr.min_luminance,
+            max_frame_avg_luminance: edid_hdr.max_frame_avg_luminance,
+        });
         if let Some(x) = orientation {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
 
         let render_node = device.render_node.unwrap_or(self.primary_render_node);
         let renderer = self.gpu_manager.single_renderer(&render_node)?;
-        let egl_context = renderer.as_ref().egl_context();
-        let render_formats = egl_context.dmabuf_render_formats();
+        let render_formats = Bind::<Dmabuf>::supported_formats(&renderer).unwrap_or_default();
+        let render_formats = &render_formats;
 
         // Filter out the CCS modifiers as they have increased bandwidth, causing some monitor
         // configurations to stop working.
@@ -1479,28 +1689,155 @@ impl Tty {
             })
             .collect::<FormatSet>();
 
-        let color_formats = if self.config.borrow().debug.disable_10bit_output {
-            &SUPPORTED_COLOR_FORMATS[..]
-        } else {
-            &SUPPORTED_COLOR_FORMATS_10BIT[..]
+        let disable_10bit_output = self.config.borrow().debug.disable_10bit_output;
+        let force_8bit = hdr_force_8bit(disable_10bit_output);
+        let wants_10bit_formats = wants_10bit_formats(&config, hdr_supported, disable_10bit_output);
+        let mut using_10bit_formats = wants_10bit_formats;
+        let mut hdr_color_formats = Vec::new();
+
+        if using_10bit_formats {
+            // Do a throwaway compositor + render_frame probe for each 10-bit format separately.
+            // Some drivers can render into AR30/AB30 but not XR30/XB30; treating 10-bit as a
+            // boolean capability would either pick a broken format or fall back too far to 8-bit.
+            for format in HDR_TEN_BIT_COLOR_FORMATS {
+                let surface = device
+                    .drm
+                    .create_surface(crtc, mode, &[connector.handle()])?;
+
+                let mut compositor: GbmDrmCompositor = match DrmCompositor::new(
+                    OutputModeSource::Auto(output.downgrade()),
+                    surface,
+                    None,
+                    device.allocator.clone(),
+                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                    std::iter::once(format),
+                    render_formats.clone(),
+                    device.drm.cursor_size(),
+                    Some(device.gbm.clone()),
+                ) {
+                    Ok(compositor) => compositor,
+                    Err(err) => {
+                        warn!(
+                            connector = connector_name,
+                            ?format,
+                            "10-bit format is not usable for DRM compositor creation: {err:?}"
+                        );
+                        continue;
+                    }
+                };
+
+                let render_ok = match self.gpu_manager.renderer(
+                    &self.primary_render_node,
+                    &render_node,
+                    compositor.format(),
+                ) {
+                    Ok(mut renderer) => {
+                        let no_elements: [SolidColorRenderElement; 0] = [];
+                        match compositor.render_frame(
+                            &mut renderer,
+                            &no_elements,
+                            [0.; 4],
+                            FrameFlags::empty(),
+                            PresentationMode::VSync,
+                        ) {
+                            Ok(_) => true,
+                            Err(err) => {
+                                warn!(
+                                    connector = connector_name,
+                                    ?format,
+                                    "10-bit format is not renderable: {err:?}"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    // Couldn't build a renderer to probe with; don't block startup — keep the
+                    // format and let the real render path try, as the previous probe did.
+                    Err(err) => {
+                        warn!(
+                            connector = connector_name,
+                            ?format,
+                            "could not probe 10-bit format renderability: {err:?}"
+                        );
+                        true
+                    }
+                };
+
+                compositor.reset_buffers();
+
+                if render_ok {
+                    debug!(
+                        connector = connector_name,
+                        ?format,
+                        "keeping renderable 10-bit format"
+                    );
+                    hdr_color_formats.push(format);
+                }
+            }
+
+            if hdr_color_formats.is_empty() {
+                warn!(
+                    connector = connector_name,
+                    "GPU can scan out but not render into any 10-bit format; using an 8-bit HDR framebuffer"
+                );
+                using_10bit_formats = false;
+            } else {
+                hdr_color_formats.extend(SDR_COLOR_FORMATS);
+            }
         }
-        .iter()
-        .copied();
+
+        let mut color_formats: &[Fourcc] = if using_10bit_formats {
+            &hdr_color_formats
+        } else {
+            &SDR_COLOR_FORMATS
+        };
 
         // Create the compositor.
-        let res = DrmCompositor::new(
+        debug!(
+            ?color_formats,
+            force_8bit,
+            hdr = config.hdr.is_some(),
+            "creating DRM compositor"
+        );
+        let mut res = DrmCompositor::new(
             OutputModeSource::Auto(output.downgrade()),
             surface,
             None,
             device.allocator.clone(),
             GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-            color_formats.clone(),
+            color_formats.iter().copied(),
             // This is only used to pick a good internal format, so it can use the surface's render
             // formats, even though we only ever render on the primary GPU.
             render_formats.clone(),
             device.drm.cursor_size(),
             Some(device.gbm.clone()),
         );
+
+        // If 10-bit formats didn't work out, fall back to plain 8-bit before trying anything
+        // else. HDR signalling still works on an 8-bit framebuffer, just with banding.
+        if res.is_err() && using_10bit_formats {
+            let err = res.as_ref().err().unwrap();
+            warn!("error creating DRM compositor with 10-bit formats, retrying 8-bit: {err:?}");
+            color_formats = &SDR_COLOR_FORMATS;
+            using_10bit_formats = false;
+
+            // DrmCompositor::new() consumed the surface...
+            let surface = device
+                .drm
+                .create_surface(crtc, mode, &[connector.handle()])?;
+
+            res = DrmCompositor::new(
+                OutputModeSource::Auto(output.downgrade()),
+                surface,
+                None,
+                device.allocator.clone(),
+                GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                color_formats.iter().copied(),
+                render_formats.clone(),
+                device.drm.cursor_size(),
+                Some(device.gbm.clone()),
+            );
+        }
 
         let mut compositor = match res {
             Ok(x) => x,
@@ -1524,7 +1861,7 @@ impl Tty {
                     None,
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-                    color_formats,
+                    color_formats.iter().copied(),
                     render_formats,
                     device.drm.cursor_size(),
                     Some(device.gbm.clone()),
@@ -1532,6 +1869,81 @@ impl Tty {
                 .context("error creating DRM compositor")?
             }
         };
+        debug!("DRM compositor created");
+
+        // Do one throwaway `render_frame` — the exact path that would fail — and, if it errors,
+        // recreate the compositor with 8-bit formats. HDR signalling still works on an 8-bit
+        // framebuffer, just with banding. Only runs for 10-bit HDR outputs, once per connector at setup.
+        if using_10bit_formats {
+            let trial_ok = match self.gpu_manager.renderer(
+                &self.primary_render_node,
+                &render_node,
+                compositor.format(),
+            ) {
+                Ok(mut renderer) => {
+                    let no_elements: [SolidColorRenderElement; 0] = [];
+                    match compositor.render_frame(
+                        &mut renderer,
+                        &no_elements,
+                        [0.; 4],
+                        FrameFlags::empty(),
+                        PresentationMode::VSync,
+                    ) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            warn!(
+                                connector = connector_name,
+                                "GPU can scan out but not render into 10-bit ({err:?}); \
+                                 using an 8-bit HDR framebuffer"
+                            );
+                            false
+                        }
+                    }
+                }
+                // Couldn't build a renderer to probe with; don't block startup — let the real
+                // render path try, and its own error handling take over.
+                Err(err) => {
+                    warn!("could not probe 10-bit renderability: {err:?}");
+                    true
+                }
+            };
+            // Discard whatever the trial left in the swapchain so the first real frame is clean.
+            compositor.reset_buffers();
+
+            if !trial_ok {
+                color_formats = &SDR_COLOR_FORMATS;
+                // Drop the 10-bit compositor first so its surface releases the CRTC before we
+                // create a fresh 8-bit surface for it. (The trial only rendered; it never queued
+                // or committed, so the CRTC was not modeset.)
+                drop(compositor);
+                let surface = device
+                    .drm
+                    .create_surface(crtc, mode, &[connector.handle()])?;
+                compositor = DrmCompositor::new(
+                    OutputModeSource::Auto(output.downgrade()),
+                    surface,
+                    None,
+                    device.allocator.clone(),
+                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                    color_formats.iter().copied(),
+                    render_formats.clone(),
+                    device.drm.cursor_size(),
+                    Some(device.gbm.clone()),
+                )
+                .context("error creating 8-bit DRM compositor after 10-bit render probe failed")?;
+            }
+        }
+
+        // Stage the initial connector color state (SDR, with the configured max bpc) so it
+        // rides the initial modeset as part of the same atomic commit.
+        let max_bpc = effective_max_bpc(&config, &max_bpc_range);
+        if let Err(err) = compositor.use_color_state(ConnectorColorState {
+            colorspace: Colorspace::Default,
+            hdr_metadata: None,
+            max_bpc,
+        }) {
+            warn!("error staging initial connector color state: {err:?}");
+        }
 
         if self.debug_tint {
             compositor.set_debug_flags(DebugFlags::TINT);
@@ -1575,20 +1987,32 @@ impl Tty {
         let presentation_misprediction_plot_name = tracy_client::PlotName::new_leak(format!(
             "{connector_name} presentation misprediction, ms"
         ));
+        let frame_completion_margin_plot_name = tracy_client::PlotName::new_leak(format!(
+            "{connector_name} frame completion margin, ms"
+        ));
         let sequence_delta_plot_name =
             tracy_client::PlotName::new_leak(format!("{connector_name} sequence delta"));
 
         let surface = Surface {
             name: output_name,
             connector: connector.handle(),
+            hdr_supported,
+            edid_hdr,
+            max_bpc_range,
+            wants_10bit_formats,
+            failed_color_state: None,
+            last_blend: None,
             compositor,
             dmabuf_feedback,
+            was_direct_scanout: None,
             gamma_props,
             pending_gamma_change: None,
+            post_blend_unsupported_logged: false,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
             presentation_misprediction_plot_name,
+            frame_completion_margin_plot_name,
             sequence_delta_plot_name,
         };
 
@@ -1665,7 +2089,7 @@ impl Tty {
         node: DrmNode,
         crtc: crtc::Handle,
         meta: DrmEventMetadata,
-    ) {
+    ) -> Option<Output> {
         let span = tracy_client::span!("Tty::on_vblank");
 
         let now = get_monotonic_time();
@@ -1673,12 +2097,12 @@ impl Tty {
         let Some(device) = self.devices.get_mut(&node) else {
             // I've seen it happen.
             error!("missing device in vblank callback for crtc {crtc:?}");
-            return;
+            return None;
         };
 
         let Some(surface) = device.surfaces.get_mut(&crtc) else {
             error!("missing surface in vblank callback for crtc {crtc:?}");
-            return;
+            return None;
         };
 
         // Finish the Tracy frame, if any.
@@ -1736,12 +2160,12 @@ impl Tty {
             .cloned()
         else {
             error!("missing output in global space for {name}");
-            return;
+            return None;
         };
 
         let Some(output_state) = niri.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
-            return;
+            return None;
         };
 
         let refresh_interval = output_state.frame_clock.refresh_interval();
@@ -1752,24 +2176,41 @@ impl Tty {
             presentation_time
         };
 
-        if output_state
-            .vblank_throttle
-            .throttle(refresh_interval, time, move |state| {
-                let meta = DrmEventMetadata {
-                    sequence: meta.sequence,
-                    time: DrmEventTime::Monotonic(Duration::ZERO),
-                };
+        let presentation_mode = surface
+            .compositor
+            .pending_frame()
+            .map(|frame| frame.presentation_mode);
 
-                let tty = state.backend.tty();
-                tty.on_vblank(&mut state.niri, node, crtc, meta);
-            })
+        if presentation_mode != Some(PresentationMode::Async)
+            && output_state
+                .vblank_throttle
+                .throttle(refresh_interval, time, move |state| {
+                    let meta = DrmEventMetadata {
+                        sequence: meta.sequence,
+                        time: DrmEventTime::Monotonic(Duration::ZERO),
+                    };
+
+                    if let Some(output) =
+                        state
+                            .backend
+                            .tty()
+                            .on_vblank(&mut state.niri, node, crtc, meta)
+                    {
+                        state.signal_fifo(&output);
+                    }
+                })
         {
             // Throttled.
-            return;
+            return None;
         }
 
         let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
             RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
+            state @ RedrawState::WaitingForFrameCompletion { .. } => {
+                error!("received vblank while waiting for frame completion on {name}");
+                output_state.redraw_state = state;
+                return None;
+            }
             state @ (RedrawState::Idle
             | RedrawState::Queued
             | RedrawState::WaitingForEstimatedVBlank(_)
@@ -1789,7 +2230,7 @@ impl Tty {
 
         // Mark the last frame as submitted.
         match surface.compositor.frame_submitted() {
-            Ok(Some((mut feedback, target_presentation_time))) => {
+            Ok((mut feedback, target_presentation_time)) => {
                 let refresh = match refresh_interval {
                     Some(refresh) => {
                         if output_state.frame_clock.vrr() {
@@ -1803,8 +2244,11 @@ impl Tty {
 
                 // FIXME: ideally should be monotonically increasing for a surface.
                 let seq = meta.sequence as u64;
-                let mut flags = wp_presentation_feedback::Kind::Vsync
-                    | wp_presentation_feedback::Kind::HwCompletion;
+                let mut flags = wp_presentation_feedback::Kind::HwCompletion;
+
+                if presentation_mode != Some(PresentationMode::Async) {
+                    flags.insert(wp_presentation_feedback::Kind::Vsync);
+                }
 
                 if !presentation_time.is_zero() {
                     flags.insert(wp_presentation_feedback::Kind::HwClock);
@@ -1821,9 +2265,27 @@ impl Tty {
                     );
                 }
             }
-            Ok(None) => (),
+            Err(FrameError::EmptyFrame) => (),
             Err(err) => {
-                warn!("error marking frame as submitted: {err}");
+                let err: SwapBuffersError = err.into();
+                warn!("error marking frame as submitted: {err:?}");
+            }
+        }
+
+        // A gamma change deferred by the post-blend encode offload can go through once the
+        // compositor has committed a frame resetting the gamma LUT.
+        let gamma_deferred = surface.pending_gamma_change.is_some();
+        if gamma_deferred && !surface.compositor.post_blend_encode_owns_gamma() {
+            let ramp = surface.pending_gamma_change.take().unwrap();
+            let res = if let Some(gamma_props) = &mut surface.gamma_props {
+                gamma_props.set_gamma(&device.drm, ramp)
+            } else {
+                // 没有 GammaProps 时走旧式 CRTC gamma，长度从 ramp 推断；重置时用最小通用尺寸。
+                let gamma_length = ramp.as_ref().map_or(256, |r| (r.len() / 3) as u32);
+                set_gamma_for_crtc(&device.drm, crtc, gamma_length, ramp.as_deref())
+            };
+            if let Err(err) = res {
+                warn!("error applying deferred gamma change: {err:?}");
             }
         }
 
@@ -1847,9 +2309,11 @@ impl Tty {
         } else {
             niri.send_frame_callbacks(&output);
         }
+
+        Some(output)
     }
 
-    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) {
+    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) -> Output {
         let span = tracy_client::span!("Tty::on_estimated_vblank_timer");
 
         let name = output.name();
@@ -1857,7 +2321,7 @@ impl Tty {
 
         let Some(output_state) = niri.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
-            return;
+            return output;
         };
 
         // We waited for the timer, now we can send frame callbacks again.
@@ -1867,11 +2331,12 @@ impl Tty {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => unreachable!(),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
+            RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(_) => (),
             // The timer fired just in front of a redraw.
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
                 output_state.redraw_state = RedrawState::Queued;
-                return;
+                return output;
             }
         }
 
@@ -1888,10 +2353,20 @@ impl Tty {
                 niri.send_frame_callbacks(&output);
             }
         }
+
+        output
     }
 
     pub fn seat_name(&self) -> String {
         self.session.seat()
+    }
+
+    pub fn primary_renderer(&mut self) -> Option<super::PrimaryRenderer<'_>> {
+        let renderer = self
+            .gpu_manager
+            .single_renderer(&self.primary_render_node)
+            .ok()?;
+        Some(super::PrimaryRenderer::Tty(renderer))
     }
 
     pub fn with_primary_renderer<T>(
@@ -1902,7 +2377,8 @@ impl Tty {
             .gpu_manager
             .single_renderer(&self.primary_render_node)
             .ok()?;
-        Some(f(renderer.as_gles_renderer()))
+        let gles_renderer = renderer.as_gles_renderer()?;
+        Some(f(gles_renderer))
     }
 
     pub fn primary_render_node(&mut self) -> Option<DrmNode> {
@@ -1947,6 +2423,194 @@ impl Tty {
             return rv;
         }
 
+        // Reconcile the output's blend space and HDR signalling with the config and content.
+        //
+        // With hdr mode="on", the connector stays in HDR (BT.2020 + PQ) and the desktop is
+        // composited into that blend space. In auto mode, HDR engages only while a fullscreen
+        // surface carries an HDR image description (passthrough), so the output is SDR
+        // otherwise.
+        //
+        // The connector state is only *staged* here; smithay applies it inside its own commit
+        // as a single atomic modeset together with mode, CRTC and plane state (committing
+        // connector color properties standalone hangs some drivers, notably nvidia).
+        let (blend_hdr, reference_luminance, edid_hdr) = {
+            let config = self.config.borrow();
+            let output_config = config.outputs.find(&surface.name);
+            let hdr_config = output_config.and_then(|o| o.hdr.clone());
+            let edid_hdr = surface.edid_hdr.with_peak_luminance(
+                hdr_config
+                    .as_ref()
+                    .and_then(|h| h.peak_luminance)
+                    .map(|v| v.0),
+            );
+            let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
+            let max_bpc = output_config
+                .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
+                .unwrap_or(None);
+            let always_on = hdr_config.as_ref().is_some_and(|h| h.mode == HdrMode::On);
+            let reference_luminance = hdr_config
+                .as_ref()
+                .and_then(|h| h.reference_luminance)
+                .map(|v| v.0)
+                .unwrap_or(DEFAULT_REFERENCE_LUMINANCE);
+            drop(config);
+
+            let hdr_desc = hdr_allowed
+                .then(|| niri.output_hdr_image_description(output))
+                .flatten();
+            let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
+
+            let desired = if blend_hdr {
+                // The HDR metadata stays fixed for as long as the output stays in HDR. Any change
+                // of the infoframe is a full modeset on nvidia whenever the GPU has a non-HDMI
+                // connector (NVKMS only synchronizes infoframes with flips on all-HDMI devices),
+                // which blanks the screen through the fullscreen animation. Niri maps content to
+                // the display's own peak luminance anyway, so the content's metadata tells the
+                // sink little.
+                //
+                // With mode="on" it always comes from the sink's EDID. In auto mode, entering HDR
+                // is a modeset regardless, so it is taken from the content that engages HDR and
+                // then kept until HDR is left.
+                let edid_desc = ImageDescription {
+                    transfer: CmTransferFunction::St2084Pq,
+                    primaries: CmPrimariesOption {
+                        named: Some(CmPrimaries::Bt2020),
+                        values: None,
+                    },
+                    max_cll: None,
+                    max_fall: None,
+                    mastering_luminance: None,
+                    mastering_primaries: None,
+                    luminances: None,
+                    windows_scrgb: false,
+                    windows_bt2100: false,
+                };
+                let pending = surface.compositor.pending_color_state();
+                let hdr_metadata = match pending.hdr_metadata {
+                    Some(metadata) if !always_on && pending.colorspace == Colorspace::Bt2020Rgb => {
+                        metadata
+                    }
+                    _ if always_on => build_hdr_metadata(&edid_desc, &edid_hdr),
+                    _ => build_hdr_metadata(hdr_desc.as_ref().unwrap_or(&edid_desc), &edid_hdr),
+                };
+                ConnectorColorState {
+                    colorspace: Colorspace::Bt2020Rgb,
+                    hdr_metadata: Some(hdr_metadata),
+                    max_bpc,
+                }
+            } else {
+                ConnectorColorState {
+                    colorspace: Colorspace::Default,
+                    hdr_metadata: None,
+                    max_bpc,
+                }
+            };
+
+            if surface.compositor.pending_color_state() != desired
+                && surface.failed_color_state != Some(desired)
+            {
+                match surface.compositor.use_color_state(desired) {
+                    Ok(()) => {
+                        surface.failed_color_state = None;
+                        info!(
+                            connector = surface.name.connector,
+                            hdr = desired.hdr_metadata.is_some(),
+                            "updated HDR signalling to match content"
+                        );
+                    }
+                    Err(err) => {
+                        surface.failed_color_state = Some(desired);
+                        warn!("failed to update HDR signalling: {err:?}");
+                    }
+                }
+            }
+
+            (blend_hdr, reference_luminance, edid_hdr)
+        };
+
+        // Per-element scanout color transforms: reproduce the blend shaders' conversions in
+        // the plane color pipeline (kernel 6.19+ drm_colorop) so color-mismatched fullscreen
+        // content can still be scanned out directly. On HDR outputs, unlisted elements are
+        // denied scanout entirely so raw values can never bypass the blend space. On SDR
+        // outputs the shaders assume the default reference white regardless of config.
+        // Content the shaders would tone map is denied scanout too (the parametric pipeline
+        // cannot express the curve), so composition and scanout never disagree.
+        let scanout_ref_lum = if blend_hdr {
+            reference_luminance
+        } else {
+            DEFAULT_REFERENCE_LUMINANCE
+        };
+        let peak_luminance =
+            blend::output_peak_luminance(blend_hdr, scanout_ref_lum, edid_hdr.max_luminance);
+        #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+        let transforms =
+            niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum, peak_luminance);
+
+        // Planes whose color pipelines can't apply the PQ encode (nvidia's always end in linear
+        // light) can still scan out a single fullscreen surface by moving the encode behind
+        // blending, onto the CRTC gamma LUT. The compositor owns the gamma LUT while this is
+        // enabled, so gamma-control ramps keep it disabled (see Tty::set_gamma).
+        let gamma_in_use = surface.pending_gamma_change.is_some()
+            || surface
+                .gamma_props
+                .as_ref()
+                .is_some_and(|props| props.mode.has_previous_state());
+        let post_blend =
+            (blend_hdr && !gamma_in_use && self.config.borrow().debug.scanout_post_blend_encode)
+                .then(|| blend::hdr_post_blend_encode(peak_luminance));
+        #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+        let linear_transforms = match post_blend {
+            Some(encode) => transforms
+                .iter()
+                .filter_map(|(id, transform)| {
+                    let linear = blend::post_blend_linear_transform((*transform)?, encode)?;
+                    Some((id.clone(), linear))
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+
+        surface
+            .compositor
+            .use_color_transforms(transforms, blend_hdr);
+        let post_blend_enabled = surface
+            .compositor
+            .use_post_blend_encode(post_blend, linear_transforms);
+        if post_blend.is_some() && !post_blend_enabled && !surface.post_blend_unsupported_logged {
+            surface.post_blend_unsupported_logged = true;
+            debug!(
+                connector = surface.name.connector,
+                "post-blend encode offload unsupported (no GAMMA_LUT or primary plane color pipelines)"
+            );
+        }
+
+        // A blend-space change alters what every shader outputs without any element damage;
+        // force a full redraw. The cursor plane's contents bypass the renderer entirely, so
+        // they get the equivalent sRGB-to-PQ encode on the CPU instead.
+        let blend = blend_hdr.then_some((reference_luminance, peak_luminance));
+        if surface.last_blend != Some(blend) {
+            surface.last_blend = Some(blend);
+            surface.compositor.reset_buffers();
+            surface
+                .compositor
+                .set_cursor_buffer_transform(blend.map(|(ref_lum, _)| {
+                    let encoder = blend::SrgbToPqEncoder::new((ref_lum / 10000.) as f32);
+                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    }) as Box<_>
+                }));
+            // Frames offloading the PQ encode to the gamma LUT (see use_post_blend_encode above)
+            // need the cursor in the same normalized linear light as the scanned out surface.
+            surface
+                .compositor
+                .set_cursor_buffer_transform_post_blend(blend.map(|(ref_lum, peak_lum)| {
+                    let encoder = blend::SrgbToPqEncoder::new_linear((ref_lum / peak_lum) as f32);
+                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    }) as Box<_>
+                }));
+        }
+
         let mut renderer = match self.gpu_manager.renderer(
             &self.primary_render_node,
             &device.render_node.unwrap_or(self.primary_render_node),
@@ -1968,7 +2632,7 @@ impl Tty {
             scanout_node = %tty_state.node,
         )
         .entered();
-        let cross_gpu_output = renderer.target_as_ref().is_some();
+        let cross_gpu_output = renderer.gles_target_ref().is_some();
         // Rendering through a second GPU is what the Hybrid work looks at, so that case keeps its
         // DEBUG entry; the same route is logged for every frame of every other output, which is
         // only interesting when the diagnostics are turned all the way up.
@@ -1976,8 +2640,8 @@ impl Tty {
             ($level:ident) => {
                 $level!(
                     target: GPU_LOG_TARGET,
-                    render_gpu = ?GpuDebug::renderer(renderer.as_ref()),
-                    target_gpu = ?renderer.target_as_ref().map(GpuDebug::renderer),
+                    render_gpu = ?renderer.gles_renderer_ref().map(GpuDebug::renderer),
+                    target_gpu = ?renderer.gles_target_ref().map(GpuDebug::renderer),
                     cross_gpu_output,
                     format = ?surface.compositor.format(),
                     "output render route (render GPU executes passes; target GPU receives output)",
@@ -2006,7 +2670,7 @@ impl Tty {
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
         // system.
-        let flags = {
+        let (flags, presentation_mode) = {
             let debug = &self.config.borrow().debug;
 
             let primary_scanout_flag = if debug.restrict_primary_scanout_to_matching_format {
@@ -2015,6 +2679,12 @@ impl Tty {
                 FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
             };
             let mut flags = primary_scanout_flag | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+
+            let presentation_mode = if debug.force_tearing || niri.output_allows_tearing(output) {
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
 
             if debug.enable_overlay_planes {
                 flags.insert(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
@@ -2033,14 +2703,76 @@ impl Tty {
                 }
             }
 
-            flags
+            if blend_hdr {
+                // The cursor plane is filled without going through GLES; its contents get a
+                // CPU blend-space encode on every cursor image change instead (see
+                // set_cursor_buffer_transform above). A composited cursor is an extra
+                // element on top of fullscreen content, blocking primary-plane direct
+                // scan-out whenever it's visible, so the plane stays on by default (the
+                // LUT-accelerated encode is cheap) with a debug opt-out.
+                if debug.disable_cursor_plane_on_hdr {
+                    flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+                } else if !niri.cursor_content_is_plain_sdr() {
+                    // The CPU encode assumes plain sRGB content; the rare non-SDR client
+                    // cursor falls back to primary-plane composition.
+                    flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+                }
+                // Primary- and overlay-plane scanout stay allowed: every window surface has a
+                // scanout color transform (see use_color_transforms above), so mismatched
+                // content is converted by the plane's color pipeline, composited when the
+                // hardware can't express the conversion, and unlisted elements are denied
+                // scanout.
+            }
+
+            (flags, presentation_mode)
         };
 
         // Hand them over to the DRM.
+        set_frame_blend_tty(&mut renderer, blend);
         let drm_compositor = &mut surface.compositor;
-        match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
+        let render_frame_result = drm_compositor.render_frame::<_, _>(
+            &mut renderer,
+            &elements,
+            [0.; 4],
+            flags,
+            presentation_mode,
+        );
+        set_frame_blend_tty(&mut renderer, None);
+        match render_frame_result {
             Ok(res) => {
-                let needs_sync = res.needs_sync()
+                // Log primary-plane scan-out transitions with the per-element denial
+                // reasons: on Nvidia the plane color pipelines reject most transforms
+                // (ColorTransformUnsupported), and this makes the fallback visible in logs.
+                let is_direct_scanout =
+                    !matches!(res.primary_element, PrimaryPlaneElement::Swapchain(_));
+                if surface.was_direct_scanout != Some(is_direct_scanout) {
+                    if is_direct_scanout {
+                        debug!(
+                            connector = surface.name.connector,
+                            "direct scan-out engaged on primary plane"
+                        );
+                    } else {
+                        let denied: Vec<_> = res
+                            .states
+                            .states
+                            .values()
+                            .filter_map(|state| match state.presentation_state {
+                                RenderElementPresentationState::Rendering {
+                                    reason: Some(reason),
+                                } => Some(reason),
+                                _ => None,
+                            })
+                            .collect();
+                        debug!(
+                            connector = surface.name.connector,
+                            ?denied,
+                            "compositing on primary plane"
+                        );
+                    }
+                    surface.was_direct_scanout = Some(is_direct_scanout);
+                }
+
+                let wait_for_frame_completion = device.is_nvidia
                     || self
                         .config
                         .borrow()
@@ -2050,11 +2782,31 @@ impl Tty {
                     target: GPU_LOG_TARGET,
                     empty = res.is_empty,
                     primary_is_swapchain = matches!(&res.primary_element, PrimaryPlaneElement::Swapchain(_)),
-                    ?needs_sync,
+                    ?wait_for_frame_completion,
                     "DRM frame prepared (swapchain composition vs direct primary-plane scanout)",
                 );
-                if needs_sync {
-                    if let PrimaryPlaneElement::Swapchain(element) = res.primary_element {
+                let mut completion_fences = Vec::new();
+                if wait_for_frame_completion {
+                    // Take every plane's synchronization point out of Smithay. Once they have all
+                    // completed, queue_frame() will submit the frame without IN_FENCE_FD.
+                    for sync in drm_compositor.take_pending_frame_sync_points() {
+                        if sync.is_reached() {
+                            continue;
+                        }
+
+                        if let Some(fd) = sync.export() {
+                            completion_fences.push((fd, sync));
+                        } else {
+                            // An unexportable fence cannot be integrated into calloop. This should
+                            // be unusual, so retain the old blocking behavior as a safe fallback.
+                            let _span = tracy_client::span!("wait for completion fallback");
+                            if let Err(err) = sync.wait() {
+                                warn!("error waiting for frame completion: {err:?}");
+                            }
+                        }
+                    }
+                } else if res.needs_sync() {
+                    if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
                         let _span = tracy_client::span!("wait for completion");
                         trace!(
                             target: GPU_LOG_TARGET,
@@ -2063,6 +2815,17 @@ impl Tty {
                         );
                         if let Err(err) = element.sync.wait() {
                             warn!("error waiting for frame completion: {err:?}");
+                        }
+                    }
+                }
+
+                // Stamp the frame's render fence onto the sampled buffers, so explicit-sync
+                // release points signal on GPU completion rather than on buffer replacement.
+                if niri.syncobj_state.is_some() && !res.is_empty {
+                    if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
+                        let _span = tracy_client::span!("export release fence");
+                        if let Some(fence) = element.sync.export() {
+                            niri.stamp_release_fences(output, fence.as_fd());
                         }
                     }
                 }
@@ -2077,6 +2840,80 @@ impl Tty {
                         niri.take_presentation_feedbacks(output, &res.states);
                     let data = (presentation_feedbacks, target_presentation_time);
 
+                    if !completion_fences.is_empty() {
+                        let node = tty_state.node;
+                        let crtc = tty_state.crtc;
+                        let pending = Rc::new(RefCell::new(PendingFrameSubmission {
+                            remaining_sync_points: completion_fences.len(),
+                            data: Some(data),
+                        }));
+                        let mut tokens = Vec::with_capacity(completion_fences.len());
+
+                        for (completion_fd, completion_sync) in completion_fences {
+                            let pending = pending.clone();
+                            let callback_output = output.clone();
+                            let source =
+                                Generic::new(completion_fd, Interest::READ, EventMode::OneShot);
+                            let token = niri
+                                .event_loop
+                                .insert_source(source, move |_, _, state| {
+                                    // The fd is the non-blocking wake-up mechanism. Verify the
+                                    // original sync point as well before considering this plane
+                                    // complete, in case a driver wakes the native fd prematurely.
+                                    let _span = tracy_client::span!("verify frame completion");
+                                    if !completion_sync.is_reached() {
+                                        debug!(
+                                            "native fence fd became readable before its sync point was signalled"
+                                        );
+                                    }
+                                    if let Err(err) = completion_sync.wait() {
+                                        warn!("error verifying frame completion: {err:?}");
+                                    }
+
+                                    let data = {
+                                        let mut pending = pending.borrow_mut();
+                                        pending.remaining_sync_points -= 1;
+                                        if pending.remaining_sync_points == 0 {
+                                            pending.data.take()
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    if let Some(data) = data {
+                                        state.backend.tty().queue_frame_after_completion(
+                                            &mut state.niri,
+                                            node,
+                                            crtc,
+                                            &callback_output,
+                                            data,
+                                        );
+                                    }
+                                    Ok(PostAction::Remove)
+                                })
+                                .unwrap();
+                            tokens.push(token);
+                        }
+
+                        let output_state = niri.output_state.get_mut(output).unwrap();
+                        let new_state = RedrawState::WaitingForFrameCompletion {
+                            tokens,
+                            redraw_needed: false,
+                        };
+                        match mem::replace(&mut output_state.redraw_state, new_state) {
+                            RedrawState::Idle => unreachable!(),
+                            RedrawState::Queued => (),
+                            RedrawState::WaitingForVBlank { .. } => unreachable!(),
+                            RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
+                            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
+                            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                                niri.event_loop.remove(token);
+                            }
+                        }
+
+                        return RenderResult::Submitted;
+                    }
+
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
                             let output_state = niri.output_state.get_mut(output).unwrap();
@@ -2087,6 +2924,7 @@ impl Tty {
                                 RedrawState::Idle => unreachable!(),
                                 RedrawState::Queued => (),
                                 RedrawState::WaitingForVBlank { .. } => unreachable!(),
+                                RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
                                 RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
                                 RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
                                     niri.event_loop.remove(token);
@@ -2102,7 +2940,7 @@ impl Tty {
                             return RenderResult::Submitted;
                         }
                         Err(err) => {
-                            warn!("error queueing frame: {err}");
+                            warn!("error queueing frame: {err:?}");
                         }
                     }
                 } else {
@@ -2122,6 +2960,81 @@ impl Tty {
         queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
 
         rv
+    }
+
+    fn queue_frame_after_completion(
+        &mut self,
+        niri: &mut Niri,
+        node: DrmNode,
+        crtc: crtc::Handle,
+        output: &Output,
+        data: FrameUserData,
+    ) {
+        let _span = tracy_client::span!("Tty::queue_frame_after_completion");
+        let name = output.name();
+
+        let Some(output_state) = niri.output_state.get_mut(output) else {
+            // The output was removed while its event source was ready to dispatch.
+            return;
+        };
+        let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+            RedrawState::WaitingForFrameCompletion { redraw_needed, .. } => redraw_needed,
+            state => {
+                error!("unexpected redraw state after frame completion on {name}: {state:?}");
+                output_state.redraw_state = state;
+                return;
+            }
+        };
+
+        let target_presentation_time = data.1;
+        let completion_margin_ms =
+            (target_presentation_time.as_secs_f64() - get_monotonic_time().as_secs_f64()) * 1000.;
+        let queue_result = self
+            .devices
+            .get_mut(&node)
+            .and_then(|device| device.surfaces.get_mut(&crtc))
+            .ok_or_else(|| anyhow!("output surface disappeared"))
+            .and_then(|surface| {
+                tracy_client::Client::running().unwrap().plot(
+                    surface.frame_completion_margin_plot_name,
+                    completion_margin_ms,
+                );
+                surface
+                    .compositor
+                    .queue_frame(data)
+                    .map_err(anyhow::Error::from)
+            });
+
+        match queue_result {
+            Ok(()) => {
+                let output_state = niri.output_state.get_mut(output).unwrap();
+                output_state.redraw_state = RedrawState::WaitingForVBlank { redraw_needed };
+
+                // The client buffers are latched only now, at actual KMS submission time.
+                output_state.frame_callback_sequence =
+                    output_state.frame_callback_sequence.wrapping_add(1);
+                niri.send_frame_callbacks(output);
+            }
+            Err(err) => {
+                warn!("error queueing frame after completion on {name}: {err}");
+
+                if let Some(surface) = self
+                    .devices
+                    .get_mut(&node)
+                    .and_then(|device| device.surfaces.get_mut(&crtc))
+                {
+                    drop(surface.vblank_frame.take());
+                }
+
+                // Match the normal render failure path: throttle until the predicted vblank,
+                // while preserving a redraw requested during the fence wait.
+                niri.output_state.get_mut(output).unwrap().redraw_state = RedrawState::Queued;
+                queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+                if redraw_needed {
+                    niri.queue_redraw(output);
+                }
+            }
+        }
     }
 
     pub fn change_vt(&mut self, vt: i32) {
@@ -2163,7 +3076,7 @@ impl Tty {
         let _span = debug_span!(
             target: GPU_LOG_TARGET,
             "dmabuf-validation",
-            requested_render_gpu = ?GpuDebug::renderer(renderer.as_ref()),
+            requested_render_gpu = ?renderer.gles_renderer_ref().map(GpuDebug::renderer),
             original_buffer = ?DmabufDebug(dmabuf),
         )
         .entered();
@@ -2177,7 +3090,7 @@ impl Tty {
                 debug!(
                     target: GPU_LOG_TARGET,
                     import_node_hint_after = ?dmabuf.node().map(|node| node.to_string()),
-                    native_texture_in_requested_context = ?native_texture(&texture, &renderer.as_ref().context_id()).as_ref().map(TextureDebug),
+                    native_texture_in_requested_context = ?renderer.gles_renderer_ref().and_then(|r| native_texture(&texture, &r.context_id())).as_ref().map(TextureDebug),
                     accepted = true,
                     "dmabuf validation complete; exporter and copy path unknown",
                 );
@@ -2243,6 +3156,16 @@ impl Tty {
         }
     }
 
+    /// Whether a gamma change is waiting to be applied, e.g. for the post-blend encode offload
+    /// to release the gamma LUT, which takes a redraw.
+    pub fn has_pending_gamma_change(&self, output: &Output) -> bool {
+        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        self.devices
+            .get(&tty_state.node)
+            .and_then(|device| device.surfaces.get(&tty_state.crtc))
+            .is_some_and(|surface| surface.pending_gamma_change.is_some())
+    }
+
     pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> anyhow::Result<()> {
         let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
             bail!(
@@ -2259,8 +3182,11 @@ impl Tty {
             .context("missing device")?;
         let surface = device.surfaces.get_mut(&crtc).context("missing surface")?;
 
-        // Cannot change properties while the device is inactive.
-        if !self.session.is_active() {
+        // Cannot change properties while the device is inactive, nor while the compositor
+        // owns the gamma LUT for the post-blend encode offload. In the latter case the pending
+        // change disables the offload on the next frame, and is applied on the vblank after the
+        // gamma LUT was reset (see on_vblank).
+        if !self.session.is_active() || surface.compositor.post_blend_encode_owns_gamma() {
             surface.pending_gamma_change = Some(ramp);
             return Ok(());
         }
@@ -2724,6 +3650,23 @@ impl Tty {
                     continue;
                 };
 
+                // The scanout format list (8-bit vs 10-bit) is fixed when the compositor is
+                // created, so toggling HDR would otherwise leave an output that was set up as SDR
+                // rendering PQ into an 8-bit framebuffer. Recreate the output instead; entering or
+                // leaving HDR is a full modeset anyway.
+                let disable_10bit_output = self.config.borrow().debug.disable_10bit_output;
+                if wants_10bit_formats(&config, surface.hdr_supported, disable_10bit_output)
+                    != surface.wants_10bit_formats
+                {
+                    debug!(
+                        "output {:?}: hdr changed, recreating to switch scanout formats",
+                        surface.name.connector
+                    );
+                    to_disconnect.push((node, crtc));
+                    to_connect.push((node, connector.clone(), crtc, surface.name.clone()));
+                    continue;
+                }
+
                 let mut mode = None;
                 if let Some(modeline) = &config.modeline {
                     match calculate_drm_mode_from_modeline(modeline) {
@@ -2749,12 +3692,10 @@ impl Tty {
                     },
                 };
 
-                if let Ok(mut props) = ConnectorProperties::try_new(&device.drm, surface.connector)
-                {
-                    set_connector_properties(&mut props, config.max_bpc, false);
-                } else {
-                    warn!("failed to get connector properties");
-                }
+                // max-bpc and hdr changes flow through the render loop's color state
+                // reconciliation; give a previously rejected state another chance with the
+                // new config.
+                surface.failed_color_state = None;
 
                 let change_mode = surface.compositor.pending_mode() != mode;
 
@@ -3222,6 +4163,21 @@ fn surface_dmabuf_feedback(
         .chain(planes.overlay.iter().flat_map(|p| p.formats.iter()))
         .copied()
         .collect::<FormatSet>();
+    let primary_async_formats = surface
+        .plane_info()
+        .formats_async
+        .clone()
+        .unwrap_or_else(|| primary_plane_formats.clone());
+    let primary_or_overlay_async_formats = primary_async_formats
+        .iter()
+        .chain(
+            planes
+                .overlay
+                .iter()
+                .flat_map(|p| p.formats_async.as_ref().unwrap_or(&p.formats).iter()),
+        )
+        .copied()
+        .collect::<FormatSet>();
 
     // We limit the scan-out trache to formats we can also render from so that there is always a
     // fallback render path available in case the supplied buffer can not be scanned out directly.
@@ -3230,6 +4186,14 @@ fn surface_dmabuf_feedback(
         .copied()
         .collect::<Vec<_>>();
     let mut primary_or_overlay_scanout_formats = primary_or_overlay_plane_formats
+        .intersection(&primary_formats)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut primary_scanout_async_formats = primary_async_formats
+        .intersection(&primary_formats)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut primary_or_overlay_scanout_async_formats = primary_or_overlay_async_formats
         .intersection(&primary_formats)
         .copied()
         .collect::<Vec<_>>();
@@ -3242,6 +4206,8 @@ fn surface_dmabuf_feedback(
     if surface_render_node != Some(primary_render_node) {
         primary_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
         primary_or_overlay_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
+        primary_scanout_async_formats.retain(|f| f.modifier == Modifier::Linear);
+        primary_or_overlay_scanout_async_formats.retain(|f| f.modifier == Modifier::Linear);
     }
 
     let builder = DmabufFeedbackBuilder::new(primary_render_node.dev_id(), primary_formats);
@@ -3270,6 +4236,21 @@ fn surface_dmabuf_feedback(
             4..=6,
         )
         .build()?;
+    let r#async = builder
+        .clone()
+        .add_preference_tranche(
+            surface_scanout_node.dev_id(),
+            TrancheFlags::Scanout,
+            primary_scanout_async_formats,
+            4..=6,
+        )
+        .add_preference_tranche(
+            surface_scanout_node.dev_id(),
+            TrancheFlags::Scanout,
+            primary_or_overlay_scanout_async_formats,
+            4..=6,
+        )
+        .build()?;
 
     // If this is the primary node surface, send scanout formats in both tranches to avoid
     // duplication.
@@ -3279,7 +4260,11 @@ fn surface_dmabuf_feedback(
         builder.build()?
     };
 
-    Ok(SurfaceDmabufFeedback { render, scanout })
+    Ok(SurfaceDmabufFeedback {
+        render,
+        scanout,
+        r#async,
+    })
 }
 
 fn find_drm_property(
@@ -3353,6 +4338,7 @@ fn queue_estimated_vblank_timer(
         RedrawState::Idle => unreachable!(),
         RedrawState::Queued => (),
         RedrawState::WaitingForVBlank { .. } => unreachable!(),
+        RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
         RedrawState::WaitingForEstimatedVBlank(token)
         | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
             output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
@@ -3380,9 +4366,11 @@ fn queue_estimated_vblank_timer(
     let token = niri
         .event_loop
         .insert_source(timer, move |_, _, data| {
-            data.backend
+            let output = data
+                .backend
                 .tty()
                 .on_estimated_vblank_timer(&mut data.niri, output.clone());
+            data.signal_fifo(&output);
             TimeoutAction::Drop
         })
         .unwrap();
@@ -3643,8 +4631,99 @@ fn get_edid_info(
     libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
 }
 
-impl<'a> ConnectorProperties<'a> {
-    fn try_new(device: &'a DrmDevice, connector: connector::Handle) -> anyhow::Result<Self> {
+/// Formats a plane color pipeline as a compact one-line summary for logging, e.g.
+/// `1D Curve[sRGB EOTF, PQ 125 EOTF] → Multiplier → 3x4 Matrix → 3D LUT[17³]`.
+fn describe_color_pipeline(pipeline: &ColorPipeline) -> String {
+    let ops: Vec<String> = pipeline
+        .ops
+        .iter()
+        .map(|op| {
+            let mut s = match &op.kind {
+                ColorOpKind::Curve1D { supported } => {
+                    let curves: Vec<_> = supported.iter().map(|(c, _)| c.kernel_name()).collect();
+                    format!("1D Curve[{}]", curves.join(", "))
+                }
+                ColorOpKind::Lut1D { size, .. } => format!("1D LUT[{size}]"),
+                ColorOpKind::Ctm3x4 => "3x4 Matrix".to_owned(),
+                ColorOpKind::Multiplier => "Multiplier".to_owned(),
+                ColorOpKind::Lut3D { size, .. } => format!("3D LUT[{size}³]"),
+                ColorOpKind::Unknown { type_name } => format!("Unknown({type_name})"),
+            };
+            if !op.bypassable {
+                s.push_str(" (fixed)");
+            }
+            s
+        })
+        .collect();
+    ops.join(" → ")
+}
+
+/// Builds the HDR static metadata to signal on the connector for a client's image description:
+/// a PQ infoframe with the description's mastering display primaries (target color volume),
+/// falling back to its container primaries when the client didn't provide any.
+///
+/// Luminance priority: what the client provided (clamped to the sink's EDID capabilities) >
+/// the sink's EDID desired-content values > conservative ~500 nit placeholders.
+fn build_hdr_metadata(desc: &ImageDescription, edid: &EdidHdrInfo) -> HdrOutputMetadata {
+    let to_u16 = |v: u32| v.min(u16::MAX as u32) as u16;
+    // Clamps a client-provided value to the sink's EDID capability, when the EDID has one.
+    let clamp_to = |v: u16, edid_cap: u16| if edid_cap > 0 { v.min(edid_cap) } else { v };
+
+    // CTA-861.3 defines 0 as "unknown" for the luminance fields, and clients do send explicit
+    // zeros. Treat them as absent so they fall back to the EDID values: forwarding a 0 tells
+    // the sink nothing, but the resulting metadata change forces a connector commit (a
+    // seconds-long blank resync on some driver/sink combinations) every time fullscreen HDR
+    // content appears or disappears.
+    let max_luminance = desc
+        .mastering_luminance
+        .filter(|(_, max)| *max > 0)
+        .map(|(_, max)| clamp_to(to_u16(max), edid.max_luminance))
+        .or((edid.max_luminance > 0).then_some(edid.max_luminance))
+        .unwrap_or(500);
+    let min_luminance = desc
+        .mastering_luminance
+        .filter(|(_, max)| *max > 0)
+        .map(|(min, _)| to_u16(min).max(edid.min_luminance))
+        .or((edid.min_luminance > 0).then_some(edid.min_luminance))
+        .unwrap_or(50);
+    let max_cll = desc
+        .max_cll
+        .filter(|v| *v > 0)
+        .map(|v| clamp_to(to_u16(v), edid.max_luminance))
+        .or((edid.max_luminance > 0).then_some(edid.max_luminance))
+        .unwrap_or(500);
+    let max_fall = desc
+        .max_fall
+        .filter(|v| *v > 0)
+        .map(|v| clamp_to(to_u16(v), edid.max_frame_avg_luminance))
+        .or((edid.max_frame_avg_luminance > 0).then_some(edid.max_frame_avg_luminance))
+        // The frame-average luminance can't exceed the content's max luminance, which matters
+        // for a configured peak-luminance below the placeholder.
+        .unwrap_or(max_cll.min(500));
+
+    // ST 2086 mastering primaries: the client's target color volume, which may exceed the
+    // container primaries (extended target volume). Without one, the target defaults to the
+    // container primaries per the color-management protocol.
+    let chroma = desc.mastering_primaries.unwrap_or_else(|| {
+        Chromaticities::from_option(desc.primaries)
+            .unwrap_or(Chromaticities::from_named(CmPrimaries::Srgb))
+    });
+    // Protocol wire units (xy * 1e6) -> CTA-861.3 units (xy * 50000).
+    let coord = |(x, y): (i32, i32)| CtaCoordinate::from_xy(f64::from(x) / 1e6, f64::from(y) / 1e6);
+
+    HdrOutputMetadata {
+        eotf: Eotf::SmpteSt2084,
+        display_primaries: [coord(chroma.red), coord(chroma.green), coord(chroma.blue)],
+        white_point: coord(chroma.white),
+        max_display_mastering_luminance: max_luminance,
+        min_display_mastering_luminance: min_luminance,
+        max_cll,
+        max_fall,
+    }
+}
+
+impl ConnectorProperties {
+    fn try_new(device: &DrmDevice, connector: connector::Handle) -> anyhow::Result<Self> {
         let prop_vals = device
             .get_properties(connector)
             .context("error getting properties")?;
@@ -3659,13 +4738,7 @@ impl<'a> ConnectorProperties<'a> {
             properties.push((info, value));
         }
 
-        Ok(Self {
-            device,
-            connector,
-            properties,
-            has_change: false,
-            requests: AtomicModeReq::new(),
-        })
+        Ok(Self { properties })
     }
 
     fn find(&self, name: &std::ffi::CStr) -> anyhow::Result<&(property::Info, property::RawValue)> {
@@ -3695,97 +4768,45 @@ impl<'a> ConnectorProperties<'a> {
             _ => bail!("panel orientation has wrong value type"),
         }
     }
-
-    fn reset_hdr(&mut self) -> anyhow::Result<()> {
-        const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
-
-        let (info, value) = self.find(c"HDR_OUTPUT_METADATA")?;
-
-        let property::ValueType::Blob = info.value_type() else {
-            bail!("wrong property type")
-        };
-        if *value != 0 {
-            self.requests
-                .add_raw_property(self.connector.into(), info.handle(), 0);
-            self.has_change = true;
-        }
-
-        let (info, value) = self.find(c"Colorspace")?;
-        let property::ValueType::Enum(_) = info.value_type() else {
-            bail!("wrong property type")
-        };
-        if *value != DRM_MODE_COLORIMETRY_DEFAULT {
-            self.requests.add_raw_property(
-                self.connector.into(),
-                info.handle(),
-                DRM_MODE_COLORIMETRY_DEFAULT,
-            );
-            self.has_change = true;
-        }
-
-        Ok(())
-    }
-
-    fn set_max_bpc(&mut self, max_bpc: MaxBpc) -> anyhow::Result<u64> {
-        let (info, value) = self.find(c"max bpc")?;
-
-        let property::ValueType::UnsignedRange(min, max) = info.value_type() else {
-            bail!("wrong property type")
-        };
-
-        let max_bpc = max_bpc.0 as u64;
-        if !(min..=max).contains(&max_bpc) {
-            bail!("max-bpc {max_bpc} outside valid range of [{min}, {max}]");
-        }
-
-        let property::Value::UnsignedRange(value) = info.value_type().convert_value(*value) else {
-            bail!("wrong property type")
-        };
-
-        if value != max_bpc {
-            self.requests.add_raw_property(
-                self.connector.into(),
-                info.handle(),
-                property::Value::UnsignedRange(max_bpc).into(),
-            );
-            self.has_change = true;
-        }
-
-        Ok(max_bpc)
-    }
-
-    fn commit(&mut self) -> anyhow::Result<()> {
-        if self.has_change {
-            self.device.atomic_commit(
-                AtomicCommitFlags::ALLOW_MODESET,
-                std::mem::take(&mut self.requests),
-            )?;
-        }
-
-        Ok(())
-    }
 }
 
-fn set_connector_properties(
-    props: &mut ConnectorProperties,
-    max_bpc: Option<MaxBpc>,
-    reset_hdr: bool,
-) {
-    if let Some(max_bpc) = max_bpc {
-        if let Err(err) = props.set_max_bpc(max_bpc) {
-            debug!("failed to set `max bpc` property: {err}");
-        }
-    }
+/// Diagnostic escape hatch: NIRI_HDR_FORCE_8BIT (or the disable-10bit-output debug flag) keeps an
+/// 8-bit framebuffer even on HDR outputs, while still emitting the HDR colorspace/metadata
+/// signalling. This isolates a driver that hangs on 10-bit scanout (set the var -> boots fine)
+/// from one that hangs on the HDR infoframe commit itself (still hangs). Remove once HDR on nvidia
+/// is understood.
+fn hdr_force_8bit(disable_10bit_output: bool) -> bool {
+    disable_10bit_output || std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some()
+}
 
-    if reset_hdr {
-        if let Err(err) = props.reset_hdr() {
-            debug!("failed to set HDR properties: {err}");
-        }
-    }
+/// Whether to offer 10-bit scanout formats for an output: only on outputs that opted into HDR
+/// (and can do it). Requesting a 10-bit framebuffer unconditionally hangs the initial modeset on
+/// some drivers (notably nvidia), so SDR outputs stay 8-bit exactly as upstream.
+fn wants_10bit_formats(
+    output: &niri_config::Output,
+    hdr_supported: bool,
+    disable_10bit_output: bool,
+) -> bool {
+    output.hdr.is_some() && hdr_supported && !hdr_force_8bit(disable_10bit_output)
+}
 
-    if let Err(err) = props.commit() {
-        warn!("failed to atomically commit properties: {err}");
-    }
+/// The `max bpc` to request for an output. When HDR is enabled this is at least 10 (HDR needs at
+/// least 10 bits per channel so the PQ signal isn't crushed; `max bpc` is only a cap, so the
+/// driver still drops lower if the link can't carry it). Otherwise the configured value, if any.
+/// Clamped to the connector's supported range; `None` when the connector has no `max bpc`
+/// property at all.
+fn effective_max_bpc(
+    output: &niri_config::Output,
+    range: &Option<RangeInclusive<u32>>,
+) -> Option<u32> {
+    let range = range.as_ref()?;
+    let configured = output.max_bpc.map(|max_bpc| max_bpc.0 as u32);
+    let requested = if output.hdr.is_some() {
+        configured.map_or(10, |bpc| bpc.max(10))
+    } else {
+        configured?
+    };
+    Some(requested.clamp(*range.start(), *range.end()))
 }
 
 fn is_vrr_capable(device: &DrmDevice, connector: connector::Handle) -> Option<bool> {
@@ -3910,7 +4931,137 @@ mod tests {
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
-    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt};
+    use smithay::wayland::color::management::ImageDescription;
+
+    use crate::backend::tty::{
+        build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt, EdidHdrInfo,
+    };
+
+    #[test]
+    fn hdr_metadata_luminance_priorities() {
+        let pq_desc = ImageDescription {
+            transfer: smithay::wayland::color::management::TransferFunction::St2084Pq,
+            primaries: smithay::wayland::color::management::PrimariesOption {
+                named: Some(smithay::wayland::color::management::Primaries::Bt2020),
+                values: None,
+            },
+            max_cll: None,
+            max_fall: None,
+            mastering_luminance: None,
+            mastering_primaries: None,
+            luminances: None,
+            windows_scrgb: false,
+            windows_bt2100: false,
+        };
+        let edid = EdidHdrInfo {
+            pq: true,
+            bt2020_rgb: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
+        };
+
+        // No client data, no EDID data: conservative placeholders.
+        let meta = build_hdr_metadata(&pq_desc, &EdidHdrInfo::default());
+        assert_eq!(meta.max_display_mastering_luminance, 500);
+        assert_eq!(meta.min_display_mastering_luminance, 50);
+        assert_eq!(meta.max_cll, 500);
+        assert_eq!(meta.max_fall, 500);
+
+        // No client data: EDID desired-content values win.
+        let meta = build_hdr_metadata(&pq_desc, &edid);
+        assert_eq!(meta.max_display_mastering_luminance, 800);
+        assert_eq!(meta.min_display_mastering_luminance, 100);
+        assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
+
+        // A configured peak luminance replaces the EDID's (or the missing) max luminance, and
+        // caps the frame-average luminance.
+        let meta = build_hdr_metadata(
+            &pq_desc,
+            &EdidHdrInfo::default().with_peak_luminance(Some(350.)),
+        );
+        assert_eq!(meta.max_display_mastering_luminance, 350);
+        assert_eq!(meta.max_cll, 350);
+        assert_eq!(meta.max_fall, 350);
+        let meta = build_hdr_metadata(&pq_desc, &edid.with_peak_luminance(Some(400.4)));
+        assert_eq!(meta.max_display_mastering_luminance, 400);
+        assert_eq!(meta.max_cll, 400);
+        assert_eq!(meta.max_fall, 400);
+        let meta = build_hdr_metadata(&pq_desc, &edid.with_peak_luminance(Some(1500.)));
+        assert_eq!(meta.max_cll, 1500);
+        assert_eq!(meta.max_fall, 600);
+
+        // Client data within the sink's capabilities is used as-is.
+        let desc = ImageDescription {
+            mastering_luminance: Some((200, 700)),
+            max_cll: Some(650),
+            max_fall: Some(300),
+            ..pq_desc
+        };
+        let meta = build_hdr_metadata(&desc, &edid);
+        assert_eq!(meta.max_display_mastering_luminance, 700);
+        assert_eq!(meta.min_display_mastering_luminance, 200);
+        assert_eq!(meta.max_cll, 650);
+        assert_eq!(meta.max_fall, 300);
+
+        // Client data beyond the sink's capabilities is clamped to the EDID.
+        let desc = ImageDescription {
+            mastering_luminance: Some((1, 4000)),
+            max_cll: Some(4000),
+            max_fall: Some(2000),
+            ..pq_desc
+        };
+        let meta = build_hdr_metadata(&desc, &edid);
+        assert_eq!(meta.max_display_mastering_luminance, 800);
+        assert_eq!(meta.min_display_mastering_luminance, 100);
+        assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
+    }
+
+    #[test]
+    fn hdr_metadata_mastering_primaries() {
+        use smithay::backend::drm::CtaCoordinate;
+        use smithay::wayland::color::management::{Chromaticities, Primaries, PrimariesOption};
+
+        let pq_desc = ImageDescription {
+            transfer: smithay::wayland::color::management::TransferFunction::St2084Pq,
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
+            max_cll: None,
+            max_fall: None,
+            mastering_luminance: None,
+            mastering_primaries: None,
+            luminances: None,
+            windows_scrgb: false,
+            windows_bt2100: false,
+        };
+
+        // Without mastering primaries the infoframe carries the container primaries
+        // (BT.2020, matching the previous hardcoded behavior).
+        let meta = build_hdr_metadata(&pq_desc, &EdidHdrInfo::default());
+        assert_eq!(meta.display_primaries[0], CtaCoordinate::BT2020_RED);
+        assert_eq!(meta.display_primaries[1], CtaCoordinate::BT2020_GREEN);
+        assert_eq!(meta.display_primaries[2], CtaCoordinate::BT2020_BLUE);
+        assert_eq!(meta.white_point, CtaCoordinate::D65_WHITE);
+
+        // Client-provided mastering primaries (e.g. a DCI-P3 mastered HDR10 stream) are
+        // forwarded to the sink.
+        let p3 = Chromaticities::from_named(Primaries::DisplayP3);
+        let desc = ImageDescription {
+            mastering_primaries: Some(p3),
+            ..pq_desc
+        };
+        let meta = build_hdr_metadata(&desc, &EdidHdrInfo::default());
+        // Display P3 red is (0.680, 0.320): x = 0.680 * 50000 = 34000.
+        assert_eq!(
+            meta.display_primaries[0],
+            CtaCoordinate { x: 34000, y: 16000 }
+        );
+        assert_eq!(meta.white_point, CtaCoordinate::D65_WHITE);
+    }
 
     #[test]
     fn test_calculate_drmmode_from_modeline() {

@@ -1,6 +1,5 @@
 use std::cell::Cell;
 
-use calloop::Interest;
 use niri_config::PresetSize;
 use smithay::backend::input::InputTime;
 use smithay::desktop::{
@@ -21,10 +20,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
 use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::compositor::{
-    add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
-    HookId, SurfaceAttributes,
+    add_pre_commit_hook, with_states, BufferAssignment, HookId, SurfaceAttributes,
 };
-use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::input_method::InputMethodSeat;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::wlr_layer::{self, Layer};
@@ -874,6 +871,33 @@ impl XdgShellHandler for State {
         }
     }
 
+    fn minimize_request(&mut self, toplevel: ToplevelSurface) {
+        let Some((mapped, _)) = self
+            .niri
+            .layout
+            .find_window_and_output_mut(toplevel.wl_surface())
+        else {
+            // Minimizing an unmapped window doesn't mean anything: it isn't in the layout yet, and
+            // it will open unminimized. A configure is not required in response to this request.
+            return;
+        };
+
+        // Fullscreen games minimize themselves whenever they lose focus, which would make them
+        // vanish from the layout on every window switch. The `block-minimize` window rule opts
+        // them out.
+        if mapped.is_blocking_minimize() {
+            trace!("ignoring client minimize request due to block-minimize window rule");
+            return;
+        }
+
+        let window = mapped.window.clone();
+
+        if self.niri.layout.minimize_window(&window) {
+            // The minimized window may have had focus.
+            self.niri.queue_redraw_all();
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if self
             .niri
@@ -907,7 +931,7 @@ impl XdgShellHandler for State {
 
         let transaction = Transaction::new();
         let blocker = transaction.blocker();
-        self.backend.with_primary_renderer(|renderer| {
+        crate::with_primary_renderer_any!(self.backend, |renderer| {
             self.niri
                 .layout
                 .start_close_animation_for_window(renderer, &window, blocker);
@@ -919,19 +943,14 @@ impl XdgShellHandler for State {
         self.niri.window_mru_ui.remove_window(id);
         self.niri.layout.remove_window(&window, transaction.clone());
 
-        let surface = surface.wl_surface();
-        // This check is necessary because implicit resource destruction is done with
-        // undefined order, so the surface might get destroyed before toplevel_destroyed() is
-        // called. In this case, adding the default pre-commit hook here would leak it, since the
-        // place that removes it is WlSurface::destroyed(), which had already been called by now.
-        if surface.is_alive() {
-            self.add_default_dmabuf_pre_commit_hook(surface);
-        }
+        // Unlike upstream, the default dmabuf pre-commit hook stays installed for mapped
+        // toplevels (buffer readiness always comes from its immediate blockers, see
+        // add_mapped_toplevel_pre_commit_hook), so there is nothing to re-add here.
 
         // If this is the only instance, then this transaction will complete immediately, so no
         // need to set the timer.
         if !transaction.is_last() {
-            transaction.register_deadline_timer(&self.niri.event_loop);
+            transaction.register_deadline_timer(&self.niri.event_loop, &self.niri.display_handle);
         }
 
         if was_active {
@@ -977,10 +996,29 @@ impl XdgShellHandler for State {
 
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        // If we want CSD, we hide this global altogether.
+        // With xdg-decoration v2, a decoration object can be created for an already mapped
+        // toplevel, including right after destroying a previous decoration object. In that case
+        // the protocol requires the previously negotiated mode to be retained, so restore the
+        // last acked mode if there is one. Otherwise, advertise our preferred mode. (If we want
+        // CSD, we hide this global altogether.)
+        let prev_mode =
+            toplevel.with_committed_state(|current| current.and_then(|s| s.decoration_mode));
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            state.decoration_mode =
+                Some(prev_mode.unwrap_or(zxdg_toplevel_decoration_v1::Mode::ServerSide));
         });
+
+        // The new decoration object needs a configure carrying its initial mode. If an initial
+        // configure wasn't sent, then we will send this as part of the initial configure later.
+        if toplevel.is_initial_configure_sent() {
+            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
+            let surface = toplevel.wl_surface();
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                mapped.set_needs_configure();
+            } else {
+                toplevel.send_configure();
+            }
+        }
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: zxdg_toplevel_decoration_v1::Mode) {
@@ -1017,6 +1055,25 @@ impl XdgDecorationHandler for State {
 
         // A configure is required in response to this event. However, if an initial configure
         // wasn't sent, then we will send this as part of the initial configure later.
+        if toplevel.is_initial_configure_sent() {
+            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
+            let surface = toplevel.wl_surface();
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                mapped.set_needs_configure();
+            } else {
+                toplevel.send_configure();
+            }
+        }
+    }
+
+    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
+        // The protocol requires the surface to switch back to client-side decorations at the
+        // next commit, unless a new decoration object is created first (in which case
+        // new_decoration() will run before any commit and override this).
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        });
+
         if toplevel.is_initial_configure_sent() {
             // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
             let surface = toplevel.wl_surface();
@@ -1078,6 +1135,8 @@ impl XdgForeignHandler for State {
 impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
+
+        let suspended = self.niri.is_locked() || !self.niri.monitors_active;
 
         let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
@@ -1215,6 +1274,16 @@ impl State {
 
         // Set the tiled state for the initial configure.
         update_tiled_state(toplevel, config.prefer_no_csd, rules.tiled_state);
+
+        // Windows opening while the session is locked or the monitors are powered off are not
+        // visible, so tell them upfront (Chromium notification toasts open like this). The state
+        // is cleared by refresh_window_states() when they become visible; cast exemptions don't
+        // apply here since an unmapped window cannot be a cast target yet.
+        if suspended {
+            toplevel.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Suspended);
+            });
+        }
 
         // Set the configured settings.
         *state = InitialConfigureState::Configured {
@@ -1523,16 +1592,13 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             return;
         };
 
-        let (got_unmapped, dmabuf, commit_serial) = with_states(surface, |states| {
-            let (got_unmapped, dmabuf) = {
+        let (got_unmapped, commit_serial) = with_states(surface, |states| {
+            let got_unmapped = {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
                 match guard.pending().buffer.as_ref() {
-                    Some(BufferAssignment::NewBuffer(buffer)) => {
-                        let dmabuf = get_dmabuf(buffer).cloned().ok();
-                        (false, dmabuf)
-                    }
-                    Some(BufferAssignment::Removed) => (true, None),
-                    None => (false, None),
+                    Some(BufferAssignment::NewBuffer(_)) => false,
+                    Some(BufferAssignment::Removed) => true,
+                    None => false,
                 }
             };
 
@@ -1544,10 +1610,9 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 .unwrap();
             let serial = role.last_acked.as_ref().map(|c| c.serial);
 
-            (got_unmapped, dmabuf, serial)
+            (got_unmapped, serial)
         });
 
-        let mut transaction_for_dmabuf = None;
         let mut animate = false;
         if let Some(serial) = commit_serial {
             if !span.is_disabled() {
@@ -1559,32 +1624,36 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 // Transaction can be already completed if it ran past the deadline.
                 let disable = state.niri.config.borrow().debug.disable_transactions;
                 if !transaction.is_completed() && !disable {
-                    // Register the deadline even if this is the last pending, since dmabuf
-                    // rendering can still run over the deadline.
-                    transaction.register_deadline_timer(&state.niri.event_loop);
+                    // Register the deadline even if this is the last pending, since buffer
+                    // readiness (dmabuf / syncobj) can still run over the deadline.
+                    transaction.register_deadline_timer(
+                        &state.niri.event_loop,
+                        &state.niri.display_handle,
+                    );
 
-                    let is_last = transaction.is_last();
-
-                    // If this is the last transaction, we don't need to add a separate
-                    // notification, because the transaction will complete in our dmabuf blocker
-                    // callback, which already calls blocker_cleared(), or by the end of this
-                    // function, in which case there would be no blocker in the first place.
-                    if !is_last {
-                        // Waiting for some other surface; register a notification and add a
-                        // transaction blocker.
-                        if let Some(client) = surface.client() {
+                    if let Some(client) = surface.client() {
+                        // If this is the last pending, the transaction will complete by the end
+                        // of this pre-commit hook, so the completion notification is not needed.
+                        if !transaction.is_last() {
                             transaction.add_notification(
                                 state.niri.blocker_cleared_tx.clone(),
                                 client.clone(),
                             );
-                            add_blocker(surface, transaction.blocker());
                         }
+
+                        // Register this commit into the transaction's surface barrier. This adds
+                        // a blocker gating the commit on the transaction's completion, plus a
+                        // delayed barrier blocker that applies the states of all registered
+                        // surfaces atomically once each of them is ready. Buffer readiness is
+                        // handled by the per-surface blockers from the default dmabuf pre-commit
+                        // hook.
+                        transaction.register_surface(surface, &state.niri.surface_barriers);
                     }
 
-                    // Delay dropping (and completing) the transaction until the dmabuf is ready.
-                    // If there's no dmabuf, this will be dropped by the end of this pre-commit
-                    // hook.
-                    transaction_for_dmabuf = Some(transaction);
+                    // The transaction drops (and possibly completes) by the end of this
+                    // pre-commit hook; the surface barrier takes care of delaying the state
+                    // application until every participant is ready.
+                    drop(transaction);
                 }
             }
 
@@ -1593,38 +1662,13 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             error!("commit on a mapped surface without a configured serial");
         };
 
-        if let Some((blocker, source)) =
-            dmabuf.and_then(|dmabuf| dmabuf.generate_blocker(Interest::READ).ok())
-        {
-            if let Some(client) = surface.client() {
-                let res = state
-                    .niri
-                    .event_loop
-                    .insert_source(source, move |_, _, state| {
-                        // This surface is now ready for the transaction.
-                        drop(transaction_for_dmabuf.take());
-
-                        let display_handle = state.niri.display_handle.clone();
-                        state
-                            .client_compositor_state(&client)
-                            .blocker_cleared(state, &display_handle);
-
-                        Ok(())
-                    });
-                if res.is_ok() {
-                    add_blocker(surface, blocker);
-                    trace!("added dmabuf blocker");
-                }
-            }
-        }
-
         let window = mapped.window.clone();
         if got_unmapped {
             let output = output.cloned();
             state.store_unmap_snapshot(&window, output.as_ref());
         } else {
             if animate {
-                state.backend.with_primary_renderer(|renderer| {
+                crate::with_primary_renderer_any!(state.backend, |renderer| {
                     mapped.store_animation_snapshot(renderer);
                 });
             }

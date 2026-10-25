@@ -3,25 +3,26 @@ use niri_config::CornerRadius;
 use smithay::backend::renderer::buffer_y_inverted;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
-};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
+use super::blend::{ContentColor, FrameBlendState};
 use super::damage::ExtraDamage;
 use super::renderer::{AsGlesFrame as _, NiriRenderer};
-use super::shaders::{mat3_uniform, Shaders};
+use super::shaders::{mat3_uniform, NiriTexProgram, Shaders};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: GlesTexProgram,
+    program: NiriTexProgram,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
+    /// How the content relates to the output blend space (from its image description).
+    content: ContentColor,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -35,8 +36,9 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         elem: WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
-        program: GlesTexProgram,
+        program: NiriTexProgram,
         corner_radius: CornerRadius,
+        content: ContentColor,
     ) -> Self {
         Self {
             inner: elem,
@@ -44,6 +46,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
             corner_radius,
             geometry,
             scale: scale.x as f32,
+            content,
         }
     }
 
@@ -99,8 +102,8 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         ]
     }
 
-    pub fn shader(renderer: &mut R) -> Option<&GlesTexProgram> {
-        Shaders::get(renderer).clipped_surface.as_ref()
+    pub fn shader(renderer: &mut R) -> Option<&NiriTexProgram> {
+        Shaders::get(renderer)?.clipped_surface.as_ref()
     }
 
     pub fn will_clip(
@@ -238,8 +241,16 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        RenderElement::<GlesRenderer>::draw(
+        let NiriTexProgram::Gles(program) = &self.program else {
+            return Ok(());
+        };
+        let mut uniforms = self.compute_uniforms();
+        uniforms.extend(FrameBlendState::uniforms_for_content(frame, self.content));
+        let saved = frame.take_tex_program_override();
+        crate::audit_texture_program!("clipped_surface");
+
+        frame.override_default_tex_program(program.clone(), uniforms);
+        let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -247,9 +258,9 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
             damage,
             opaque_regions,
             cache,
-        )?;
-        frame.clear_tex_program_override();
-        Ok(())
+        );
+        frame.set_tex_program_override(saved);
+        res
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -271,12 +282,59 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        frame
-            .as_gles_frame()
-            .override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache)?;
-        frame.as_gles_frame().clear_tex_program_override();
-        Ok(())
+        let mut saved = None;
+        let mut saved_vk = None;
+        match (&self.program, &mut *frame) {
+            (NiriTexProgram::Gles(program), _) => {
+                if let Some(gles_frame) = frame.as_gles_frame() {
+                    let mut uniforms = self.compute_uniforms();
+                    uniforms.extend(FrameBlendState::uniforms_for_content(
+                        gles_frame,
+                        self.content,
+                    ));
+                    saved = Some(gles_frame.take_tex_program_override());
+                    crate::audit_texture_program!("clipped_surface");
+
+                    gles_frame.override_default_tex_program(program.clone(), uniforms);
+                }
+            }
+            (NiriTexProgram::Vulkan(program), TtyFrame::Vulkan(multi)) => {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                let mut uniforms: Vec<_> = self
+                    .compute_uniforms()
+                    .iter()
+                    .filter_map(super::shader_element::uniform_to_custom_owned)
+                    .collect();
+                uniforms.extend(
+                    super::blend::vulkan_blend_custom_uniforms(vk_frame, self.content)
+                        .into_iter()
+                        .map(|u| smithay::backend::renderer::vulkan::OwnedCustomUniform {
+                            name: u.name.to_owned(),
+                            value: u.value,
+                        }),
+                );
+                saved_vk = Some(vk_frame.take_tex_program_override());
+                crate::audit_texture_program!("clipped_surface");
+
+                vk_frame.set_tex_program_override(Some((program.clone(), uniforms)));
+            }
+            _ => {}
+        }
+        let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+        if let Some(saved) = saved {
+            if let Some(gles_frame) = frame.as_gles_frame() {
+                gles_frame.set_tex_program_override(saved);
+            }
+        }
+        if let Some(saved) = saved_vk {
+            if let TtyFrame::Vulkan(multi) = frame {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                vk_frame.set_tex_program_override(saved);
+            }
+        }
+        res
     }
 
     fn underlying_storage(

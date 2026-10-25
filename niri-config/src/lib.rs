@@ -54,7 +54,7 @@ pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocu
 pub use crate::layer_rule::LayerRule;
 pub use crate::layout::*;
 pub use crate::misc::*;
-pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
+pub use crate::output::{Output, OutputName, Outputs, Position, TearingMode, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
 pub use crate::utils::FloatOrInt;
@@ -84,6 +84,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub minimized_windows: MinimizedWindows,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -205,6 +206,7 @@ where
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
+                "minimized-windows" => m_merge!(minimized_windows),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -899,7 +901,12 @@ mod tests {
                 position x=10 y=20
                 mode "1920x1080@144"
                 max-bpc 10
+                hdr mode="on" {
+                    reference-luminance 203
+                    peak-luminance 800
+                }
                 variable-refresh-rate on-demand=true
+                allow-tearing true
                 background-color "rgba(25, 25, 102, 1.0)"
                 hot-corners {
                     off
@@ -1334,6 +1341,21 @@ mod tests {
                                 _10,
                             ),
                         ),
+                        hdr: Some(
+                            Hdr {
+                                mode: On,
+                                reference_luminance: Some(
+                                    FloatOrInt(
+                                        203.0,
+                                    ),
+                                ),
+                                peak_luminance: Some(
+                                    FloatOrInt(
+                                        800.0,
+                                    ),
+                                ),
+                            },
+                        ),
                         mode: Some(
                             Mode {
                                 custom: false,
@@ -1352,6 +1374,7 @@ mod tests {
                                 on_demand: true,
                             },
                         ),
+                        allow_tearing: Always,
                         focus_at_startup: true,
                         background_color: Some(
                             Color {
@@ -1380,6 +1403,7 @@ mod tests {
                         transform: Normal,
                         position: None,
                         max_bpc: None,
+                        hdr: None,
                         mode: Some(
                             Mode {
                                 custom: true,
@@ -1394,6 +1418,7 @@ mod tests {
                         ),
                         modeline: None,
                         variable_refresh_rate: None,
+                        allow_tearing: Fullscreen,
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
@@ -1407,6 +1432,7 @@ mod tests {
                         transform: Normal,
                         position: None,
                         max_bpc: None,
+                        hdr: None,
                         mode: None,
                         modeline: Some(
                             Modeline {
@@ -1424,6 +1450,7 @@ mod tests {
                             },
                         ),
                         variable_refresh_rate: None,
+                        allow_tearing: Fullscreen,
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
@@ -1874,6 +1901,12 @@ mod tests {
                     },
                 },
             },
+            minimized_windows: MinimizedWindows {
+                off: false,
+                position: BottomLeft,
+                size: 96.0,
+                gaps: 8.0,
+            },
             environment: Environment(
                 [
                     EnvironmentVariable {
@@ -2042,6 +2075,8 @@ mod tests {
                     clip_to_geometry: None,
                     baba_is_float: None,
                     block_out_from: None,
+                    block_minimize: None,
+                    allow_tearing: None,
                     variable_refresh_rate: Some(
                         FullscreenOnly,
                     ),
@@ -2446,6 +2481,8 @@ mod tests {
                 wait_for_frame_completion_before_queueing: false,
                 enable_overlay_planes: false,
                 disable_cursor_plane: false,
+                disable_cursor_plane_on_hdr: false,
+                scanout_post_blend_encode: false,
                 disable_direct_scanout: false,
                 restrict_primary_scanout_to_matching_format: false,
                 force_disable_connectors_on_resume: false,
@@ -2468,6 +2505,8 @@ mod tests {
                 deactivate_unfocused_windows: false,
                 skip_cursor_only_updates_during_vrr: false,
                 disable_10bit_output: false,
+                force_tearing: false,
+                vulkan_renderer: false,
             },
             workspaces: [
                 Workspace {

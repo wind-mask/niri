@@ -67,6 +67,7 @@ impl Headless {
         resources::init(&mut renderer);
         shaders::init(&mut renderer);
         superres::init(&mut renderer, None);
+        crate::render_helpers::blend::FrameBlendState::init(&mut renderer);
 
         self.renderer = Some(renderer);
         Ok(())
@@ -243,6 +244,10 @@ impl Headless {
         None
     }
 
+    pub fn renderer(&mut self) -> Option<&mut GlesRenderer> {
+        self.renderer.as_mut()
+    }
+
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let now = get_monotonic_time();
 
@@ -260,6 +265,7 @@ impl Headless {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
+            RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(token)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
                 niri.event_loop.remove(token);

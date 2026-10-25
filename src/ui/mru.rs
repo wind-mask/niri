@@ -16,14 +16,14 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::element::{Kind, RenderElement};
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
+use crate::backend::tty_renderer::TtyOffscreen;
 use crate::layout::focus_ring::{FocusRing, FocusRingRenderElement};
 use crate::layout::{Layout, LayoutElement as _, LayoutElementRenderElement};
 use crate::niri::Niri;
@@ -32,10 +32,11 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::{
+    TextureBuffer, TextureRenderElement, UniversalTextureRenderElement,
+};
 use crate::render_helpers::RenderCtx;
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
@@ -118,7 +119,7 @@ niri_render_elements! {
 niri_render_elements! {
     WindowMruUiRenderElement<R> => {
         SolidColor = SolidColorRenderElement,
-        TextureElement = PrimaryGpuTextureRenderElement,
+        TextureElement = UniversalTextureRenderElement,
         GradientFadeElem = GradientFadeTextureRenderElement,
         FocusRing = FocusRingRenderElement,
         Offscreen = OffscreenRenderElement,
@@ -185,7 +186,7 @@ struct MoveAnimation {
     from: f64,
 }
 
-type MruTexture = TextureBuffer<GlesTexture>;
+type MruTexture = TextureBuffer<TtyOffscreen>;
 
 /// Cached title texture.
 #[derive(Debug, Default)]
@@ -322,9 +323,9 @@ impl Thumbnail {
         size.to_physical_precise_round(scale).to_logical(scale)
     }
 
-    fn title_texture(
+    fn title_texture<R: NiriRenderer>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         mapped: &Mapped,
         scale: f64,
     ) -> Option<MruTexture> {
@@ -382,9 +383,16 @@ impl Thumbnail {
         let clip = move |elem| match elem {
             LayoutElementRenderElement::Wayland(elem) => {
                 if let Some(shader) = clip_shader.clone() {
-                    if ClippedSurfaceRenderElement::will_clip(&elem, s, geo, radius) {
-                        let elem =
-                            ClippedSurfaceRenderElement::new(elem, s, geo, shader.clone(), radius);
+                    if ClippedSurfaceRenderElement::will_clip(elem.inner(), s, geo, radius) {
+                        let content = elem.content();
+                        let elem = ClippedSurfaceRenderElement::new(
+                            elem.into_inner(),
+                            s,
+                            geo,
+                            shader.clone(),
+                            radius,
+                            content,
+                        );
                         return ThumbnailRenderElement::ClippedSurface(elem);
                     }
                 }
@@ -460,7 +468,7 @@ impl Thumbnail {
         });
 
         let mut title_size = None;
-        let title_texture = self.title_texture(ctx.as_gles().renderer, mapped, scale);
+        let title_texture = self.title_texture(ctx.renderer, mapped, scale);
         let title_texture = title_texture.map(|texture| {
             let mut size = texture.logical_size();
             size.w = f64::min(size.w, preview_geo.size.w);
@@ -493,12 +501,12 @@ impl Thumbnail {
                 Kind::Unspecified,
             );
 
-            let ctx = ctx.as_gles();
-            if let Some(program) = GradientFadeTextureRenderElement::shader(ctx.renderer) {
+            let program = GradientFadeTextureRenderElement::shader(ctx.renderer);
+            if let Some(program) = program {
                 let elem = GradientFadeTextureRenderElement::new(texture, program);
                 push(WindowMruUiRenderElement::GradientFadeElem(elem));
             } else {
-                let elem = PrimaryGpuTextureRenderElement(texture);
+                let elem = UniversalTextureRenderElement(texture);
                 push(WindowMruUiRenderElement::TextureElement(elem));
             }
         }
@@ -1104,7 +1112,10 @@ impl WindowMruUi {
         output: &Output,
         mut ctx: RenderCtx<R>,
         push: &mut dyn FnMut(WindowMruUiRenderElement<R>),
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+    {
         let (inner, progress) = match &self.state {
             UiState::Closed { .. } => return,
             UiState::Closing { inner, anim } => (inner, anim.clamped_value()),
@@ -1140,33 +1151,33 @@ impl WindowMruUi {
         // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
         let mut pushed_offscreen = false;
         if *output == inner.output && alpha < 1. {
-            let mut ctx = ctx.as_gles();
-
-            let mut elems = Vec::new();
-            inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
-            elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
-
-            let scale = output.current_scale().fractional_scale();
-            match inner
-                .offscreen
-                .render(ctx.renderer, Scale::from(scale), &elems)
             {
-                Ok((elem, _sync, _data)) => {
-                    // FIXME: would be good to passthrough offscreen data to visible windows here.
-                    // As is, during the closing fade, windows from other workspaces stop receiving
-                    // frame callbacks.
-                    //
-                    // However, we need to refactor our offscreen data a bit to make this nicer.
-                    // Currently it supports a stack of offscreens, but not a several unrelated
-                    // offscreens showing the same window (possibly in addition to the window
-                    // itself).
-                    //
-                    // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
-                    push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
-                    pushed_offscreen = true;
-                }
-                Err(err) => {
-                    warn!("error rendering MRU to offscreen for fade-out: {err:?}");
+                let mut elems = Vec::new();
+                inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
+                elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
+
+                let scale = output.current_scale().fractional_scale();
+                match inner
+                    .offscreen
+                    .render(ctx.renderer, Scale::from(scale), &elems)
+                {
+                    Ok((elem, _sync, _data)) => {
+                        // FIXME: would be good to passthrough offscreen data to visible windows here.
+                        // As is, during the closing fade, windows from other workspaces stop receiving
+                        // frame callbacks.
+                        //
+                        // However, we need to refactor our offscreen data a bit to make this nicer.
+                        // Currently it supports a stack of offscreens, but not a several unrelated
+                        // offscreens showing the same window (possibly in addition to the window
+                        // itself).
+                        //
+                        // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
+                        push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
+                        pushed_offscreen = true;
+                    }
+                    Err(err) => {
+                        warn!("error rendering MRU to offscreen for fade-out: {err:?}");
+                    }
                 }
             }
         }
@@ -1564,16 +1575,16 @@ impl Inner {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();
 
-        let panel_texture =
-            self.scope_panel
-                .borrow_mut()
-                .get(ctx.as_gles().renderer, scale, self.wmru.scope);
+        let panel_texture = self
+            .scope_panel
+            .borrow_mut()
+            .get(ctx.renderer, scale, self.wmru.scope);
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 
             let size = texture.logical_size();
             let location = Point::new((output_size.w - size.w) / 2., padding * 2.);
-            let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+            let elem = UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
                 texture.clone(),
                 location,
                 1.,
@@ -1637,7 +1648,12 @@ impl Inner {
 }
 
 impl TitleTexture {
-    fn get(&mut self, renderer: &mut GlesRenderer, title: &str, scale: f64) -> Option<MruTexture> {
+    fn get<R: NiriRenderer>(
+        &mut self,
+        renderer: &mut R,
+        title: &str,
+        scale: f64,
+    ) -> Option<MruTexture> {
         if self.title != title || self.scale != scale {
             self.texture = None;
             self.title = title.to_owned();
@@ -1658,8 +1674,8 @@ impl TitleTexture {
     }
 }
 
-fn generate_title_texture(
-    renderer: &mut GlesRenderer,
+fn generate_title_texture<R: NiriRenderer>(
+    renderer: &mut R,
     title: &str,
     scale: f64,
 ) -> anyhow::Result<MruTexture> {
@@ -1703,13 +1719,13 @@ fn generate_title_texture(
         Vec::new(),
     )?;
 
-    Ok(buffer)
+    Ok(buffer.map_texture(R::wrap_texture))
 }
 
 impl ScopePanel {
-    fn get(
+    fn get<R: NiriRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         scale: f64,
         scope: MruScope,
     ) -> Option<MruTexture> {
@@ -1725,8 +1741,8 @@ impl ScopePanel {
     }
 }
 
-fn generate_scope_panels(
-    renderer: &mut GlesRenderer,
+fn generate_scope_panels<R: NiriRenderer>(
+    renderer: &mut R,
     scale: f64,
 ) -> anyhow::Result<[MruTexture; 3]> {
     fn make_panel_text(idx: usize) -> String {
@@ -1766,7 +1782,11 @@ fn generate_scope_panels(
     ])
 }
 
-fn render_panel(renderer: &mut GlesRenderer, scale: f64, text: &str) -> anyhow::Result<MruTexture> {
+fn render_panel<R: NiriRenderer>(
+    renderer: &mut R,
+    scale: f64,
+    text: &str,
+) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::render_panel");
 
     let mut font = FontDescription::from_string(FONT);
@@ -1825,7 +1845,7 @@ fn render_panel(renderer: &mut GlesRenderer, scale: f64, text: &str) -> anyhow::
         Vec::new(),
     )?;
 
-    Ok(buffer)
+    Ok(buffer.map_texture(R::wrap_texture))
 }
 
 /// Returns key bindings available when the MRU UI is open.

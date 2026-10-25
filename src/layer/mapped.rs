@@ -1,6 +1,5 @@
 use niri_config::utils::MergeWith as _;
 use niri_config::{Config, LayerRule};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
@@ -12,6 +11,7 @@ use crate::animation::Clock;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -57,10 +57,94 @@ pub struct MappedLayer {
 
 niri_render_elements! {
     LayerSurfaceRenderElement<R> => {
-        Wayland = WaylandSurfaceRenderElement<R>,
+        Wayland = BlendSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         Shadow = ShadowRenderElement,
         BackgroundEffect = BackgroundEffectElement,
+    }
+}
+
+impl
+    smithay::backend::renderer::element::RenderElement<
+        smithay::backend::renderer::vulkan::VulkanRenderer,
+    > for LayerSurfaceRenderElement<smithay::backend::renderer::vulkan::VulkanRenderer>
+{
+    fn capture_framebuffer(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, smithay::utils::Physical>,
+        cache: &smithay::utils::user_data::UserDataMap,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        use smithay::backend::renderer::element::RenderElement;
+        use smithay::backend::renderer::vulkan::VulkanRenderer;
+        match self {
+            LayerSurfaceRenderElement::Wayland(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            LayerSurfaceRenderElement::SolidColor(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            LayerSurfaceRenderElement::Shadow(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            LayerSurfaceRenderElement::BackgroundEffect(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+        }
+    }
+
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, smithay::utils::Physical>,
+        damage: &[Rectangle<i32, smithay::utils::Physical>],
+        opaque_regions: &[Rectangle<i32, smithay::utils::Physical>],
+        cache: Option<&smithay::utils::user_data::UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        use smithay::backend::renderer::element::RenderElement;
+        use smithay::backend::renderer::vulkan::VulkanRenderer;
+        match self {
+            LayerSurfaceRenderElement::Wayland(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            LayerSurfaceRenderElement::SolidColor(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            LayerSurfaceRenderElement::Shadow(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            LayerSurfaceRenderElement::BackgroundEffect(elem) => {
+                RenderElement::<VulkanRenderer>::draw(
+                    elem,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+            }
+        }
     }
 }
 
@@ -238,7 +322,7 @@ impl MappedLayer {
         let surface_anim_scale = Scale::from(1.);
         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
         background_effect::render_for_tile(
-            ctx.as_gles(),
+            ctx.r(),
             ns,
             geometry,
             self.scale,
@@ -311,7 +395,7 @@ impl MappedLayer {
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
             background_effect::render_for_tile(
-                ctx.as_gles(),
+                ctx.r(),
                 ns,
                 geometry,
                 self.scale,

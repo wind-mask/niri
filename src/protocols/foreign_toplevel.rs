@@ -5,7 +5,8 @@ use std::sync::Arc;
 use arrayvec::ArrayVec;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::{
-    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1}, ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
 };
 use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::server::{
     ext_foreign_toplevel_image_capture_source_manager_v1::{
@@ -15,7 +16,8 @@ use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::server
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
-    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1}, zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
@@ -26,13 +28,13 @@ use smithay::reexports::wayland_server::{
 use smithay::wayland::image_capture_source::{ImageCaptureSource, ImageCaptureSourceData};
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 use smithay::wayland::shell::xdg::{
-    ToplevelState, ToplevelStateSet, XdgToplevelSurfaceRoleAttributes
+    ToplevelState, ToplevelStateSet, XdgToplevelSurfaceRoleAttributes,
 };
 
 use crate::niri::State;
 use crate::protocols::EmptyData;
-use crate::window::mapped::MappedId;
 use crate::utils::with_toplevel_role_and_current;
+use crate::window::mapped::MappedId;
 
 const EXT_LIST_VERSION: u32 = 1;
 const WLR_MANAGEMENT_VERSION: u32 = 3;
@@ -69,13 +71,15 @@ pub trait ForeignToplevelHandler {
     fn unset_fullscreen(&mut self, wl_surface: WlSurface);
     fn set_maximized(&mut self, wl_surface: WlSurface);
     fn unset_maximized(&mut self, wl_surface: WlSurface);
+    fn set_minimized(&mut self, wl_surface: WlSurface);
+    fn unset_minimized(&mut self, wl_surface: WlSurface);
 }
 
 struct ToplevelData {
     identifier: MappedId,
     title: Option<String>,
     app_id: Option<String>,
-    states: ArrayVec<u32, 3>,
+    states: ArrayVec<u32, 4>,
     output: Option<Output>,
 
     ext_list_instances: HashSet<ExtForeignToplevelHandleV1>,
@@ -148,6 +152,7 @@ pub fn refresh(state: &mut State) {
     // Save the focused window for last, this way when the focus changes, we will first deactivate
     // the previous window and only then activate the newly focused window.
     let mut focused = None;
+    let mut focused_is_minimized = false;
     state.niri.layout.with_windows(|mapped, output, _, _| {
         let toplevel = mapped.toplevel();
         let wl_surface = toplevel.wl_surface();
@@ -159,6 +164,7 @@ pub fn refresh(state: &mut State) {
 
             if state.niri.keyboard_focus.surface() == Some(wl_surface) {
                 focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
+                focused_is_minimized = mapped.is_minimized();
             } else {
                 refresh_toplevel(
                     protocol_state,
@@ -168,6 +174,7 @@ pub fn refresh(state: &mut State) {
                     cur,
                     output,
                     false,
+                    mapped.is_minimized(),
                 );
             }
         });
@@ -191,6 +198,7 @@ pub fn refresh(state: &mut State) {
                 cur,
                 output.as_ref(),
                 true,
+                focused_is_minimized,
             );
         });
     }
@@ -254,6 +262,7 @@ pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_toplevel(
     protocol_state: &mut ForeignToplevelManagerState,
     wl_surface: &WlSurface,
@@ -262,8 +271,9 @@ fn refresh_toplevel(
     current: &ToplevelState,
     output: Option<&Output>,
     has_focus: bool,
+    is_minimized: bool,
 ) {
-    let states = to_state_vec(&current.states, has_focus);
+    let states = to_state_vec(&current.states, has_focus, is_minimized);
 
     match protocol_state.toplevels.entry(wl_surface.clone()) {
         Entry::Occupied(entry) => {
@@ -721,8 +731,10 @@ where
             zwlr_foreign_toplevel_handle_v1::Request::UnsetMaximized => {
                 state.unset_maximized(surface)
             }
-            zwlr_foreign_toplevel_handle_v1::Request::SetMinimized => (),
-            zwlr_foreign_toplevel_handle_v1::Request::UnsetMinimized => (),
+            zwlr_foreign_toplevel_handle_v1::Request::SetMinimized => state.set_minimized(surface),
+            zwlr_foreign_toplevel_handle_v1::Request::UnsetMinimized => {
+                state.unset_minimized(surface)
+            }
             zwlr_foreign_toplevel_handle_v1::Request::Activate { .. } => {
                 state.activate(surface);
             }
@@ -749,13 +761,23 @@ where
     }
 }
 
-fn to_state_vec(states: &ToplevelStateSet, has_focus: bool) -> ArrayVec<u32, 3> {
+fn to_state_vec(
+    states: &ToplevelStateSet,
+    has_focus: bool,
+    is_minimized: bool,
+) -> ArrayVec<u32, 4> {
     let mut rv = ArrayVec::new();
     if states.contains(xdg_toplevel::State::Maximized) {
         rv.push(zwlr_foreign_toplevel_handle_v1::State::Maximized as u32);
     }
     if states.contains(xdg_toplevel::State::Fullscreen) {
         rv.push(zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32);
+    }
+
+    // xdg-shell has no minimized state, so this is tracked by the layout rather than by the
+    // toplevel state set.
+    if is_minimized {
+        rv.push(zwlr_foreign_toplevel_handle_v1::State::Minimized as u32);
     }
 
     // HACK: wlr-foreign-toplevel-management states:

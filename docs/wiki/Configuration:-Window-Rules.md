@@ -52,6 +52,7 @@ window-rule {
     // Properties that apply continuously.
     draw-border-with-background false
     opacity 0.5
+    block-minimize true
     block-out-from "screencast"
     // block-out-from "screen-capture"
     variable-refresh-rate true
@@ -631,6 +632,28 @@ window-rule {
 }
 ```
 
+#### `block-minimize`
+
+Ignore `xdg_toplevel.set_minimized` requests coming from the window itself.
+
+Minimizing the window through a key binding, through `niri msg action minimize-window`, or from a taskbar still works; only the window's own requests are ignored.
+
+This is mainly useful for fullscreen games.
+Windows games leave exclusive fullscreen and minimize themselves whenever they lose focus, which under Wine means every time you switch to another window in niri.
+Without this rule, the game disappears from your layout on every window switch.
+
+```kdl
+window-rule {
+    match app-id=r#"^borderlands4\.exe$"#
+
+    block-minimize true
+}
+```
+
+> [!NOTE]
+> This does not stop the game from *leaving fullscreen* on focus loss, it only stops it from being taken out of the layout.
+> Wine's own `WAYLANDDRV_FOCUS_LOSS=0` environment variable suppresses the focus change itself.
+
 #### `opacity`
 
 Set the opacity of the window.
@@ -653,6 +676,25 @@ window-rule {
     opacity 0.95
 }
 ```
+
+#### `allow-tearing`
+
+Request screen tearing for this window, as if it had used the tearing-control protocol. Setting it
+to `false` suppresses the window's own tearing requests instead.
+
+```kdl
+// Allow tearing only when osu! has keyboard focus.
+window-rule {
+    match app-id="^osu!$" is-focused=true
+
+    allow-tearing true
+}
+```
+
+Whether the request is actually honored depends on the output's
+[`allow-tearing`](./Configuration:-Outputs.md#allow-tearing) setting, which by default only lets the
+focused fullscreen window tear. If you want a windowed application to tear, set `allow-tearing true`
+on the output as well.
 
 #### `variable-refresh-rate`
 

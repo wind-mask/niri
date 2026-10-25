@@ -8,7 +8,7 @@ use calloop::LoopHandle;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::RenderElement;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
@@ -16,13 +16,19 @@ use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
+use crate::layout::tile::TileRenderElement;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
+use crate::render_helpers::renderer::NiriCaptureRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
+use crate::layout::LayoutElementRenderElement;
+use crate::render_helpers::texture::UniversalTextureRenderElement;
+use crate::ui::minimized_strip::MinimizedStripRenderElement;
+use crate::ui::mru::WindowMruUiRenderElement;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
 pub struct Screencasting {
@@ -96,12 +102,13 @@ impl State {
             return Ok(None);
         };
 
-        let mut render_formats = self
-            .backend
-            .with_primary_renderer(|renderer| {
-                renderer.egl_context().dmabuf_render_formats().clone()
-            })
-            .unwrap_or_default();
+        let mut render_formats = crate::with_primary_renderer_any!(self.backend, |renderer| {
+            smithay::backend::renderer::Bind::<smithay::backend::allocator::dmabuf::Dmabuf>::supported_formats(
+                renderer,
+            )
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
 
         {
             let config = self.niri.config.borrow();
@@ -152,7 +159,7 @@ impl State {
 
         let id = match &cast.target {
             CastTarget::Nothing => {
-                self.backend.with_primary_renderer(|renderer| {
+                crate::with_primary_renderer_any!(self.backend, |renderer| {
                     if cast.dequeue_buffer_and_clear(renderer) {
                         cast.record_frame_time(get_monotonic_time());
                     }
@@ -202,7 +209,7 @@ impl State {
                 }
             }
 
-            self.backend.with_primary_renderer(|renderer| {
+            crate::with_primary_renderer_any!(self.backend, |renderer| {
                 let mut elements = Vec::new();
                 let mut pointer_location = Point::default();
 
@@ -236,12 +243,14 @@ impl State {
                 let cursor_data =
                     CursorData::compute(&elements, main_start, pointer_location, scale);
 
+                let reference_luminance = self.niri.output_capture_reference_luminance(output);
                 if cast.dequeue_buffer_and_render(
                     renderer,
                     &elements,
                     &cursor_data,
                     bbox.size,
                     scale,
+                    reference_luminance,
                 ) {
                     cast.record_frame_time(get_monotonic_time());
                 }
@@ -537,12 +546,21 @@ impl Niri {
         }
     }
 
-    pub fn render_for_screen_cast(
+    pub fn render_for_screen_cast<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
-    ) {
+    ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        CastRenderElement<R>: RenderElement<R>,
+        OutputRenderElements<R>: RenderElement<R>,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
+        TileRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_screen_cast");
 
         let weak = output.downgrade();
@@ -614,7 +632,15 @@ impl Niri {
             }
             let cursor_data = cursor_data.as_ref().unwrap();
 
-            if cast.dequeue_buffer_and_render(renderer, &elements, cursor_data, size, scale) {
+            let reference_luminance = self.output_capture_reference_luminance(output);
+            if cast.dequeue_buffer_and_render(
+                renderer,
+                &elements,
+                cursor_data,
+                size,
+                scale,
+                reference_luminance,
+            ) {
                 cast.record_frame_time(target_presentation_time);
             }
         }
@@ -625,12 +651,15 @@ impl Niri {
         }
     }
 
-    pub fn render_windows_for_screen_cast(
+    pub fn render_windows_for_screen_cast<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        CastRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_windows_for_screen_cast");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -699,7 +728,15 @@ impl Niri {
 
             let cursor_data = CursorData::compute(&elements, main_start, pointer_location, scale);
 
-            if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, bbox.size, scale) {
+            let reference_luminance = self.output_capture_reference_luminance(output);
+            if cast.dequeue_buffer_and_render(
+                renderer,
+                &elements,
+                &cursor_data,
+                bbox.size,
+                scale,
+                reference_luminance,
+            ) {
                 cast.record_frame_time(target_presentation_time);
             }
         }

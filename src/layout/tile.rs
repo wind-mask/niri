@@ -1,12 +1,13 @@
 use core::f64;
+use std::cell::OnceCell;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
-use smithay::backend::renderer::element::{Element, Kind};
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::{Element, Kind, RenderElement};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
@@ -23,11 +24,12 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -136,8 +138,7 @@ niri_render_elements! {
     }
 }
 
-pub type TileRenderSnapshot =
-    RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
+pub type TileRenderSnapshot = crate::layout::LayoutElementRenderSnapshot;
 
 #[derive(Debug)]
 struct ResizeAnimation {
@@ -1072,7 +1073,10 @@ impl<W: LayoutElement> Tile<W> {
         mut xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement<R>),
-    ) {
+    ) where
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Tile::render_inner");
 
         let scale = Scale::from(self.scale);
@@ -1137,8 +1141,6 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed_resize = false;
         if let Some(resize) = &self.resize_animation {
             if ResizeRenderElement::has_shader(ctx.renderer) {
-                let mut ctx = ctx.as_gles();
-
                 if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
                     let mut window_elements = Vec::new();
                     self.window.render_normal(
@@ -1176,7 +1178,7 @@ impl<W: LayoutElement> Tile<W> {
                         let elem = ResizeRenderElement::new(
                             area,
                             scale,
-                            texture_from.clone(),
+                            (texture_from.0.clone(), texture_from.1),
                             resize.snapshot.size,
                             (texture_current, texture_current_geo),
                             window_size,
@@ -1224,13 +1226,20 @@ impl<W: LayoutElement> Tile<W> {
                     // If we should clip to geometry, render a clipped window.
                     if clip_to_geometry {
                         if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                            if ClippedSurfaceRenderElement::will_clip(
+                                elem.inner(),
+                                scale,
+                                geo,
+                                radius,
+                            ) {
+                                let content = elem.content();
                                 return ClippedSurfaceRenderElement::new(
-                                    elem,
+                                    elem.into_inner(),
                                     scale,
                                     geo,
                                     shader.clone(),
                                     radius,
+                                    content,
                                 )
                                 .into();
                             }
@@ -1358,7 +1367,7 @@ impl<W: LayoutElement> Tile<W> {
 
         let surface_anim_scale = animated_window_size / window_size;
         self.window.render_background_effect(
-            ctx.as_gles(),
+            ctx.r(),
             area,
             self.scale,
             clip_to_geometry,
@@ -1376,7 +1385,12 @@ impl<W: LayoutElement> Tile<W> {
         xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement<R>),
-    ) {
+    ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Tile::render");
 
         let scale = Scale::from(self.scale);
@@ -1390,7 +1404,6 @@ impl<W: LayoutElement> Tile<W> {
         self.window().set_offscreen_data(None);
 
         if let Some(open) = &self.open_animation {
-            let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1417,7 +1430,6 @@ impl<W: LayoutElement> Tile<W> {
                 }
             }
         } else if let Some(alpha) = &self.alpha_animation {
-            let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1446,13 +1458,18 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
-    pub fn store_unmap_snapshot_if_empty(
+    pub fn store_unmap_snapshot_if_empty<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
-    ) {
+    ) where
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+    {
         if self.unmap_snapshot.is_some() {
             return;
         }
@@ -1461,14 +1478,40 @@ impl<W: LayoutElement> Tile<W> {
             Some(self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos));
     }
 
-    fn render_snapshot(
+    fn render_snapshot<R: NiriCaptureRenderer>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         mut xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
-    ) -> TileRenderSnapshot {
+    ) -> TileRenderSnapshot
+    where
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Tile::render_snapshot");
+
+        let scale = Scale::from(self.scale);
+        // Unlike the lazily-rendered contents of upstream snapshots, these are baked to textures
+        // right away: render elements borrow the renderer's lifetime on the TTY backend, so they
+        // cannot be stored in the snapshot.
+        let bake = |renderer: &mut R, elements: &[TileRenderElement<R>]| {
+            match crate::render_helpers::render_to_encompassing_texture(
+                renderer,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements,
+            ) {
+                Ok((texture, _sync_point, geo)) => Some((texture, geo)),
+                Err(err) => {
+                    warn!("error rendering tile snapshot contents to texture: {err:?}");
+                    None
+                }
+            }
+        };
 
         let mut contents = Vec::new();
         self.render(
@@ -1533,7 +1576,7 @@ impl<W: LayoutElement> Tile<W> {
                     false,
                     &mut |elem| contents.push(elem),
                 );
-                contents_with_blocked_out_bg = Some(contents);
+                contents_with_blocked_out_bg = Some(bake(renderer, &contents));
             } else {
                 xray.background[screencast_idx] = output_background.clone().unwrap();
                 xray.backdrop[screencast_idx] = output_backdrop.clone().unwrap();
@@ -1565,15 +1608,20 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
+        let texture = bake(renderer, &contents);
+        let blocked_out_texture = bake(renderer, &blocked_out_contents);
+
         RenderSnapshot {
-            contents,
-            contents_with_blocked_out_bg,
-            blocked_out_contents,
+            contents: Vec::new(),
+            contents_with_blocked_out_bg: contents_with_blocked_out_bg.as_ref().map(|_| Vec::new()),
+            blocked_out_contents: Vec::new(),
             block_out_from: self.window.rules().block_out_from,
             size: self.animated_tile_size(),
-            texture: Default::default(),
-            texture_with_blocked_out_bg: Default::default(),
-            blocked_out_texture: Default::default(),
+            texture: OnceCell::from(texture),
+            texture_with_blocked_out_bg: contents_with_blocked_out_bg
+                .map(OnceCell::from)
+                .unwrap_or_default(),
+            blocked_out_texture: OnceCell::from(blocked_out_texture),
         }
     }
 

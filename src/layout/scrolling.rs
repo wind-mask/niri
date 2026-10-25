@@ -7,7 +7,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{CenterFocusedColumn, PresetSize, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::RenderElement;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
@@ -18,9 +18,10 @@ use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
-use crate::layout::{RenderLayer, SizingMode};
+use crate::layout::{LayoutElementRenderElement, RenderLayer, SizingMode};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::utils::id::IdCounter;
@@ -1475,12 +1476,16 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         true
     }
 
-    pub fn start_close_animation_for_window(
+    pub fn start_close_animation_for_window<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         window: &W::Id,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let (tile, mut tile_pos) = self
             .tiles_with_render_positions_mut(false)
             .find(|(tile, _)| tile.window().id() == window)
@@ -1536,14 +1541,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
-    fn start_close_animation_for_tile(
+    fn start_close_animation_for_tile<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let anim = Animation::new(
             self.clock.clone(),
             0.,
@@ -2604,6 +2613,29 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         view.intersection(window_rect)
     }
 
+    /// Returns the geometry of the window matching id relative to and clamped to the view.
+    ///
+    /// During animations, assumes the final view position.
+    pub fn window_visual_rectangle(&self, id: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        let final_view_offset = self.view_offset.target();
+        let view_off = Point::from((-final_view_offset, 0.));
+
+        for col in &self.columns {
+            for (tile, pos) in col.tiles() {
+                if tile.window().id() == id {
+                    let window_pos = view_off + pos + tile.window_loc();
+                    let window_size = tile.window_size();
+                    let window_rect = Rectangle::new(window_pos, window_size);
+
+                    let view = Rectangle::from_size(self.view_size);
+                    return view.intersection(window_rect);
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn popup_target_rect(&self, id: &W::Id, overflow: bool) -> Option<Rectangle<f64, Logical>> {
         let view_pos = self.target_view_pos();
         let col_xs = self.column_xs(self.data.iter().copied());
@@ -2968,14 +3000,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         focus_ring: bool,
         layer: RenderLayer,
         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
-    ) {
+    ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+    {
         let scale = Scale::from(self.scale);
 
         // Draw the closing windows on top of the other windows.
         if layer.is_normal() {
             let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
             for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
+                let elem = closing.render(ctx.r(), view_rect, scale);
                 push(elem.into());
             }
         }

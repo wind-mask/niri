@@ -5,18 +5,20 @@ use std::rc::Rc;
 use glam::{Mat3, Vec2};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
-    ffi, link_program, Capability, GlesError, GlesFrame, GlesRenderer, GlesTexture, Uniform,
-    UniformDesc, UniformName,
+    ffi, link_program, Capability, GlesError, GlesFrame, GlesRenderer, Uniform, UniformDesc,
+    UniformName,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::DebugFlags;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
+use super::blend::FrameBlendState;
 use super::renderer::AsGlesFrame;
 use super::resources::Resources;
 use super::shaders::{ProgramType, Shaders};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::backend::tty_renderer::TtyOffscreen;
 
 /// Renders a shader with optional texture input, on the primary GPU.
 #[derive(Debug, Clone)]
@@ -30,12 +32,18 @@ pub struct ShaderRenderElement {
     scale: f32,
     alpha: f32,
     additional_uniforms: Rc<[Uniform<'static>]>,
-    textures: HashMap<String, GlesTexture>,
+    textures: HashMap<String, TtyOffscreen>,
     kind: Kind,
 }
 
 #[derive(Debug, Clone)]
-pub struct ShaderProgram(Rc<ShaderProgramInner>);
+pub enum ShaderProgram {
+    Gles(GlesShaderProgram),
+    Vulkan(smithay::backend::renderer::vulkan::VulkanPixelProgram),
+}
+
+#[derive(Debug, Clone)]
+pub struct GlesShaderProgram(Rc<ShaderProgramInner>);
 
 #[derive(Debug)]
 struct ShaderProgramInner {
@@ -60,7 +68,11 @@ struct ShaderProgramInternal {
 
 impl PartialEq for ShaderProgram {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        match (self, other) {
+            (ShaderProgram::Gles(a), ShaderProgram::Gles(b)) => Rc::ptr_eq(&a.0, &b.0),
+            (ShaderProgram::Vulkan(a), ShaderProgram::Vulkan(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -70,7 +82,7 @@ unsafe fn compile_program(
     additional_uniforms: &[UniformName<'_>],
     texture_uniforms: &[&str],
     // destruction_callback_sender: Sender<CleanupResource>,
-) -> Result<ShaderProgram, GlesError> {
+) -> Result<GlesShaderProgram, GlesError> {
     let shader = format!("#version 100\n{src}");
     let program = unsafe { link_program(gl, include_str!("shaders/texture.vert"), &shader)? };
     let debug_shader = format!("#version 100\n#define DEBUG_FLAGS\n{src}");
@@ -86,7 +98,7 @@ unsafe fn compile_program(
     let alpha = c"niri_alpha";
     let tint = c"niri_tint";
 
-    Ok(ShaderProgram(Rc::new(ShaderProgramInner {
+    Ok(GlesShaderProgram(Rc::new(ShaderProgramInner {
         normal: ShaderProgramInternal {
             program,
             uniform_matrix: gl.GetUniformLocation(program, matrix.as_ptr()),
@@ -164,16 +176,53 @@ impl ShaderProgram {
         additional_uniforms: &[UniformName<'_>],
         texture_uniforms: &[&str],
     ) -> Result<Self, GlesError> {
-        renderer.with_context(move |gl| unsafe {
-            compile_program(gl, src, additional_uniforms, texture_uniforms)
-        })?
+        // All niri shader programs get the blend-space transform (and its uniforms), so their
+        // output is correct on HDR outputs. The uniforms are set per draw from the frame's
+        // blend state.
+        let mut src = src.to_string();
+        src.push_str(include_str!("shaders/hdr.frag"));
+        let mut additional_uniforms = additional_uniforms.to_vec();
+        additional_uniforms.extend(FrameBlendState::uniform_names());
+
+        Ok(ShaderProgram::Gles(renderer.with_context(
+            move |gl| unsafe { compile_program(gl, &src, &additional_uniforms, texture_uniforms) },
+        )??))
+    }
+
+    /// Compiles the same program for the Vulkan renderer.
+    ///
+    /// The GLES source is transformed to Vulkan GLSL: uniform declarations move into the
+    /// generated std140 block, `niri_v_coords` becomes the vertex input, and alpha/tint come
+    /// from the push constants.
+    pub fn compile_vulkan(
+        renderer: &mut smithay::backend::renderer::vulkan::VulkanRenderer,
+        src: &str,
+        additional_uniforms: &[UniformName<'_>],
+        texture_uniforms: &[&str],
+    ) -> anyhow::Result<Self> {
+        let mut src = src.to_string();
+        src.push_str(include_str!("shaders/hdr.frag"));
+        let mut additional_uniforms = additional_uniforms.to_vec();
+        additional_uniforms.extend(FrameBlendState::uniform_names());
+
+        let program = super::shaders::compile_vulkan_program(
+            renderer,
+            &src,
+            &additional_uniforms,
+            texture_uniforms,
+        )?;
+        Ok(ShaderProgram::Vulkan(program))
     }
 
     pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
-        renderer.with_context(move |gl| unsafe {
-            gl.DeleteProgram(self.0.normal.program);
-            gl.DeleteProgram(self.0.debug.program);
-        })
+        match self {
+            ShaderProgram::Gles(program) => renderer.with_context(move |gl| unsafe {
+                gl.DeleteProgram(program.0.normal.program);
+                gl.DeleteProgram(program.0.debug.program);
+            }),
+            // Deferred destruction happens internally.
+            ShaderProgram::Vulkan(_) => Ok(()),
+        }
     }
 }
 
@@ -187,7 +236,7 @@ impl ShaderRenderElement {
         scale: f32,
         alpha: f32,
         additional_uniforms: Rc<[Uniform<'static>]>,
-        textures: HashMap<String, GlesTexture>,
+        textures: HashMap<String, TtyOffscreen>,
         kind: Kind,
     ) -> Self {
         Self {
@@ -230,7 +279,7 @@ impl ShaderRenderElement {
         scale: f32,
         alpha: f32,
         uniforms: Rc<[Uniform<'static>]>,
-        textures: HashMap<String, GlesTexture>,
+        textures: HashMap<String, TtyOffscreen>,
     ) {
         self.area.size = size;
         self.opaque_regions = opaque_regions.unwrap_or_default();
@@ -298,11 +347,17 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
     ) -> Result<(), GlesError> {
         let _span = tracy_client::span!("ShaderRenderElement::draw");
 
-        let frame = frame.as_gles_frame();
-
-        let Some(shader) = Shaders::get_from_frame(frame).program(self.program) else {
+        let Some(frame) = frame.as_gles_frame() else {
             return Ok(());
         };
+
+        let Some(ShaderProgram::Gles(shader)) =
+            Shaders::get_from_frame(frame).program(self.program)
+        else {
+            return Ok(());
+        };
+
+        let blend_uniforms = FrameBlendState::uniforms(frame);
 
         let Some(resources) = Resources::get(frame) else {
             return Ok(());
@@ -376,6 +431,23 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
         let has_debug = !frame.debug_flags().is_empty();
         let has_tint = frame.debug_flags().contains(DebugFlags::TINT);
 
+        #[cfg(test)]
+        draw_audit::record(draw_audit::DrawRecord {
+            program: self.program,
+            gl_program: Some(if has_debug {
+                shader.0.debug.program
+            } else {
+                shader.0.normal.program
+            }),
+            uniforms: self
+                .additional_uniforms
+                .iter()
+                .chain(&blend_uniforms)
+                .map(|uniform| uniform.name.to_string())
+                .collect(),
+            textures: self.textures.keys().cloned().collect(),
+        });
+
         // render
         let span_loc = smithay::gpu_span_location!("draw shader");
         frame.with_profiled_context(span_loc, move |gl| -> Result<(), GlesError> {
@@ -387,6 +459,9 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
 
             unsafe {
                 for (i, texture) in self.textures.values().enumerate() {
+                    let TtyOffscreen::Gles(texture) = texture else {
+                        return Ok(());
+                    };
                     gl.ActiveTexture(ffi::TEXTURE0 + i as u32);
                     gl.BindTexture(ffi::TEXTURE_2D, texture.tex_id());
                     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
@@ -439,6 +514,14 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
                                 GlesError::UnknownUniform(uniform.name.clone().into_owned())
                             })?;
                     uniform.value.set(gl, desc)?;
+                }
+
+                // Uniform values persist in the program object, so set the blend uniforms on
+                // every draw.
+                for uniform in &blend_uniforms {
+                    if let Some(desc) = program.additional_uniforms.get(&*uniform.name) {
+                        uniform.value.set(gl, desc)?;
+                    }
                 }
 
                 gl.EnableVertexAttribArray(program.attrib_vert as u32);
@@ -521,6 +604,122 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
     }
 }
 
+impl ShaderRenderElement {
+    fn draw_vulkan(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
+
+        let _span = tracy_client::span!("ShaderRenderElement::draw_vulkan");
+
+        let mut textures: Vec<(&str, &smithay::backend::renderer::vulkan::VulkanTexture)> =
+            Vec::with_capacity(self.textures.len());
+        for (name, texture) in &self.textures {
+            let TtyOffscreen::Vulkan(texture) = texture else {
+                return Ok(());
+            };
+            textures.push((name, texture));
+        }
+
+        let Some(program) = frame
+            .user_data()
+            .get::<Shaders>()
+            .and_then(|shaders| shaders.program(self.program))
+        else {
+            return Ok(());
+        };
+        let ShaderProgram::Vulkan(program) = program else {
+            return Ok(());
+        };
+
+        let mut uniforms: Vec<CustomUniform<'_>> = self
+            .additional_uniforms
+            .iter()
+            .filter_map(uniform_to_custom)
+            .collect();
+        uniforms.push(CustomUniform {
+            name: "niri_size",
+            value: CustomUniformValue::Vec2([dst.size.w as f32, dst.size.h as f32]),
+        });
+        uniforms.push(CustomUniform {
+            name: "niri_scale",
+            value: CustomUniformValue::Float(self.scale),
+        });
+        uniforms.extend(super::blend::vulkan_blend_custom_uniforms(
+            frame,
+            super::blend::ContentColor::default(),
+        ));
+
+        #[cfg(test)]
+        draw_audit::record(draw_audit::DrawRecord {
+            program: self.program,
+            gl_program: None,
+            uniforms: uniforms.iter().map(|u| u.name.to_string()).collect(),
+            textures: textures
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect(),
+        });
+
+        frame.render_custom(&program, dst, damage, &uniforms, &textures, self.alpha)
+    }
+}
+
+impl RenderElement<smithay::backend::renderer::vulkan::VulkanRenderer> for ShaderRenderElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        self.draw_vulkan(frame, dst, damage)
+    }
+
+    fn underlying_storage(
+        &self,
+        _renderer: &mut smithay::backend::renderer::vulkan::VulkanRenderer,
+    ) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+/// Converts a GLES uniform into an owned custom shader uniform, skipping unsupported types.
+pub(super) fn uniform_to_custom_owned(
+    uniform: &Uniform<'_>,
+) -> Option<smithay::backend::renderer::vulkan::OwnedCustomUniform> {
+    uniform_to_custom(uniform).map(|u| smithay::backend::renderer::vulkan::OwnedCustomUniform {
+        name: u.name.to_owned(),
+        value: u.value,
+    })
+}
+
+/// Converts a GLES uniform value into a custom shader uniform, skipping unsupported types.
+fn uniform_to_custom<'a>(
+    uniform: &'a Uniform<'_>,
+) -> Option<smithay::backend::renderer::vulkan::CustomUniform<'a>> {
+    use smithay::backend::renderer::gles::UniformValue;
+    use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
+
+    let value = match &uniform.value {
+        UniformValue::_1f(a) => CustomUniformValue::Float(*a),
+        UniformValue::_2f(a, b) => CustomUniformValue::Vec2([*a, *b]),
+        UniformValue::_3f(a, b, c) => CustomUniformValue::Vec3([*a, *b, *c]),
+        UniformValue::_4f(a, b, c, d) => CustomUniformValue::Vec4([*a, *b, *c, *d]),
+        UniformValue::Matrix3x3 { matrices, .. } => CustomUniformValue::Mat3(*matrices.first()?),
+        _ => return None,
+    };
+    Some(CustomUniform {
+        name: &uniform.name,
+        value,
+    })
+}
+
 impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
     fn draw(
         &self,
@@ -531,7 +730,17 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
+        if let TtyFrame::Vulkan(multi) = frame {
+            let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                multi.as_mut();
+            return self.draw_vulkan(vk_frame, dst, damage).map_err(|err| {
+                TtyRendererError::Vulkan(smithay::backend::renderer::multigpu::Error::Render(err))
+            });
+        }
+
+        let Some(frame) = frame.as_gles_frame() else {
+            return Ok(());
+        };
 
         RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
 
@@ -545,5 +754,94 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None
+    }
+}
+
+/// Records a draw with one of the renderer's custom texture programs into the test audit
+/// trail, and compiles to nothing outside of tests.
+///
+/// These programs (the rounded-corner clip, the postprocess, the gradient fade, the HDR
+/// texture shaders, the blur) belong to the renderer rather than to a
+/// [`ShaderRenderElement`], so a test cannot tell from the render elements alone whether a
+/// scene exercised them. See the `draw_audit` module.
+#[macro_export]
+macro_rules! audit_texture_program {
+    ($name:literal) => {
+        #[cfg(test)]
+        $crate::render_helpers::shader_element::draw_audit::record_texture_program($name);
+    };
+    ($name:literal, if $cond:expr) => {
+        #[cfg(test)]
+        if $cond {
+            $crate::render_helpers::shader_element::draw_audit::record_texture_program($name);
+        }
+    };
+}
+
+/// Test-only audit trail of the shader draws that a render pass performed.
+///
+/// Recording every draw's bound uniforms lets tests check them against the uniforms the
+/// linked program actually uses: GL silently leaves an unbound uniform at its previous (or
+/// zero) value, so forgetting to bind one is invisible at runtime and produces wrong pixels
+/// instead of an error. The records also tell a test which shader programs a scene really
+/// exercised, so a scene that stops producing an effect cannot pass vacuously.
+#[cfg(test)]
+pub mod draw_audit {
+    use std::cell::RefCell;
+
+    use super::ProgramType;
+
+    /// One [`ShaderRenderElement`](super::ShaderRenderElement) draw.
+    #[derive(Debug, Clone)]
+    pub struct DrawRecord {
+        /// Which of niri's shader programs was drawn.
+        pub program: ProgramType,
+        /// The GL program object of the draw, or `None` for a Vulkan draw.
+        pub gl_program: Option<u32>,
+        /// Names of every uniform that was given a value for this draw.
+        pub uniforms: Vec<String>,
+        /// Names of the texture samplers that were bound for this draw.
+        pub textures: Vec<String>,
+    }
+
+    thread_local! {
+        static RECORDS: RefCell<Option<Vec<DrawRecord>>> = const { RefCell::new(None) };
+        static TEXTURE_PROGRAMS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording draws on this thread, discarding any earlier records.
+    pub fn start() {
+        RECORDS.with(|records| *records.borrow_mut() = Some(Vec::new()));
+        TEXTURE_PROGRAMS.with(|programs| *programs.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stops recording and returns everything recorded since [`start`].
+    pub fn take() -> Vec<DrawRecord> {
+        RECORDS.with(|records| records.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Stops recording and returns the custom texture programs drawn since [`start`].
+    pub fn take_texture_programs() -> Vec<&'static str> {
+        TEXTURE_PROGRAMS.with(|programs| programs.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn record(record: DrawRecord) {
+        RECORDS.with(|records| {
+            if let Some(records) = &mut *records.borrow_mut() {
+                records.push(record);
+            }
+        });
+    }
+
+    /// Records a draw with one of the custom texture programs, which are owned by the
+    /// renderer rather than by a [`ShaderRenderElement`](super::ShaderRenderElement).
+    pub fn record_texture_program(name: &'static str) {
+        TEXTURE_PROGRAMS.with(|programs| {
+            if let Some(programs) = &mut *programs.borrow_mut() {
+                if !programs.contains(&name) {
+                    programs.push(name);
+                }
+            }
+        });
     }
 }

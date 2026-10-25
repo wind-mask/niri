@@ -842,6 +842,30 @@ pub enum Action {
     DebugToggleDamage {},
     /// Toggle the touchpad on/off at runtime.
     ToggleTouchpad {},
+    /// Minimize a window, taking it out of the layout.
+    MinimizeWindow {
+        /// Id of the window to minimize.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Restore a minimized window to its workspace and focus it.
+    UnminimizeWindow {
+        /// Id of the window to restore.
+        ///
+        /// If `None`, restores the most recently minimized window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Minimize a window, or restore it if it is already minimized.
+    ToggleWindowMinimized {
+        /// Id of the window to minimize or restore.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Move the focused window between the floating and the tiling layout.
     ToggleWindowFloating {
         /// Id of the window to move.
@@ -1396,6 +1420,23 @@ pub struct Window {
     pub is_floating: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
+    /// Whether this window is fullscreen.
+    ///
+    /// While visible, a fullscreen window fills its entire output, covering layer-shell panels.
+    /// That is what distinguishes it from a merely full-width column, which does not, and which
+    /// the size fields alone cannot tell you apart from fullscreen.
+    ///
+    /// Windows in *windowed* fullscreen report `false`: they carry the fullscreen state as far as
+    /// the client is concerned, but niri lays them out as ordinary tiles.
+    ///
+    /// A minimized window keeps whatever fullscreen state it will be restored with, so this can be
+    /// `true` together with `is_minimized`.
+    pub is_fullscreen: bool,
+    /// Whether this window is currently minimized.
+    ///
+    /// Minimized windows are not part of any workspace layout and are not rendered. The
+    /// `workspace_id` of a minimized window is the workspace it will be restored to.
+    pub is_minimized: bool,
     /// Position- and size-related properties of the window.
     pub layout: WindowLayout,
     /// Timestamp when the window was most recently focused.

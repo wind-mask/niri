@@ -77,6 +77,9 @@ pub struct ResolvedWindowRules {
     /// What to do on xdg-activation requests.
     pub on_xdg_activate: Option<OnXdgActivate>,
 
+    /// Whether to ignore `xdg_toplevel.set_minimized` requests from the client itself.
+    pub block_minimize: Option<bool>,
+
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
     /// Extra bound on the minimum window height.
@@ -114,6 +117,9 @@ pub struct ResolvedWindowRules {
 
     /// Whether to block out this window from certain render targets.
     pub block_out_from: Option<BlockOutFrom>,
+
+    /// Whether to enable screen tearing on this window's primary output.
+    pub allow_tearing: Option<bool>,
 
     /// Whether to enable VRR on this window's primary output if it is on-demand.
     pub variable_refresh_rate: Option<VrrRule>,
@@ -271,6 +277,10 @@ impl ResolvedWindowRules {
                     resolved.on_xdg_activate = Some(x);
                 }
 
+                if let Some(x) = rule.block_minimize {
+                    resolved.block_minimize = Some(x);
+                }
+
                 if let Some(x) = rule.min_width {
                     resolved.min_width = Some(x);
                 }
@@ -306,6 +316,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.block_out_from {
                     resolved.block_out_from = Some(x);
+                }
+                if let Some(x) = rule.allow_tearing {
+                    resolved.allow_tearing = Some(x);
                 }
                 if let Some(x) = rule.variable_refresh_rate {
                     resolved.variable_refresh_rate = Some(x);

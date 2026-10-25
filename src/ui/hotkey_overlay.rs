@@ -9,15 +9,16 @@ use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Scale, Transform};
 
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::backend::tty_renderer::TtyOffscreen;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::{
+    TextureBuffer, TextureRenderElement, UniversalTextureRenderElement,
+};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
@@ -35,7 +36,7 @@ pub struct HotkeyOverlay {
 }
 
 pub struct RenderedOverlay {
-    buffer: Option<TextureBuffer<GlesTexture>>,
+    buffer: Option<TextureBuffer<TtyOffscreen>>,
 }
 
 impl HotkeyOverlay {
@@ -79,7 +80,7 @@ impl HotkeyOverlay {
         &self,
         renderer: &mut R,
         output: &Output,
-    ) -> Option<PrimaryGpuTextureRenderElement> {
+    ) -> Option<UniversalTextureRenderElement> {
         if !self.is_open {
             return None;
         }
@@ -101,9 +102,9 @@ impl HotkeyOverlay {
         }
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
-            let renderer = renderer.as_gles_renderer();
             render(renderer, &self.config.borrow(), self.mod_key, scale)
-                .unwrap_or_else(|_| RenderedOverlay { buffer: None })
+                .ok()
+                .unwrap_or_else(|| RenderedOverlay { buffer: None })
         });
         let buffer = rendered.buffer.as_ref()?;
 
@@ -122,7 +123,7 @@ impl HotkeyOverlay {
             Kind::Unspecified,
         );
 
-        Some(PrimaryGpuTextureRenderElement(elem))
+        Some(UniversalTextureRenderElement(elem))
     }
 
     pub fn a11y_text(&self) -> String {
@@ -303,8 +304,8 @@ fn collect_actions(config: &Config) -> Vec<&Action> {
     actions
 }
 
-fn render(
-    renderer: &mut GlesRenderer,
+fn render<R: NiriRenderer>(
+    renderer: &mut R,
     config: &Config,
     mod_key: ModKey,
     scale: f64,
@@ -451,7 +452,7 @@ fn render(
     )?;
 
     Ok(RenderedOverlay {
-        buffer: Some(buffer),
+        buffer: Some(buffer.map_texture(R::wrap_texture)),
     })
 }
 

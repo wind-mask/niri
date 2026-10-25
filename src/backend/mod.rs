@@ -15,6 +15,8 @@ use crate::utils::id::IdCounter;
 pub mod tty;
 pub use tty::Tty;
 
+pub mod tty_renderer;
+
 pub mod winit;
 pub use winit::Winit;
 
@@ -26,6 +28,77 @@ pub enum Backend {
     Tty(Tty),
     Winit(Winit),
     Headless(Headless),
+}
+
+/// The primary renderer of a backend.
+#[allow(clippy::large_enum_variant)]
+pub enum PrimaryRenderer<'render> {
+    Tty(crate::backend::tty_renderer::TtyRenderer<'render>),
+    Gles(&'render mut GlesRenderer),
+}
+
+/// Runs a closure-like body with the backend's primary renderer, monomorphizing it over
+/// the possible renderer types (all implementing `NiriRenderer`).
+#[macro_export]
+macro_rules! with_primary_renderer_any {
+    ($backend:expr, |$renderer:ident| $body:expr) => {
+        match $backend.primary_renderer() {
+            Some($crate::backend::PrimaryRenderer::Tty(mut renderer)) => {
+                let $renderer = &mut renderer;
+                Some($body)
+            }
+            Some($crate::backend::PrimaryRenderer::Gles(renderer)) => {
+                let $renderer = renderer;
+                Some($body)
+            }
+            None => None,
+        }
+    };
+}
+
+/// HDR capabilities of an output, inserted into the [`Output`]'s user data by the backend.
+///
+/// `supported` requires the DRM connector to expose the `Colorspace` (with BT2020_RGB) and
+/// `HDR_OUTPUT_METADATA` properties, and the sink's EDID to advertise the PQ EOTF. On backends
+/// without HDR support (winit, headless) the user data entry is absent, which reads as
+/// unsupported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutputHdrCaps {
+    pub supported: bool,
+    /// Desired content max luminance from the EDID, in cd/m² (0 = not provided).
+    pub max_luminance: u16,
+    /// Desired content min luminance from the EDID, in 0.0001 cd/m² units (0 = not provided).
+    pub min_luminance: u16,
+    /// Desired content max frame-average luminance from the EDID, in cd/m² (0 = not provided).
+    pub max_frame_avg_luminance: u16,
+}
+
+impl OutputHdrCaps {
+    /// Applies the `peak-luminance` override from the output's HDR config, if any.
+    pub fn with_peak_luminance(self, peak_luminance: Option<f64>) -> Self {
+        let Some(peak) = peak_luminance else {
+            return self;
+        };
+        let (max_luminance, max_frame_avg_luminance) =
+            override_peak_luminance(peak, self.max_frame_avg_luminance);
+        Self {
+            max_luminance,
+            max_frame_avg_luminance,
+            ..self
+        }
+    }
+}
+
+/// The (max, max frame-average) luminance pair for a configured peak luminance: the peak
+/// replaces the max luminance, and caps the frame-average luminance, which can't exceed it.
+pub fn override_peak_luminance(peak: f64, max_frame_avg_luminance: u16) -> (u16, u16) {
+    let peak = peak.round().clamp(1., f64::from(u16::MAX)) as u16;
+    let frame_avg = if max_frame_avg_luminance > 0 {
+        max_frame_avg_luminance.min(peak)
+    } else {
+        0
+    };
+    (peak, frame_avg)
 }
 
 #[derive(PartialEq, Eq)]
@@ -93,6 +166,18 @@ impl Backend {
             Backend::Tty(tty) => tty.primary_render_node(),
             Backend::Winit(winit) => winit.primary_render_node(),
             Backend::Headless(headless) => headless.primary_render_node(),
+        }
+    }
+
+    /// Returns the primary renderer, GLES or Vulkan.
+    ///
+    /// Use through [`with_primary_renderer_any!`](crate::with_primary_renderer_any), which
+    /// monomorphizes a closure body over both renderer types.
+    pub fn primary_renderer(&mut self) -> Option<PrimaryRenderer<'_>> {
+        match self {
+            Backend::Tty(tty) => tty.primary_renderer(),
+            Backend::Winit(winit) => Some(PrimaryRenderer::Gles(winit.renderer())),
+            Backend::Headless(headless) => headless.renderer().map(PrimaryRenderer::Gles),
         }
     }
 
