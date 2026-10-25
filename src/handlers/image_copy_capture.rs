@@ -354,7 +354,10 @@ pub fn refresh_dynamic_cast_constraints(
             output_capture_constraints(render_formats, render_node, output)
         }
         Some(DynamicCastTarget::Window { mapped, output }) => Some(window_capture_constraints(
-            render_formats, render_node, mapped, output,
+            render_formats,
+            render_node,
+            mapped,
+            output,
         )),
     });
 }
@@ -686,9 +689,14 @@ impl ImageCopyCaptureHandler for State {
                 Some(DynamicCastTarget::Output(output)) => {
                     output_capture_constraints(render_formats.as_ref(), render_node, output)
                 }
-                Some(DynamicCastTarget::Window { mapped, output }) => Some(
-                    window_capture_constraints(render_formats.as_ref(), render_node, mapped, output),
-                ),
+                Some(DynamicCastTarget::Window { mapped, output }) => {
+                    Some(window_capture_constraints(
+                        render_formats.as_ref(),
+                        render_node,
+                        mapped,
+                        output,
+                    ))
+                }
             }
             // Like with the target not being picked, keep the session alive when we can't
             // build the real constraints.
@@ -775,13 +783,12 @@ impl ImageCopyCaptureHandler for State {
         // That output has to be redrawn for the frame to be completed: like any other cast, the
         // frame is captured together with the output's render pass.
         let frame_source = session.source();
-        let placeholder_output = if source_dynamic_cast(&frame_source)
-            && dynamic_cast_target(&self.niri).is_none()
-        {
-            dynamic_cast_placeholder_output(&self.niri)
-        } else {
-            None
-        };
+        let placeholder_output =
+            if source_dynamic_cast(&frame_source) && dynamic_cast_target(&self.niri).is_none() {
+                dynamic_cast_placeholder_output(&self.niri)
+            } else {
+                None
+            };
         let Some(s) = self
             .niri
             .image_copy_sessions

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation};
 use niri_ipc::SizeChange;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element as _, Kind};
 use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -32,6 +33,7 @@ use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shaders::ProgramType;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::superres::{self, ResampleFilter, SuperResElement};
 use crate::render_helpers::{blend, shaders, RenderCtx, RenderTarget};
 
 /// Reference and peak luminance of an HDR frame, in cd/m².
@@ -265,6 +267,175 @@ fn scene_with_effects_draws_gles() {
     assert!(drawn.contains(&"clipped_surface"), "drawn: {drawn:?}");
     assert!(drawn.contains(&"blur"), "drawn: {drawn:?}");
     assert!(drawn.contains(&"postprocess_and_clip"), "drawn: {drawn:?}");
+}
+
+/// The super-resolution resamplers compile for the GLES renderer.
+///
+/// The kernels are the same shader source for both renderers, but the GLES path goes through
+/// smithay's texture program interface, so a mismatch between the declared uniforms and what
+/// the GLSL reads only shows up at compile time.
+#[test]
+fn resample_programs_compile_gles() {
+    let Some(mut renderer) = gpu::gles_renderer() else {
+        return;
+    };
+
+    superres::init(&mut renderer, None);
+
+    let Some(programs) = renderer
+        .egl_context()
+        .user_data()
+        .get::<superres::SuperResPrograms>()
+    else {
+        // The capabilities probe failed; there is nothing to compile against.
+        return;
+    };
+
+    for filter in [ResampleFilter::Bilinear, ResampleFilter::Bicubic] {
+        assert!(
+            programs.program(filter).is_some(),
+            "the {} resampler did not compile for GLES",
+            filter_name(filter),
+        );
+    }
+}
+
+/// The super-resolution resamplers compile for the Vulkan renderer.
+///
+/// This exercises the GLSL-to-Vulkan translation: the shader is written in the GLES dialect,
+/// where `alpha`/`tint` are plain uniforms, and the shim turns them into push constants.
+#[test]
+fn resample_programs_compile_vulkan() {
+    let Some(mut renderer) = gpu::vulkan_renderer() else {
+        return;
+    };
+
+    superres::init_vulkan(&mut renderer);
+
+    let programs = renderer
+        .user_data()
+        .get::<superres::VulkanSuperResPrograms>()
+        .expect("init_vulkan() stores the programs in the renderer's user data");
+
+    for filter in [ResampleFilter::Bilinear, ResampleFilter::Bicubic] {
+        assert!(
+            programs.program(filter).is_some(),
+            "the {} resampler did not compile for Vulkan",
+            filter_name(filter),
+        );
+    }
+}
+
+/// The element draws through the Vulkan texture-program override.
+///
+/// This is the path a window with an `upscaling` rule takes on the Vulkan renderer: the
+/// element installs the resampling program for its own draw, then restores the previous
+/// override.
+#[test]
+fn resample_draws_vulkan() {
+    use smithay::wayland::compositor::with_states;
+
+    let Some(mut renderer) = gpu::vulkan_renderer() else {
+        return;
+    };
+    superres::init_vulkan(&mut renderer);
+
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    add_window(&mut f);
+    settle(&mut f);
+
+    let surface = f
+        .niri()
+        .layout
+        .windows()
+        .next()
+        .expect("expected a mapped window")
+        .1
+        .toplevel()
+        .wl_surface()
+        .clone();
+
+    let element = with_states(&surface, |states| {
+        WaylandSurfaceRenderElement::from_surface(
+            &mut renderer,
+            &surface,
+            states,
+            Point::<f64, Physical>::from((0., 0.)),
+            1.,
+            Kind::Unspecified,
+        )
+    })
+    .expect("error importing the window surface")
+    .expect("the window surface should be mapped");
+
+    let element = SuperResElement::new(element, ResampleFilter::Bicubic);
+    let size = element.geometry(Scale::from(1.)).size;
+
+    gpu::render_offscreen_audited(&mut renderer, size, 1., &[element])
+        .expect("error rendering the resampling element")
+        .assert_drew_texture(&["bicubic"]);
+}
+
+/// The same element draw on the GLES renderer.
+#[test]
+fn resample_draws_gles() {
+    use smithay::wayland::compositor::with_states;
+
+    let Some(mut renderer) = gpu::gles_renderer() else {
+        return;
+    };
+    superres::init(&mut renderer, None);
+    if superres::capabilities(&mut renderer).is_none() {
+        // The capabilities probe failed; the programs were not compiled.
+        return;
+    }
+
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    add_window(&mut f);
+    settle(&mut f);
+
+    let surface = f
+        .niri()
+        .layout
+        .windows()
+        .next()
+        .expect("expected a mapped window")
+        .1
+        .toplevel()
+        .wl_surface()
+        .clone();
+
+    let element = with_states(&surface, |states| {
+        WaylandSurfaceRenderElement::from_surface(
+            &mut renderer,
+            &surface,
+            states,
+            Point::<f64, Physical>::from((0., 0.)),
+            1.,
+            Kind::Unspecified,
+        )
+    })
+    .expect("error importing the window surface")
+    .expect("the window surface should be mapped");
+
+    let element = SuperResElement::new(element, ResampleFilter::Bicubic);
+    let size = element.geometry(Scale::from(1.)).size;
+
+    gpu::render_offscreen_audited(&mut renderer, size, 1., &[element])
+        .expect("error rendering the resampling element")
+        .assert_drew_texture(&["bicubic"]);
+}
+
+/// Name of a resampling kernel, for assertions.
+fn filter_name(filter: ResampleFilter) -> &'static str {
+    match filter {
+        ResampleFilter::Bilinear => "bilinear",
+        ResampleFilter::Bicubic => "bicubic",
+    }
 }
 
 /// Renders the window opening animation, with and without a custom shader.

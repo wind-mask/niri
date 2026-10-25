@@ -5,8 +5,9 @@
 //! type, so only the frame, framebuffer, error and texture-mapping types need wrapping.
 //!
 //! The GLES-specific parts of niri (custom shaders, offscreen effects) reach the raw
-//! [`GlesRenderer`] through [`AsGlesRenderer`](super::super::render_helpers::renderer::AsGlesRenderer),
-//! which returns `None` on the Vulkan variant; the effects degrade gracefully in that case.
+//! [`GlesRenderer`] through
+//! [`AsGlesRenderer`](super::super::render_helpers::renderer::AsGlesRenderer), which returns `None`
+//! on the Vulkan variant; the effects degrade gracefully in that case.
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;

@@ -39,6 +39,9 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::backend::renderer::multigpu::MultiTexture;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::vulkan::{
+    OwnedCustomUniform, VulkanError, VulkanFrame, VulkanPixelProgram, VulkanRenderer,
+};
 use smithay::backend::renderer::{
     buffer_y_inverted, Bind as _, Color32F, ContextId, Frame as _, ImportAll, Offscreen as _,
     Renderer, Texture, TextureFilter,
@@ -51,6 +54,7 @@ use crate::render_helpers::renderer::{
     gpu_diagnostics, AsGlesFrame as _, ClientBufferDebug, GpuDebug, NiriRenderer, TextureDebug,
     GPU_LOG_TARGET,
 };
+use crate::render_helpers::shaders::compile_vulkan_program;
 
 /// Resampling kernel for a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,7 +669,7 @@ impl SuperResPrograms {
         renderer.egl_context().user_data().get()
     }
 
-    fn program(&self, filter: ResampleFilter) -> Option<GlesTexProgram> {
+    pub(crate) fn program(&self, filter: ResampleFilter) -> Option<GlesTexProgram> {
         match filter {
             ResampleFilter::Bilinear => self.bilinear.clone(),
             ResampleFilter::Bicubic => self.bicubic.clone(),
@@ -699,6 +703,94 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
         gpu = ?GpuDebug::renderer(renderer),
         "initialized super-resolution execution context; texture IDs are context-local",
     );
+}
+
+/// Super-resolution programs compiled for the Vulkan renderer.
+///
+/// Only the single-pass resampling kernels live here: they reuse the same `resample.frag`
+/// source as the GLES path, translated by [`compile_vulkan_program()`]. FSR1 and CuNNy run
+/// their passes offscreen through a `GlesRenderer`, so on Vulkan the element falls back to the
+/// renderer's own sampling instead.
+pub struct VulkanSuperResPrograms {
+    bilinear: Option<VulkanPixelProgram>,
+    bicubic: Option<VulkanPixelProgram>,
+}
+
+impl VulkanSuperResPrograms {
+    fn compile(renderer: &mut VulkanRenderer) -> Self {
+        Self {
+            bilinear: Self::compile_filter(renderer, ResampleFilter::Bilinear),
+            bicubic: Self::compile_filter(renderer, ResampleFilter::Bicubic),
+        }
+    }
+
+    fn compile_filter(
+        renderer: &mut VulkanRenderer,
+        filter: ResampleFilter,
+    ) -> Option<VulkanPixelProgram> {
+        let index = match filter {
+            ResampleFilter::Bilinear => 0,
+            ResampleFilter::Bicubic => 1,
+        };
+        let name = match filter {
+            ResampleFilter::Bilinear => "bilinear",
+            ResampleFilter::Bicubic => "bicubic",
+        };
+
+        // `alpha` and `tint` are plain uniforms in the GLES dialect, but the Vulkan path
+        // provides them through the push constants that the shader shim defines.
+        let source = format!(
+            "#define alpha niri_alpha\n#define tint niri_tint\n{source}",
+            source = include_str!("shaders/superres/resample.frag").replace(
+                "// niri:resample-filter",
+                &format!("#define NIRI_RESAMPLE_FILTER {index}"),
+            ),
+        );
+
+        match compile_vulkan_program(
+            renderer,
+            &source,
+            &[
+                UniformName::new("niri_tex_size", UniformType::_2f),
+                UniformName::new("niri_src_rect", UniformType::_4f),
+            ],
+            &["tex"],
+        ) {
+            Ok(program) => Some(program),
+            Err(err) => {
+                warn!("super resolution: error compiling the {name} shader for vulkan: {err:?}");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn program(&self, filter: ResampleFilter) -> Option<VulkanPixelProgram> {
+        match filter {
+            ResampleFilter::Bilinear => self.bilinear.clone(),
+            ResampleFilter::Bicubic => self.bicubic.clone(),
+        }
+    }
+}
+
+/// Compiles the super-resolution programs for the Vulkan renderer.
+///
+/// The counterpart of [`init()`], called once when the TTY backend initializes its Vulkan
+/// renderer. The programs are stored in the renderer's own user data, since they are not tied
+/// to an EGL context.
+pub fn init_vulkan(renderer: &mut VulkanRenderer) {
+    let programs = VulkanSuperResPrograms::compile(renderer);
+    let compiled = programs.bilinear.is_some() || programs.bicubic.is_some();
+
+    if !renderer.user_data().insert_if_missing(|| programs) {
+        error!("super resolution: the vulkan programs were already compiled");
+        return;
+    }
+
+    if compiled {
+        info!("super resolution: compiled the resampling shaders for the vulkan renderer");
+    } else {
+        warn!("super resolution: no resampling shader compiled for the vulkan renderer");
+    }
 }
 
 /// Returns the capabilities probed for this renderer context, if any.
@@ -1010,6 +1102,42 @@ where
         let uniforms = self.resample_uniforms(src)?;
         Some((program, uniforms.to_vec()))
     }
+
+    /// Returns the Vulkan resampling program and the uniforms it needs.
+    ///
+    /// The counterpart of [`Self::resample_program()`]: the program is looked up in the
+    /// renderer's own user data, and the same `niri_tex_size`/`niri_src_rect` uniforms are
+    /// translated into the custom-program block.
+    fn vulkan_resample(
+        &self,
+        frame: &VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+    ) -> Option<(VulkanPixelProgram, Vec<OwnedCustomUniform>)> {
+        let ElementKernel::Filter(filter) = self.kernel else {
+            return None;
+        };
+
+        let Some(program) = frame
+            .user_data()
+            .get::<VulkanSuperResPrograms>()
+            .and_then(|programs| programs.program(filter))
+        else {
+            trace!(
+                target: GPU_LOG_TARGET,
+                ?filter,
+                reason = "no resampling program for the vulkan renderer",
+                "renderer-default fallback",
+            );
+            return None;
+        };
+
+        let uniforms: Vec<OwnedCustomUniform> = self
+            .resample_uniforms(src)?
+            .iter()
+            .filter_map(super::shader_element::uniform_to_custom_owned)
+            .collect();
+        Some((program, uniforms))
+    }
 }
 
 impl<R: Renderer + ImportAll> Element for SuperResElement<R> {
@@ -1198,6 +1326,14 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                 }
                 Some((program, uniforms)) => {
                     executed_pass = self.kernel.draw_pass();
+                    crate::audit_texture_program!(
+                        "bilinear",
+                        if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bilinear))
+                    );
+                    crate::audit_texture_program!(
+                        "bicubic",
+                        if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bicubic))
+                    );
                     frame.override_default_tex_program(program, uniforms);
                     let res = draw_inner_gles(
                         &self.inner,
@@ -1272,6 +1408,58 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
     }
 }
 
+impl RenderElement<VulkanRenderer> for SuperResElement<VulkanRenderer> {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        // Only the single-pass resampling kernels have a Vulkan implementation; the FSR1 and
+        // CuNNy chains need a `GlesRenderer` for their offscreen passes.
+        let installed = if matches!(self.kernel, ElementKernel::Filter(_)) {
+            self.vulkan_resample(frame, src).map(|(program, uniforms)| {
+                crate::audit_texture_program!(
+                    "bilinear",
+                    if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bilinear))
+                );
+                crate::audit_texture_program!(
+                    "bicubic",
+                    if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bicubic))
+                );
+                let saved = frame.take_tex_program_override();
+                frame.set_tex_program_override(Some((program, uniforms)));
+                saved
+            })
+        } else {
+            None
+        };
+
+        let res = RenderElement::<VulkanRenderer>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        );
+
+        if let Some(saved) = installed {
+            frame.set_tex_program_override(saved);
+        }
+
+        res
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
 impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRenderer<'render>> {
     fn draw(
         &self,
@@ -1282,17 +1470,10 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        // Vulkan 渲染器上没有 GLES 帧，超分管线不可用，退回渲染器自带采样。
+        // Vulkan 渲染器上没有 GLES 帧：单 pass 的重采样内核走 Vulkan 的自定义纹理程序，
+        // 其余内核（FSR1、CuNNy 的离屏链路）退回渲染器自带采样。
         if frame.as_gles_frame().is_none() {
-            return RenderElement::<TtyRenderer<'render>>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            );
+            return self.draw_non_gles(frame, src, dst, damage, opaque_regions, cache);
         }
 
         // The element draws with the renderer's own sampling, so there is nothing to measure.
@@ -1306,17 +1487,28 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                 opaque_regions,
                 cache,
             );
-            self.log_draw(frame.as_gles_frame().expect("gles frame checked above"), "renderer-default", dst, res.is_ok());
+            self.log_draw(
+                frame.as_gles_frame().expect("gles frame checked above"),
+                "renderer-default",
+                dst,
+                res.is_ok(),
+            );
             return res;
         }
 
-        self.timings.begin(frame.as_gles_frame().expect("gles frame checked above"), Pass::Draw);
+        self.timings.begin(
+            frame.as_gles_frame().expect("gles frame checked above"),
+            Pass::Draw,
+        );
         let mut executed_pass = "renderer-default";
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
             ElementKernel::Filter(_) => {
-                match self.resample_program(frame.as_gles_frame().expect("gles frame checked above"), src) {
+                match self.resample_program(
+                    frame.as_gles_frame().expect("gles frame checked above"),
+                    src,
+                ) {
                     // Fall back to the renderer's own sampling.
                     None => RenderElement::<TtyRenderer<'render>>::draw(
                         &self.inner,
@@ -1342,7 +1534,10 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                             opaque_regions,
                             cache,
                         );
-                        frame.as_gles_frame().expect("gles frame checked above").clear_tex_program_override();
+                        frame
+                            .as_gles_frame()
+                            .expect("gles frame checked above")
+                            .clear_tex_program_override();
                         res
                     }
                 }
@@ -1373,7 +1568,10 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
                             opaque_regions,
                             cache,
                         );
-                        frame.as_gles_frame().expect("gles frame checked above").clear_tex_program_override();
+                        frame
+                            .as_gles_frame()
+                            .expect("gles frame checked above")
+                            .clear_tex_program_override();
                         res
                     }
                     // Fall back to the renderer's own sampling.
@@ -1428,8 +1626,14 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
             }
         };
 
-        self.timings.end(frame.as_gles_frame().expect("gles frame checked above"));
-        self.log_draw(frame.as_gles_frame().expect("gles frame checked above"), executed_pass, dst, res.is_ok());
+        self.timings
+            .end(frame.as_gles_frame().expect("gles frame checked above"));
+        self.log_draw(
+            frame.as_gles_frame().expect("gles frame checked above"),
+            executed_pass,
+            dst,
+            res.is_ok(),
+        );
         res
     }
 
@@ -1438,6 +1642,63 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         _renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
         None
+    }
+}
+
+impl<'render> SuperResElement<TtyRenderer<'render>> {
+    /// Draws on a renderer without a GLES frame, i.e. the Vulkan one.
+    ///
+    /// The resampling kernels are single-pass, so they map onto the Vulkan texture-program
+    /// override: the program replaces the built-in texture shader for this one draw and
+    /// samples the same `tex` binding. Everything else (the FSR1 and CuNNy chains, whose
+    /// passes need a `GlesRenderer`) draws the surface the normal way.
+    fn draw_non_gles(
+        &self,
+        frame: &mut TtyFrame<'render, '_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), TtyRendererError<'render>> {
+        // The override that was in place before this draw, if one was installed at all.
+        let mut installed = None;
+
+        if let (ElementKernel::Filter(_), TtyFrame::Vulkan(multi)) = (&self.kernel, &mut *frame) {
+            let vk_frame: &mut VulkanFrame<'_, '_> = multi.as_mut();
+            if let Some((program, uniforms)) = self.vulkan_resample(vk_frame, src) {
+                crate::audit_texture_program!(
+                    "bilinear",
+                    if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bilinear))
+                );
+                crate::audit_texture_program!(
+                    "bicubic",
+                    if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bicubic))
+                );
+                let saved = vk_frame.take_tex_program_override();
+                vk_frame.set_tex_program_override(Some((program, uniforms)));
+                installed = Some(saved);
+            }
+        }
+
+        let res = RenderElement::<TtyRenderer<'render>>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        );
+
+        if let Some(saved) = installed {
+            if let TtyFrame::Vulkan(multi) = frame {
+                let vk_frame: &mut VulkanFrame<'_, '_> = multi.as_mut();
+                vk_frame.set_tex_program_override(saved);
+            }
+        }
+
+        res
     }
 }
 
@@ -2208,10 +2469,11 @@ fn run_cunny(
                         format!("error starting pass {pass_number} group {group_number}")
                     })?;
 
-                // A run is measured as a whole: what a user has to weigh is what running the network
-                // costs, and the passes are short enough that timing each of them separately would
-                // mostly measure the queries. The draw that applies the residuals is measured on its
-                // own, since it happens once per composited frame rather than once per client frame.
+                // A run is measured as a whole: what a user has to weigh is what running the
+                // network costs, and the passes are short enough that timing each
+                // of them separately would mostly measure the queries. The draw
+                // that applies the residuals is measured on its own, since it
+                // happens once per composited frame rather than once per client frame.
                 let first = pass_index == 0 && group == 0;
                 let last =
                     pass_index + 1 == variant.passes().len() && group + 1 == pass.shaders.len();
@@ -3005,7 +3267,8 @@ impl SuperResolutionPipeline {
             Ok(out) => out,
             Err(err) => {
                 // Logged every time rather than once: a pass that fails every frame is exactly what
-                // the Hybrid work has to be able to see, and the file this goes to keeps everything.
+                // the Hybrid work has to be able to see, and the file this goes to keeps
+                // everything.
                 debug!(
                     target: GPU_LOG_TARGET,
                     window = id,
@@ -3034,15 +3297,15 @@ impl SuperResolutionPipeline {
 
     /// Wraps a surface element, running the EASU or CuNNy pass first if the cached result is stale.
     ///
-    /// `renderer` must be the GLES renderer that will draw the element, and `scale` is the output
-    /// scale that the element is drawn at. When `on_screen` is `false`, the element lies outside
+    /// `renderer` is the renderer that will draw the element, and `scale` is the output scale
+    /// that the element is drawn at. When `on_screen` is `false`, the element lies outside
     /// the visible viewport and skips offscreen passes entirely. The returned element falls back
     /// to drawing the client buffer normally when the pass cannot run or when its result is not
     /// valid for the renderer that ends up drawing it.
     #[allow(clippy::too_many_arguments)]
     pub fn element<R: NiriRenderer>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         elem: WaylandSurfaceRenderElement<R>,
         kernel: SuperResKernel,
         scale: Scale<f64>,
@@ -3068,15 +3331,18 @@ impl SuperResolutionPipeline {
             None => elem.geometry(scale).size,
         };
 
-        // The passes run in this renderer's context, which is where their timings belong.
-        self.timings
-            .set_context(context_address(renderer.egl_context()));
-        self.log_timings(id, kernel, dest_size, renderer);
+        // The passes run in this renderer's context, which is where their timings belong. The
+        // Vulkan renderer has no GLES context, so it reports no pass timings.
+        if let Some(gles) = renderer.as_gles_renderer() {
+            self.timings
+                .set_context(context_address(gles.egl_context()));
+            self.log_timings(id, kernel, dest_size, gles);
+        }
 
         if !on_screen {
             trace!(
                 target: GPU_LOG_TARGET,
-                gpu = ?GpuDebug::renderer(renderer),
+                gpu = ?renderer.as_gles_renderer().as_deref().map(GpuDebug::renderer),
                 ?dest_size,
                 "element is offscreen; skipping super-resolution pass",
             );
@@ -3088,23 +3354,24 @@ impl SuperResolutionPipeline {
         }
 
         if gpu_diagnostics() {
-            let native = match elem.texture() {
-                WaylandSurfaceTexture::Texture(texture) => {
-                    texture.pass_texture(&renderer.context_id())
-                }
-                WaylandSurfaceTexture::SolidColor(_) => None,
-            };
-            // A client texture with no native texture in this context is the window that goes
-            // through Smithay's import/copy path, which is what the Hybrid work has to see. The
-            // healthy case is the same entry for every window of every frame, so it stays out of
-            // the default file.
-            let native_is_missing =
-                native.is_none() && matches!(elem.texture(), WaylandSurfaceTexture::Texture(_));
-            macro_rules! log_input {
+            if let Some(gles) = renderer.as_gles_renderer() {
+                let native = match elem.texture() {
+                    WaylandSurfaceTexture::Texture(texture) => {
+                        texture.pass_texture(&gles.context_id())
+                    }
+                    WaylandSurfaceTexture::SolidColor(_) => None,
+                };
+                // A client texture with no native texture in this context is the window that goes
+                // through Smithay's import/copy path, which is what the Hybrid work has to see. The
+                // healthy case is the same entry for every window of every frame, so it stays out
+                // of the default file.
+                let native_is_missing =
+                    native.is_none() && matches!(elem.texture(), WaylandSurfaceTexture::Texture(_));
+                macro_rules! log_input {
                 ($level:ident) => {
                     $level!(
                         target: GPU_LOG_TARGET,
-                        gpu = ?GpuDebug::renderer(renderer),
+                        gpu = ?GpuDebug::renderer(gles),
                         kernel = %kernel,
                         client_buffer = ?ClientBufferDebug(elem.buffer()),
                         native_texture = ?native.as_ref().map(TextureDebug),
@@ -3115,17 +3382,18 @@ impl SuperResolutionPipeline {
                     );
                 };
             }
-            if native_is_missing {
-                log_input!(debug);
-            } else {
-                log_input!(trace);
-            }
-            if let WaylandSurfaceTexture::Texture(texture) = elem.texture() {
-                trace!(
-                    target: GPU_LOG_TARGET,
-                    smithay_texture = ?texture,
-                    "raw import/cache state (not a stable path classifier)",
-                );
+                if native_is_missing {
+                    log_input!(debug);
+                } else {
+                    log_input!(trace);
+                }
+                if let WaylandSurfaceTexture::Texture(texture) = elem.texture() {
+                    trace!(
+                        target: GPU_LOG_TARGET,
+                        smithay_texture = ?texture,
+                        "raw import/cache state (not a stable path classifier)",
+                    );
+                }
             }
         }
 
@@ -3138,7 +3406,7 @@ impl SuperResolutionPipeline {
         if magnify.is_none() && !has_something_to_magnify(elem.src().size, dest_size) {
             trace!(
                 target: GPU_LOG_TARGET,
-                gpu = ?GpuDebug::renderer(renderer),
+                gpu = ?renderer.as_gles_renderer().as_deref().map(GpuDebug::renderer),
                 src = ?elem.src(),
                 ?dest_size,
                 "nothing to magnify; selecting renderer-default sampling",
@@ -3161,12 +3429,15 @@ impl SuperResolutionPipeline {
 
         let params = match kernel {
             SuperResKernel::Cunny(variant) => {
-                let Some(result) = self.cunny_result(renderer, variant, &elem, scale, id) else {
+                let Some(result) = renderer
+                    .as_gles_renderer()
+                    .and_then(|gles| self.cunny_result(gles, variant, &elem, scale, id))
+                else {
                     trace!(
                         target: GPU_LOG_TARGET,
                         requested_kernel = %kernel,
                         fallback_kernel = "bicubic",
-                        gpu = ?GpuDebug::renderer(renderer),
+                        gpu = ?renderer.as_gles_renderer().as_deref().map(GpuDebug::renderer),
                         "CuNNy result unavailable; selecting single-pass fallback",
                     );
                     if self.log_once(logged::NO_PASS) {
@@ -3202,12 +3473,15 @@ impl SuperResolutionPipeline {
             SuperResKernel::Fsr1(params) => params,
         };
 
-        let Some(texture) = self.fsr1_result(renderer, &elem, dest_size, scale, id) else {
+        let Some(texture) = renderer
+            .as_gles_renderer()
+            .and_then(|gles| self.fsr1_result(gles, &elem, dest_size, scale, id))
+        else {
             trace!(
                 target: GPU_LOG_TARGET,
                 requested_kernel = %kernel,
                 fallback_kernel = "bicubic",
-                gpu = ?GpuDebug::renderer(renderer),
+                gpu = ?renderer.as_gles_renderer().as_deref().map(GpuDebug::renderer),
                 "EASU result unavailable; selecting single-pass fallback",
             );
             if self.log_once(logged::NO_PASS) {

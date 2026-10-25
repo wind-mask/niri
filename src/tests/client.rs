@@ -357,8 +357,8 @@ impl Client {
         self.state.window(surface)
     }
 
-    /// Drives the color-management requests `wayland-info` sends: bind an output's image description
-    /// and query its information.
+    /// Drives the color-management requests `wayland-info` sends: bind an output's image
+    /// description and query its information.
     pub fn probe_output_color_management(&mut self) {
         let manager = self.state.color_manager.clone().expect("manager not bound");
         let output = self.state.outputs.keys().next().expect("no output").clone();

@@ -6709,17 +6709,15 @@ impl Niri {
         };
 
         let res = match capture_buffer {
-            CaptureBuffer::Dma(dmabuf) => {
-                render_to_dmabuf(
-                    renderer,
-                    &mut s.damage_tracker,
-                    dmabuf,
-                    elements,
-                    states,
-                    reference_luminance,
-                )
-                    .map(Some)
-            }
+            CaptureBuffer::Dma(dmabuf) => render_to_dmabuf(
+                renderer,
+                &mut s.damage_tracker,
+                dmabuf,
+                elements,
+                states,
+                reference_luminance,
+            )
+            .map(Some),
             CaptureBuffer::Shm => render_to_shm(
                 renderer,
                 &mut s.damage_tracker,

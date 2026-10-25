@@ -7,9 +7,9 @@ use smithay::utils::{Logical, Physical, Point, Scale};
 use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
-use super::superres::{ResampleFilter, SuperResElement};
 use super::blend::{BlendSurfaceRenderElement, ContentColor};
 use super::renderer::NiriRenderer;
+use super::superres::{ResampleFilter, SuperResElement};
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
 use crate::backend::tty_renderer::TtyOffscreen;

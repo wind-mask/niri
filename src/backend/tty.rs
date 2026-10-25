@@ -168,7 +168,6 @@ pub fn native_texture(
 #[allow(dead_code)]
 pub type TtyRendererError<'render> = super::tty_renderer::TtyRendererError;
 
-
 type GbmDrmCompositor = DrmCompositor<
     GbmAllocator<DeviceFd>,
     GbmFramebufferExporter<DeviceFd>,
@@ -858,7 +857,6 @@ impl Tty {
                         // state another chance after resume.
                         surface.failed_color_state = None;
 
-
                         if let Some(gamma_props) = &mut surface.gamma_props {
                             if let Some(ramp) = surface.pending_gamma_change.take() {
                                 if let Err(err) = gamma_props.set_gamma(&device.drm, ramp) {
@@ -1017,13 +1015,15 @@ impl Tty {
                 resources::init(gles_renderer);
                 shaders::init(gles_renderer);
                 blend::FrameBlendState::init(gles_renderer);
-                // 超分管线只在 GLES 上可用，Vulkan 渲染器下自动跳过。
+                // 超分在 GLES 上跑全部内核；Vulkan 侧只有单 pass 重采样，见下面的初始化。
                 superres::init(
                     gles_renderer,
                     self.primary_render_node.dev_path().as_deref(),
                 );
             } else if renderer.as_vulkan_renderer().is_some() {
-                shaders::init_vulkan(renderer.as_vulkan_renderer().unwrap());
+                let vulkan_renderer = renderer.as_vulkan_renderer().unwrap();
+                shaders::init_vulkan(vulkan_renderer);
+                superres::init_vulkan(vulkan_renderer);
                 info!("running on the vulkan renderer");
             }
 
@@ -1873,7 +1873,8 @@ impl Tty {
 
         // Do one throwaway `render_frame` — the exact path that would fail — and, if it errors,
         // recreate the compositor with 8-bit formats. HDR signalling still works on an 8-bit
-        // framebuffer, just with banding. Only runs for 10-bit HDR outputs, once per connector at setup.
+        // framebuffer, just with banding. Only runs for 10-bit HDR outputs, once per connector at
+        // setup.
         if using_10bit_formats {
             let trial_ok = match self.gpu_manager.renderer(
                 &self.primary_render_node,
@@ -4930,7 +4931,6 @@ mod tests {
     use insta::assert_debug_snapshot;
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
-
     use smithay::wayland::color::management::ImageDescription;
 
     use crate::backend::tty::{

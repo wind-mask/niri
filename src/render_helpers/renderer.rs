@@ -7,8 +7,8 @@ use smithay::backend::renderer::{
 };
 
 use crate::backend::tty::{TtyFrame, TtyRenderer};
-use crate::render_helpers::superres::PassSource;
 use crate::backend::tty_renderer::TtyOffscreen;
+use crate::render_helpers::superres::PassSource;
 
 /// Trait with our main renderer requirements to save on the typing.
 pub trait NiriRenderer:

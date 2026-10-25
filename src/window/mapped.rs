@@ -34,7 +34,7 @@ use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::superres::{
-    MagnifiedGeometry, SuperResElement, SuperResolutionPipeline,
+    MagnifiedGeometry, SuperResElement, SuperResKernel, SuperResolutionPipeline,
 };
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
@@ -769,11 +769,13 @@ impl LayoutElement for Mapped {
             // display geometry, its input handling and everything else stays the same. It applies
             // to every render target, so that screen captures show what is on the screen.
             //
-            // 超分管线跑在 GLES 上，Vulkan 渲染器下退回渲染器自带采样。
-            let superres_kernel = match ctx.renderer.as_gles_renderer() {
-                Some(_) => self.superres.kernel(&self.rules.upscaling, self.id.get()),
-                None => None,
-            };
+            // 单 pass 的重采样内核在 GLES 与 Vulkan 上都可用；FSR1 与 CuNNy 要跑 GLES 离屏
+            // 链路，在没有 GLES 渲染器时退回渲染器自带采样。
+            let has_gles = ctx.renderer.as_gles_renderer().is_some();
+            let superres_kernel = self
+                .superres
+                .kernel(&self.rules.upscaling, self.id.get())
+                .filter(|kernel| has_gles || matches!(kernel, SuperResKernel::Filter(_)));
             match superres_kernel {
                 Some(kernel) => {
                     // Collect the surface elements first, because running the offscreen pass needs
@@ -793,10 +795,6 @@ impl LayoutElement for Mapped {
                     for elem in elements {
                         // 超分元素包在 HDR 混合元素内层，绘制由超分管线接管。
                         let elem = elem.into_inner();
-                        let renderer = ctx
-                            .renderer
-                            .as_gles_renderer()
-                            .expect("superres kernel implies a GLES renderer");
                         let raw_rect = elem.geometry(scale).to_f64().to_logical(scale);
                         let magnify = magnify.map(|magnify| {
                             magnify_element_rect(&magnify, window_location, raw_rect)
@@ -807,7 +805,7 @@ impl LayoutElement for Mapped {
                         };
                         let on_screen = view_rect.is_none_or(|view| view.overlaps(elem_rect));
                         let elem = self.superres.element(
-                            renderer,
+                            &mut *ctx.renderer,
                             elem,
                             kernel,
                             scale,
