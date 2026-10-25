@@ -40,7 +40,8 @@ use smithay::backend::renderer::gles::{
 use smithay::backend::renderer::multigpu::MultiTexture;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::vulkan::{
-    OwnedCustomUniform, VulkanError, VulkanFrame, VulkanPixelProgram, VulkanRenderer,
+    CustomPass, CustomUniform, CustomUniformValue, OwnedCustomUniform, VulkanError, VulkanFrame,
+    VulkanPixelProgram, VulkanRenderer, VulkanTexture,
 };
 use smithay::backend::renderer::{
     buffer_y_inverted, Bind as _, Color32F, ContextId, Frame as _, ImportAll, Offscreen as _,
@@ -49,7 +50,9 @@ use smithay::backend::renderer::{
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::backend::tty::{native_texture, TtyFrame, TtyRenderer, TtyRendererError};
+use crate::backend::tty::{
+    native_texture, native_vulkan_texture, TtyFrame, TtyRenderer, TtyRendererError,
+};
 use crate::render_helpers::renderer::{
     gpu_diagnostics, AsGlesFrame as _, ClientBufferDebug, GpuDebug, NiriRenderer, TextureDebug,
     GPU_LOG_TARGET,
@@ -707,13 +710,19 @@ pub fn init(renderer: &mut GlesRenderer, render_node: Option<&Path>) {
 
 /// Super-resolution programs compiled for the Vulkan renderer.
 ///
-/// Only the single-pass resampling kernels live here: they reuse the same `resample.frag`
-/// source as the GLES path, translated by [`compile_vulkan_program()`]. FSR1 and CuNNy run
-/// their passes offscreen through a `GlesRenderer`, so on Vulkan the element falls back to the
-/// renderer's own sampling instead.
+/// The kernels and the CuNNy network reuse the same shader sources as the GLES path, translated
+/// by [`compile_vulkan_program()`]. FSR1 still runs its EASU pass through a `GlesRenderer`, so on
+/// Vulkan that algorithm falls back to the resampling kernels.
 pub struct VulkanSuperResPrograms {
     bilinear: Option<VulkanPixelProgram>,
     bicubic: Option<VulkanPixelProgram>,
+    /// The draw that applies a network's residuals over the client buffer.
+    cunny_upscale: Option<VulkanPixelProgram>,
+    /// The network's passes, compiled on demand and keyed by `(variant, pass, group)`.
+    ///
+    /// There are twenty-two of them across both networks, and most sessions never run the
+    /// effect at all, so they are compiled when a network is first used, like on GLES.
+    cunny_passes: RefCell<HashMap<(u32, usize, usize), Option<VulkanPixelProgram>>>,
 }
 
 impl VulkanSuperResPrograms {
@@ -721,7 +730,126 @@ impl VulkanSuperResPrograms {
         Self {
             bilinear: Self::compile_filter(renderer, ResampleFilter::Bilinear),
             bicubic: Self::compile_filter(renderer, ResampleFilter::Bicubic),
+            cunny_upscale: Self::compile_cunny_upscale(renderer),
+            cunny_passes: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Compiles the draw that applies a network's residuals.
+    fn compile_cunny_upscale(renderer: &mut VulkanRenderer) -> Option<VulkanPixelProgram> {
+        let source = format!(
+            "#define alpha niri_alpha\n#define tint niri_tint\n\
+             #define NIRI_UV_TRANSFORM 1\n{source}",
+            source = include_str!("shaders/superres/cunny_upscale.frag"),
+        );
+
+        match compile_vulkan_program(
+            renderer,
+            &source,
+            &cunny_upscale_vulkan_uniforms(),
+            &["tex", "niri_tex1"],
+        ) {
+            Ok(program) => Some(program),
+            Err(err) => {
+                warn!("super resolution: error compiling the CuNNy upscale shader: {err:?}");
+                None
+            }
+        }
+    }
+
+    /// Compiles one pass of a network, if it was not compiled yet.
+    fn ensure_cunny_pass(
+        renderer: &mut VulkanRenderer,
+        variant: CunnyVariant,
+        pass_index: usize,
+        group: usize,
+    ) -> bool {
+        let key = (variant.index(), pass_index, group);
+        let compiled = renderer
+            .user_data()
+            .get::<VulkanSuperResPrograms>()
+            .is_some_and(|programs| programs.cunny_passes.borrow().contains_key(&key));
+        if compiled {
+            return true;
+        }
+
+        let pass = &variant.passes()[pass_index];
+        let source = format!(
+            "#define alpha niri_alpha\n#define tint niri_tint\n{source}",
+            source = pass.shaders[group],
+        );
+
+        // The first read is the drawn texture, the rest are the samplers that follow it.
+        let mut textures = vec!["tex"];
+        for (i, _) in pass.reads.iter().enumerate().skip(1) {
+            match i {
+                1 => textures.push("niri_tex1"),
+                2 => textures.push("niri_tex2"),
+                _ => return false,
+            }
+        }
+
+        let program = match compile_vulkan_program(
+            renderer,
+            &source,
+            &cunny_pass_vulkan_uniforms(),
+            &textures,
+        ) {
+            Ok(program) => Some(program),
+            Err(err) => {
+                warn!(
+                    "super resolution: error compiling the {variant:?} pass {} group {} shader: \
+                     {err:?}",
+                    pass_index + 1,
+                    group + 1,
+                );
+                None
+            }
+        };
+
+        let compiled = program.is_some();
+        if let Some(programs) = renderer.user_data().get::<VulkanSuperResPrograms>() {
+            programs.cunny_passes.borrow_mut().insert(key, program);
+        }
+        compiled
+    }
+
+    /// Compiles every pass of a network, for tests and diagnostics.
+    pub(crate) fn compile_cunny_network(
+        renderer: &mut VulkanRenderer,
+        variant: CunnyVariant,
+    ) -> bool {
+        let mut ok = true;
+        for (pass_index, pass) in variant.passes().iter().enumerate() {
+            for group in 0..pass.shaders.len() {
+                ok &= Self::ensure_cunny_pass(renderer, variant, pass_index, group);
+            }
+        }
+        ok
+    }
+
+    /// The draw that applies a network's residuals, if it compiled.
+    #[cfg(test)]
+    pub(crate) fn cunny_upscale(&self) -> Option<VulkanPixelProgram> {
+        self.cunny_upscale.clone()
+    }
+
+    /// Returns the programs of every group of a network's passes, in run order.
+    fn cunny_programs(&self, variant: CunnyVariant) -> Option<Vec<VulkanPixelProgram>> {
+        let passes = variant.passes();
+        let mut programs = Vec::with_capacity(variant.draw_count());
+        for (pass_index, pass) in passes.iter().enumerate() {
+            for group in 0..pass.shaders.len() {
+                let program = self
+                    .cunny_passes
+                    .borrow()
+                    .get(&(variant.index(), pass_index, group))
+                    .cloned()
+                    .flatten()?;
+                programs.push(program);
+            }
+        }
+        Some(programs)
     }
 
     fn compile_filter(
@@ -843,6 +971,14 @@ pub enum ElementKernel {
         /// The renderer context that the texture belongs to.
         context_id: ContextId<GlesTexture>,
     },
+
+    /// The same, for the Vulkan renderer.
+    CunnyVulkan {
+        /// The residuals, at the source's resolution, one source texel per texel.
+        residuals: VulkanTexture,
+        /// The renderer context that the texture belongs to.
+        context_id: ContextId<VulkanTexture>,
+    },
 }
 
 impl ElementKernel {
@@ -852,7 +988,7 @@ impl ElementKernel {
             Self::Filter(ResampleFilter::Bilinear) => "bilinear",
             Self::Filter(ResampleFilter::Bicubic) => "bicubic",
             Self::Fsr1 { .. } => "rcas",
-            Self::Cunny { .. } => "cunny-upscale",
+            Self::Cunny { .. } | Self::CunnyVulkan { .. } => "cunny-upscale",
         }
     }
 }
@@ -899,6 +1035,23 @@ impl<R: Renderer> SuperResElement<R> {
         Self {
             inner,
             kernel: ElementKernel::Cunny {
+                residuals,
+                context_id,
+            },
+            magnify: None,
+            timings: Timings::disabled(),
+        }
+    }
+
+    /// Creates an element that draws a Vulkan CuNNy run's residuals over the client buffer.
+    pub fn cunny_vulkan(
+        inner: WaylandSurfaceRenderElement<R>,
+        residuals: VulkanTexture,
+        context_id: ContextId<VulkanTexture>,
+    ) -> Self {
+        Self {
+            inner,
+            kernel: ElementKernel::CunnyVulkan {
                 residuals,
                 context_id,
             },
@@ -1348,6 +1501,10 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                     res
                 }
             },
+            // A Vulkan residual texture cannot be drawn here; draw the surface the normal way.
+            ElementKernel::CunnyVulkan { .. } => {
+                draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
+            }
             ElementKernel::Cunny {
                 residuals,
                 context_id,
@@ -1408,6 +1565,99 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
     }
 }
 
+/// Draws a CuNNy run's residuals over the client buffer on the Vulkan renderer.
+///
+/// The surface draw path binds only the client's own texture, so the composite is a custom quad:
+/// it samples the client buffer and the residuals and writes the result into `dst`.
+///
+/// Returns `None` when the draw cannot run, in which case the caller must draw the surface the
+/// normal way.
+#[allow(clippy::too_many_arguments)]
+fn draw_cunny_vulkan<R: NiriRenderer>(
+    inner: &WaylandSurfaceRenderElement<R>,
+    residuals: &VulkanTexture,
+    context_id: &ContextId<VulkanTexture>,
+    frame: &mut VulkanFrame<'_, '_>,
+    src: Rectangle<f64, Buffer>,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+    alpha: f32,
+) -> Option<Result<(), VulkanError>>
+where
+    R::TextureId: PassSource,
+{
+    let WaylandSurfaceTexture::Texture(texture) = inner.texture() else {
+        return None;
+    };
+    let client = texture.pass_vulkan_texture(context_id)?;
+    let program = frame
+        .user_data()
+        .get::<VulkanSuperResPrograms>()?
+        .cunny_upscale
+        .clone()?;
+
+    let tex_size = client.size();
+    if tex_size.w <= 0 || tex_size.h <= 0 {
+        return None;
+    }
+
+    // How big a source texel is against a destination pixel, which says whether the destination
+    // magnifies or minifies the doubled image.
+    let footprint = [
+        2.0 * (src.size.w / f64::from(dst.size.w.max(1))) as f32,
+        2.0 * (src.size.h / f64::from(dst.size.h.max(1))) as f32,
+    ];
+    // The custom quad interpolates `v_coords` across the destination, so the shader needs the
+    // transform back into the client texture.
+    let uv_offset = [
+        (src.loc.x / f64::from(tex_size.w)) as f32,
+        (src.loc.y / f64::from(tex_size.h)) as f32,
+    ];
+    let uv_scale = [
+        (src.size.w / f64::from(tex_size.w)) as f32,
+        (src.size.h / f64::from(tex_size.h)) as f32,
+    ];
+
+    let uniforms = [
+        CustomUniform {
+            name: "niri_tex_size",
+            value: CustomUniformValue::Vec2([tex_size.w as f32, tex_size.h as f32]),
+        },
+        CustomUniform {
+            name: "niri_src_rect",
+            value: CustomUniformValue::Vec4([
+                src.loc.x as f32,
+                src.loc.y as f32,
+                src.size.w as f32,
+                src.size.h as f32,
+            ]),
+        },
+        CustomUniform {
+            name: "niri_footprint",
+            value: CustomUniformValue::Vec2(footprint),
+        },
+        CustomUniform {
+            name: "niri_uv_offset",
+            value: CustomUniformValue::Vec2(uv_offset),
+        },
+        CustomUniform {
+            name: "niri_uv_scale",
+            value: CustomUniformValue::Vec2(uv_scale),
+        },
+    ];
+
+    crate::audit_texture_program!("cunny-upscale");
+
+    Some(frame.render_custom(
+        &program,
+        dst,
+        damage,
+        &uniforms,
+        &[("tex", &client), ("niri_tex1", residuals)],
+        alpha,
+    ))
+}
+
 impl RenderElement<VulkanRenderer> for SuperResElement<VulkanRenderer> {
     fn draw(
         &self,
@@ -1418,8 +1668,29 @@ impl RenderElement<VulkanRenderer> for SuperResElement<VulkanRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), VulkanError> {
-        // Only the single-pass resampling kernels have a Vulkan implementation; the FSR1 and
-        // CuNNy chains need a `GlesRenderer` for their offscreen passes.
+        // A CuNNy run's residuals are applied through a custom quad, since the surface draw path
+        // binds only the client's own texture.
+        if let ElementKernel::CunnyVulkan {
+            residuals,
+            context_id,
+        } = &self.kernel
+        {
+            if let Some(res) = draw_cunny_vulkan(
+                &self.inner,
+                residuals,
+                context_id,
+                frame,
+                src,
+                dst,
+                damage,
+                self.inner.alpha(),
+            ) {
+                return res;
+            }
+        }
+
+        // The resampling kernels replace the texture program for this one draw. FSR1 still needs
+        // a `GlesRenderer` for its EASU pass, so it falls back to the renderer's own sampling.
         let installed = if matches!(self.kernel, ElementKernel::Filter(_)) {
             self.vulkan_resample(frame, src).map(|(program, uniforms)| {
                 crate::audit_texture_program!(
@@ -1504,6 +1775,16 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
 
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
+            // Not drawable through a GLES frame; the surface is drawn the normal way.
+            ElementKernel::CunnyVulkan { .. } => RenderElement::<TtyRenderer<'render>>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
             ElementKernel::Filter(_) => {
                 match self.resample_program(
                     frame.as_gles_frame().expect("gles frame checked above"),
@@ -1649,9 +1930,10 @@ impl<'render> SuperResElement<TtyRenderer<'render>> {
     /// Draws on a renderer without a GLES frame, i.e. the Vulkan one.
     ///
     /// The resampling kernels are single-pass, so they map onto the Vulkan texture-program
-    /// override: the program replaces the built-in texture shader for this one draw and
-    /// samples the same `tex` binding. Everything else (the FSR1 and CuNNy chains, whose
-    /// passes need a `GlesRenderer`) draws the surface the normal way.
+    /// override: the program replaces the built-in texture shader for this one draw and samples
+    /// the same `tex` binding. A CuNNy run draws through a custom quad instead, because it reads
+    /// two textures. Everything else (FSR1, whose EASU pass needs a `GlesRenderer`) draws the
+    /// surface the normal way.
     fn draw_non_gles(
         &self,
         frame: &mut TtyFrame<'render, '_, '_>,
@@ -1664,21 +1946,56 @@ impl<'render> SuperResElement<TtyRenderer<'render>> {
         // The override that was in place before this draw, if one was installed at all.
         let mut installed = None;
 
-        if let (ElementKernel::Filter(_), TtyFrame::Vulkan(multi)) = (&self.kernel, &mut *frame) {
-            let vk_frame: &mut VulkanFrame<'_, '_> = multi.as_mut();
-            if let Some((program, uniforms)) = self.vulkan_resample(vk_frame, src) {
-                crate::audit_texture_program!(
-                    "bilinear",
-                    if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bilinear))
-                );
-                crate::audit_texture_program!(
-                    "bicubic",
-                    if matches!(self.kernel, ElementKernel::Filter(ResampleFilter::Bicubic))
-                );
-                let saved = vk_frame.take_tex_program_override();
-                vk_frame.set_tex_program_override(Some((program, uniforms)));
-                installed = Some(saved);
+        match &self.kernel {
+            ElementKernel::CunnyVulkan {
+                residuals,
+                context_id,
+            } => {
+                if let TtyFrame::Vulkan(multi) = &mut *frame {
+                    let vk_frame: &mut VulkanFrame<'_, '_> = multi.as_mut();
+                    if let Some(res) = draw_cunny_vulkan(
+                        &self.inner,
+                        residuals,
+                        context_id,
+                        vk_frame,
+                        src,
+                        dst,
+                        damage,
+                        self.inner.alpha(),
+                    ) {
+                        return res.map_err(|err| {
+                            TtyRendererError::Vulkan(
+                                smithay::backend::renderer::multigpu::Error::Render(err),
+                            )
+                        });
+                    }
+                }
             }
+            ElementKernel::Filter(_) => {
+                if let TtyFrame::Vulkan(multi) = &mut *frame {
+                    let vk_frame: &mut VulkanFrame<'_, '_> = multi.as_mut();
+                    if let Some((program, uniforms)) = self.vulkan_resample(vk_frame, src) {
+                        crate::audit_texture_program!(
+                            "bilinear",
+                            if matches!(
+                                self.kernel,
+                                ElementKernel::Filter(ResampleFilter::Bilinear)
+                            )
+                        );
+                        crate::audit_texture_program!(
+                            "bicubic",
+                            if matches!(
+                                self.kernel,
+                                ElementKernel::Filter(ResampleFilter::Bicubic)
+                            )
+                        );
+                        let saved = vk_frame.take_tex_program_override();
+                        vk_frame.set_tex_program_override(Some((program, uniforms)));
+                        installed = Some(saved);
+                    }
+                }
+            }
+            _ => {}
         }
 
         let res = RenderElement::<TtyRenderer<'render>>::draw(
@@ -1707,8 +2024,17 @@ impl<'render> SuperResElement<TtyRenderer<'render>> {
 /// Offscreen passes run on one GPU's GLES renderer, so they need the texture that belongs to that
 /// renderer's context rather than the renderer-independent handle.
 pub trait PassSource {
-    /// Returns the texture as it exists in the given renderer context.
-    fn pass_texture(&self, context_id: &ContextId<GlesTexture>) -> Option<GlesTexture>;
+    /// Returns the texture as it exists in the given GLES renderer context.
+    fn pass_texture(&self, context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
+        let _ = context_id;
+        None
+    }
+
+    /// Returns the texture as it exists in the given Vulkan renderer context.
+    fn pass_vulkan_texture(&self, context_id: &ContextId<VulkanTexture>) -> Option<VulkanTexture> {
+        let _ = context_id;
+        None
+    }
 }
 
 impl PassSource for GlesTexture {
@@ -1718,16 +2044,20 @@ impl PassSource for GlesTexture {
     }
 }
 
-impl PassSource for smithay::backend::renderer::vulkan::VulkanTexture {
-    fn pass_texture(&self, _context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
-        // 超分管线只在 GLES 上运行，Vulkan 纹理没有对应的 GLES 上下文纹理。
-        None
+impl PassSource for VulkanTexture {
+    fn pass_vulkan_texture(&self, _context_id: &ContextId<VulkanTexture>) -> Option<VulkanTexture> {
+        // 元素由这个渲染器构建，纹理属于它的上下文。
+        Some(self.clone())
     }
 }
 
 impl PassSource for MultiTexture {
     fn pass_texture(&self, context_id: &ContextId<GlesTexture>) -> Option<GlesTexture> {
         native_texture(self, context_id)
+    }
+
+    fn pass_vulkan_texture(&self, context_id: &ContextId<VulkanTexture>) -> Option<VulkanTexture> {
+        native_vulkan_texture(self, context_id)
     }
 }
 
@@ -1907,6 +2237,258 @@ enum CacheReuse {
     NoDamage { made_for: CommitCounter },
     /// New [`CommitCounter`] with reported damage, but GPU [`SourceDigest`] matched.
     SameDigest { made_for: CommitCounter },
+}
+
+/// A run of a CuNNy network on the Vulkan renderer, with the textures it needs kept around.
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanCunnyRun {
+    /// Source-sized textures that the passes ping-pong between.
+    pub(crate) features: Vec<VulkanTexture>,
+    /// The network's result: the sub-pixel residuals of the doubled image.
+    pub(crate) residuals: VulkanTexture,
+    /// The renderer-owned copy of the client buffer that the passes read.
+    pub(crate) source: VulkanTexture,
+    /// Throwaway target for the frame that runs the passes.
+    pub(crate) scratch: VulkanTexture,
+}
+
+/// Runs a CuNNy network's passes on the Vulkan renderer.
+///
+/// The passes need renderer-owned textures, so the client buffer is copied into one first; that
+/// copy is also what crops the source rect, and it is what makes imported (dmabuf) client buffers
+/// work, since the pass API rejects them.
+///
+/// The passes are submitted on their own frame and waited for: the element that applies the
+/// residuals draws later in the compositor's frame, and there is no cross-submission semaphore
+/// between the two here. Running the chain inside the draw instead would avoid the wait, the way
+/// the blur runs its own passes.
+pub(crate) fn vulkan_run_cunny(
+    renderer: &mut VulkanRenderer,
+    variant: CunnyVariant,
+    client: &VulkanTexture,
+    src: Rectangle<f64, Buffer>,
+    size: Size<i32, Buffer>,
+    reuse: Option<&VulkanCunnyCache>,
+) -> Option<VulkanCunnyRun> {
+    let physical = size.to_logical(1, Transform::Normal).to_physical(1);
+
+    // The programs are compiled the first time a network runs.
+    if !VulkanSuperResPrograms::compile_cunny_network(renderer, variant) {
+        return None;
+    }
+    let programs = {
+        let stored = renderer.user_data().get::<VulkanSuperResPrograms>()?;
+        stored.cunny_programs(variant)?
+    };
+    let copy_program = renderer
+        .user_data()
+        .get::<VulkanSuperResPrograms>()
+        .and_then(|stored| stored.program(ResampleFilter::Bilinear))?;
+
+    // Keep the textures across runs at the same size.
+    let reuse_textures = reuse
+        .filter(|entry| entry.key.size == size && entry.features.len() == variant.texture_count());
+    let (features, residuals, source, scratch) = match reuse_textures {
+        Some(entry) => (
+            entry.features.clone(),
+            entry.residuals.clone(),
+            entry.source.clone(),
+            entry.scratch.clone(),
+        ),
+        None => {
+            let mut features = Vec::with_capacity(variant.texture_count());
+            for _ in 0..variant.texture_count() {
+                features.push(renderer.create_buffer(Fourcc::Abgr8888, size).ok()?);
+            }
+            // The residuals are signed, and the quantization the reference does is on the
+            // eight-bit features, so they go into a half-float texture.
+            let residuals = renderer.create_buffer(Fourcc::Abgr16161616f, size).ok()?;
+            let source = renderer.create_buffer(Fourcc::Abgr8888, size).ok()?;
+            let scratch = renderer
+                .create_buffer(Fourcc::Abgr8888, Size::from((1, 1)))
+                .ok()?;
+            debug!(
+                target: GPU_LOG_TARGET,
+                gpu = ?renderer.context_id(),
+                ?variant,
+                ?features,
+                ?residuals,
+                "allocated the CuNNy intermediates for the vulkan renderer",
+            );
+            (features, residuals, source, scratch)
+        }
+    };
+
+    let full = Rectangle::from_size(physical);
+    let tex_size = client.size();
+
+    // Copy the client buffer into a renderer-owned texture, cropping the source rect.
+    {
+        let copy_uniforms = [
+            CustomUniform {
+                name: "niri_tex_size",
+                value: CustomUniformValue::Vec2([tex_size.w as f32, tex_size.h as f32]),
+            },
+            CustomUniform {
+                name: "niri_src_rect",
+                value: CustomUniformValue::Vec4([
+                    src.loc.x as f32,
+                    src.loc.y as f32,
+                    src.size.w as f32,
+                    src.size.h as f32,
+                ]),
+            },
+        ];
+
+        let mut dst = source.clone();
+        let mut target = renderer.bind(&mut dst).ok()?;
+        let mut frame = renderer
+            .render(&mut target, physical, Transform::Normal)
+            .ok()?;
+        // The target starts out with undefined contents; clearing it makes the src-over blend an
+        // exact copy.
+        frame.clear(Color32F::TRANSPARENT, &[full]).ok()?;
+        frame
+            .render_custom(
+                &copy_program,
+                full,
+                &[full],
+                &copy_uniforms,
+                &[("tex", client)],
+                1.0,
+            )
+            .ok()?;
+        let sync = frame.finish().ok()?;
+        renderer.wait(&sync).ok()?;
+    }
+
+    // Every pass reads a source-sized texture at its full extent, so one uniform set serves them
+    // all.
+    let size_vec = [size.w as f32, size.h as f32];
+    let pass_uniforms = [
+        CustomUniform {
+            name: "niri_tex_size",
+            value: CustomUniformValue::Vec2(size_vec),
+        },
+        CustomUniform {
+            name: "niri_src_rect",
+            value: CustomUniformValue::Vec4([0., 0., size_vec[0], size_vec[1]]),
+        },
+        CustomUniform {
+            name: "niri_size",
+            value: CustomUniformValue::Vec2(size_vec),
+        },
+        CustomUniform {
+            name: "niri_src_size",
+            value: CustomUniformValue::Vec2(size_vec),
+        },
+    ];
+
+    // Describe the passes: what each writes, what it reads, and with which program.
+    let mut plan = Vec::with_capacity(programs.len());
+    let mut program_index = 0;
+    for pass in variant.passes() {
+        for group in 0..pass.shaders.len() {
+            let dst = match pass.writes[group] {
+                CunnyTexture::Feature(index) => &features[index],
+                CunnyTexture::Residuals => &residuals,
+                CunnyTexture::Input => unreachable!(),
+            };
+            let mut reads = Vec::with_capacity(pass.reads.len());
+            for (i, read) in pass.reads.iter().enumerate() {
+                let texture = match read {
+                    CunnyTexture::Input => &source,
+                    CunnyTexture::Feature(index) => &features[*index],
+                    CunnyTexture::Residuals => unreachable!(),
+                };
+                let name = match i {
+                    0 => "tex",
+                    1 => "niri_tex1",
+                    2 => "niri_tex2",
+                    _ => return None,
+                };
+                reads.push((name, texture));
+            }
+            plan.push((program_index, dst, reads));
+            program_index += 1;
+        }
+    }
+
+    let bindings: Vec<Vec<(&str, &VulkanTexture)>> =
+        plan.iter().map(|(_, _, reads)| reads.clone()).collect();
+    let descs: Vec<CustomPass<'_>> = plan
+        .iter()
+        .enumerate()
+        .map(|(i, (index, dst, _))| CustomPass {
+            dst,
+            program: &programs[*index],
+            uniforms: &pass_uniforms,
+            textures: &bindings[i],
+        })
+        .collect();
+
+    {
+        let mut target = scratch.clone();
+        let mut target = renderer.bind(&mut target).ok()?;
+        let mut frame = renderer
+            .render(&mut target, Size::from((1, 1)), Transform::Normal)
+            .ok()?;
+        frame.render_custom_passes(&descs).ok()?;
+        let sync = frame.finish().ok()?;
+        renderer.wait(&sync).ok()?;
+    }
+
+    Some(VulkanCunnyRun {
+        features,
+        residuals,
+        source,
+        scratch,
+    })
+}
+
+/// Which renderer produced a CuNNy run.
+#[derive(Debug)]
+enum CunnyOutcome {
+    /// The GLES offscreen passes produced it.
+    Gles(CunnyResult),
+    /// The Vulkan multi-pass chain produced it.
+    Vulkan(VulkanCunnyResult),
+}
+
+/// A CuNNy run's result on the Vulkan renderer.
+#[derive(Debug, Clone)]
+struct VulkanCunnyResult {
+    residuals: VulkanTexture,
+    context_id: ContextId<VulkanTexture>,
+}
+
+/// The Vulkan renderer's CuNNy intermediates, kept across frames.
+///
+/// The GLES cache keys its entry on a `ContextId<GlesTexture>` inside `PassCache`; on Vulkan the
+/// passes need renderer-owned textures (the pass API rejects imported ones), so the entry also
+/// owns the source-sized feature textures, a copy of the client buffer and the residual texture.
+#[derive(Debug)]
+pub(crate) struct VulkanCunnyCache {
+    key: CunnyKey,
+    commit: CommitCounter,
+    context_id: ContextId<VulkanTexture>,
+    /// Source-sized textures that the passes ping-pong between.
+    features: Vec<VulkanTexture>,
+    /// The network's result: the sub-pixel residuals of the doubled image.
+    residuals: VulkanTexture,
+    /// A renderer-owned copy of the client buffer that the passes read.
+    source: VulkanTexture,
+    /// Throwaway target for the frame that runs the passes.
+    scratch: VulkanTexture,
+}
+
+impl VulkanCunnyCache {
+    fn result(&self) -> VulkanCunnyResult {
+        VulkanCunnyResult {
+            residuals: self.residuals.clone(),
+            context_id: self.context_id.clone(),
+        }
+    }
 }
 
 /// Cached entry of an offscreen super-resolution pass, shared across all multi-pass algorithms.
@@ -2091,6 +2673,11 @@ pub struct SuperResolutionPipeline {
     fsr1: RefCell<PassCache<Fsr1Key, Fsr1Result>>,
     /// Cached result of a CuNNy run.
     cunny: RefCell<PassCache<CunnyKey, CunnyResult>>,
+    /// The Vulkan renderer's CuNNy intermediates and result.
+    ///
+    /// The GLES cache keys on a `ContextId<GlesTexture>` and lives in `PassCache`; the Vulkan
+    /// one keeps its own copy of the textures because the pass API wants renderer-owned ones.
+    vulkan_cunny: RefCell<Option<VulkanCunnyCache>>,
     /// Reusable 32×32 target for GPU content digests across all upscaling passes.
     digest: RefCell<DigestTarget>,
     /// The size that this window's content is magnified into, when it is being magnified.
@@ -2571,6 +3158,34 @@ fn cunny_upscale_uniforms() -> Vec<UniformName<'static>> {
     ]
 }
 
+/// The uniforms the CuNNy composite declares on Vulkan.
+///
+/// `niri_tex1` is a sampler, so it is bound by name rather than declared here; the texture-space
+/// transform replaces the varying that the GLES dialect gets from the renderer.
+fn cunny_upscale_vulkan_uniforms() -> Vec<UniformName<'static>> {
+    vec![
+        UniformName::new("niri_tex_size", UniformType::_2f),
+        UniformName::new("niri_src_rect", UniformType::_4f),
+        UniformName::new("niri_footprint", UniformType::_2f),
+        UniformName::new("niri_uv_offset", UniformType::_2f),
+        UniformName::new("niri_uv_scale", UniformType::_2f),
+    ]
+}
+
+/// The uniforms a CuNNy pass declares on Vulkan.
+///
+/// The passes are all fed full-texture rects at the source's size, so every pass gets both the
+/// client-buffer names and the feature-texture ones; a program only reads the ones its shader
+/// mentions.
+fn cunny_pass_vulkan_uniforms() -> Vec<UniformName<'static>> {
+    vec![
+        UniformName::new("niri_tex_size", UniformType::_2f),
+        UniformName::new("niri_src_rect", UniformType::_4f),
+        UniformName::new("niri_size", UniformType::_2f),
+        UniformName::new("niri_src_size", UniformType::_2f),
+    ]
+}
+
 fn cunny_pass_uniforms() -> Vec<UniformName<'static>> {
     vec![
         UniformName::new("niri_tex_size", UniformType::_2f),
@@ -3004,6 +3619,7 @@ impl SuperResolutionPipeline {
             logged: Cell::new(0),
             fsr1: RefCell::new(PassCache::default()),
             cunny: RefCell::new(PassCache::default()),
+            vulkan_cunny: RefCell::new(None),
             digest: RefCell::new(DigestTarget::default()),
             magnify_target: Cell::new(None),
             view_rect: Cell::new(None),
@@ -3104,7 +3720,125 @@ impl SuperResolutionPipeline {
         self.magnify_target.get()
     }
 
-    /// Returns a network's residuals for this window, running it if the cached result is stale.
+    /// Runs a CuNNy network on the Vulkan renderer, reusing the last run when it is still valid.
+    ///
+    /// The result is cached per window, so a client that commits a new frame without changing the
+    /// pixels the network reads costs nothing.
+    fn vulkan_cunny_result<R: NiriRenderer>(
+        &self,
+        renderer: &mut VulkanRenderer,
+        variant: CunnyVariant,
+        elem: &WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+        id: u64,
+    ) -> Option<VulkanCunnyResult>
+    where
+        R::TextureId: PassSource,
+    {
+        let _span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "vulkan-cunny",
+            window = id,
+            element = ?elem.id(),
+            ?variant,
+        )
+        .entered();
+
+        // The passes read and write axis-aligned texel grids, and the residuals only line up with
+        // an upright buffer, so other buffers keep the resampling kernels.
+        if elem.transform() != Transform::Normal
+            || buffer_y_inverted(elem.buffer()).unwrap_or(false)
+        {
+            trace!(
+                target: GPU_LOG_TARGET,
+                buffer_transform = ?elem.transform(),
+                y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false),
+                reason = "unsupported CuNNy buffer orientation",
+                "selecting resampling fallback",
+            );
+            if self.log_once(logged::CUNNY_ORIENTATION) {
+                debug!(
+                    "super resolution: window {id} has a buffer the {variant:?} network cannot \
+                     read, drawing it with the resampling kernels"
+                );
+            }
+            return None;
+        }
+
+        let src = elem.src();
+        let size = src.size.to_i32_round();
+        if size.w <= 0 || size.h <= 0 {
+            return None;
+        }
+
+        let key = CunnyKey { variant, src, size };
+        let context_id = renderer.context_id();
+        let commit = elem.current_commit();
+
+        // Reuse the last run while the buffer it was made for is unchanged.
+        let reusable = {
+            let cache = self.vulkan_cunny.borrow();
+            cache.as_ref().and_then(|entry| {
+                if entry.key != key || entry.context_id != context_id {
+                    return None;
+                }
+                if entry.commit == commit {
+                    return Some((entry.result(), true));
+                }
+                if damage_since(elem, scale, entry.commit).is_empty() {
+                    return Some((entry.result(), false));
+                }
+                None
+            })
+        };
+        if let Some((result, same_commit)) = reusable {
+            if same_commit {
+                trace!("super resolution: reusing the {variant:?} run for window {id}");
+            } else {
+                if let Some(entry) = self.vulkan_cunny.borrow_mut().as_mut() {
+                    entry.commit = commit;
+                }
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    cache = "unchanged",
+                    window = id,
+                    "the window has no damage since the network ran; reusing its residuals",
+                );
+            }
+            return Some(result);
+        }
+
+        // The client's texture in this renderer's context; a copy from another GPU is not usable.
+        let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
+            return None;
+        };
+        let client = texture.pass_vulkan_texture(&context_id)?;
+
+        let run = vulkan_run_cunny(
+            renderer,
+            variant,
+            &client,
+            src,
+            size,
+            self.vulkan_cunny.borrow().as_ref(),
+        )?;
+
+        let result = VulkanCunnyResult {
+            residuals: run.residuals.clone(),
+            context_id: context_id.clone(),
+        };
+        *self.vulkan_cunny.borrow_mut() = Some(VulkanCunnyCache {
+            key,
+            commit,
+            context_id,
+            features: run.features,
+            residuals: run.residuals,
+            source: run.source,
+            scratch: run.scratch,
+        });
+
+        Some(result)
+    }
     fn cunny_result<R: NiriRenderer>(
         &self,
         renderer: &mut GlesRenderer,
@@ -3429,10 +4163,20 @@ impl SuperResolutionPipeline {
 
         let params = match kernel {
             SuperResKernel::Cunny(variant) => {
-                let Some(result) = renderer
-                    .as_gles_renderer()
-                    .and_then(|gles| self.cunny_result(gles, variant, &elem, scale, id))
-                else {
+                // The GLES renderer runs the network through its own offscreen framebuffers;
+                // the Vulkan one through multi-pass custom draws.
+                let outcome = if let Some(gles) = renderer.as_gles_renderer() {
+                    self.cunny_result(gles, variant, &elem, scale, id)
+                        .map(CunnyOutcome::Gles)
+                } else {
+                    renderer
+                        .as_vulkan_renderer()
+                        .and_then(|vulkan| {
+                            self.vulkan_cunny_result(vulkan, variant, &elem, scale, id)
+                        })
+                        .map(CunnyOutcome::Vulkan)
+                };
+                let Some(outcome) = outcome else {
                     trace!(
                         target: GPU_LOG_TARGET,
                         requested_kernel = %kernel,
@@ -3456,7 +4200,14 @@ impl SuperResolutionPipeline {
                     return element.with_timings(self.timings.clone());
                 };
 
-                let mut element = SuperResElement::cunny(elem, result.texture, result.context_id);
+                let mut element = match outcome {
+                    CunnyOutcome::Gles(result) => {
+                        SuperResElement::cunny(elem, result.texture, result.context_id)
+                    }
+                    CunnyOutcome::Vulkan(result) => {
+                        SuperResElement::cunny_vulkan(elem, result.residuals, result.context_id)
+                    }
+                };
                 if let Some(rect) = magnify {
                     element = element.with_magnify(rect);
                 }

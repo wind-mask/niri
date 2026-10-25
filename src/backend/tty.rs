@@ -152,6 +152,17 @@ pub use super::tty_renderer::{TtyFrame, TtyFramebuffer, TtyRenderer};
 /// The GPU backend that the TTY renderer runs on.
 pub type TtyGpuBackend = GbmGlesBackend<GlesRenderer, DeviceFd>;
 
+/// Returns the native Vulkan texture that a multigpu texture has for the given renderer context.
+///
+/// The Vulkan counterpart of [`native_texture()`]: offscreen work runs on the renderer that owns
+/// the target GPU's context, and this is how such code gets at the per-GPU texture.
+pub fn native_vulkan_texture(
+    texture: &MultiTexture,
+    context_id: &ContextId<smithay::backend::renderer::vulkan::VulkanTexture>,
+) -> Option<smithay::backend::renderer::vulkan::VulkanTexture> {
+    texture.get::<super::tty_renderer::VulkanApi>(context_id)
+}
+
 /// Returns the native GLES texture that a multigpu texture has for the given renderer context.
 ///
 /// Offscreen work in niri is done with a `GlesRenderer` rather than through the multigpu renderer,

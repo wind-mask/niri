@@ -769,13 +769,16 @@ impl LayoutElement for Mapped {
             // display geometry, its input handling and everything else stays the same. It applies
             // to every render target, so that screen captures show what is on the screen.
             //
-            // 单 pass 的重采样内核在 GLES 与 Vulkan 上都可用；FSR1 与 CuNNy 要跑 GLES 离屏
-            // 链路，在没有 GLES 渲染器时退回渲染器自带采样。
+            // 重采样内核与 CuNNy 在两种渲染器上都有实现；FSR1 的 EASU 仍然要跑 GLES 离屏，
+            // 没有 GLES 渲染器时退回渲染器自带采样。
             let has_gles = ctx.renderer.as_gles_renderer().is_some();
             let superres_kernel = self
                 .superres
                 .kernel(&self.rules.upscaling, self.id.get())
-                .filter(|kernel| has_gles || matches!(kernel, SuperResKernel::Filter(_)));
+                .filter(|kernel| {
+                    has_gles
+                        || matches!(kernel, SuperResKernel::Filter(_) | SuperResKernel::Cunny(_))
+                });
             match superres_kernel {
                 Some(kernel) => {
                     // Collect the surface elements first, because running the offscreen pass needs

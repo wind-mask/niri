@@ -33,7 +33,7 @@ use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shaders::ProgramType;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::superres::{self, ResampleFilter, SuperResElement};
+use crate::render_helpers::superres::{self, CunnyVariant, ResampleFilter, SuperResElement};
 use crate::render_helpers::{blend, shaders, RenderCtx, RenderTarget};
 
 /// Reference and peak luminance of an HDR frame, in cd/m².
@@ -428,6 +428,130 @@ fn resample_draws_gles() {
     gpu::render_offscreen_audited(&mut renderer, size, 1., &[element])
         .expect("error rendering the resampling element")
         .assert_drew_texture(&["bicubic"]);
+}
+
+/// Every pass of both CuNNy networks compiles for the Vulkan renderer.
+///
+/// The shaders are the GLES ones translated by the shim, and a pass that reads three textures
+/// exercises the widest sampler layout the custom-program path supports.
+#[test]
+fn cunny_networks_compile_vulkan() {
+    let Some(mut renderer) = gpu::vulkan_renderer() else {
+        return;
+    };
+    superres::init_vulkan(&mut renderer);
+
+    for variant in [CunnyVariant::Fast, CunnyVariant::ThreeByTwelve] {
+        assert!(
+            superres::VulkanSuperResPrograms::compile_cunny_network(&mut renderer, variant),
+            "the {variant:?} network did not compile for the Vulkan renderer",
+        );
+    }
+
+    let upscale = renderer
+        .user_data()
+        .get::<superres::VulkanSuperResPrograms>()
+        .and_then(superres::VulkanSuperResPrograms::cunny_upscale);
+    assert!(
+        upscale.is_some(),
+        "the CuNNy upscale shader did not compile for the Vulkan renderer",
+    );
+}
+
+/// The CuNNy network runs on the Vulkan renderer and produces residuals.
+#[test]
+fn cunny_network_runs_vulkan() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{ImportMem as _, Texture};
+
+    let Some(mut renderer) = gpu::vulkan_renderer() else {
+        return;
+    };
+    superres::init_vulkan(&mut renderer);
+
+    let size = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((32, 18));
+    let pixels = vec![128u8; (size.w * size.h * 4) as usize];
+    let client = renderer
+        .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+        .expect("error importing the client buffer");
+
+    let src = Rectangle::from_size(size.to_f64());
+    let run =
+        superres::vulkan_run_cunny(&mut renderer, CunnyVariant::Fast, &client, src, size, None)
+            .expect("the network must run on the Vulkan renderer");
+
+    assert_eq!(
+        run.features.len(),
+        6,
+        "a network needs six feature textures"
+    );
+    assert_eq!(run.residuals.size(), size, "the residuals are source-sized");
+}
+
+/// The element applies the residuals over the client buffer on the Vulkan renderer.
+#[test]
+fn cunny_draws_vulkan() {
+    use smithay::backend::renderer::element::surface::WaylandSurfaceTexture;
+    use smithay::wayland::compositor::with_states;
+
+    use crate::render_helpers::superres::PassSource as _;
+
+    let Some(mut renderer) = gpu::vulkan_renderer() else {
+        return;
+    };
+    superres::init_vulkan(&mut renderer);
+
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    add_window(&mut f);
+    settle(&mut f);
+
+    let surface = f
+        .niri()
+        .layout
+        .windows()
+        .next()
+        .expect("expected a mapped window")
+        .1
+        .toplevel()
+        .wl_surface()
+        .clone();
+
+    let element = with_states(&surface, |states| {
+        WaylandSurfaceRenderElement::from_surface(
+            &mut renderer,
+            &surface,
+            states,
+            Point::<f64, Physical>::from((0., 0.)),
+            1.,
+            Kind::Unspecified,
+        )
+    })
+    .expect("error importing the window surface")
+    .expect("the window surface should be mapped");
+
+    // Run the network on the window's own buffer, then draw it with the residuals.
+    use smithay::backend::renderer::Renderer as _;
+    let context_id = renderer.context_id();
+    let client = match element.texture() {
+        WaylandSurfaceTexture::Texture(texture) => texture
+            .pass_vulkan_texture(&context_id)
+            .expect("the window texture must be in this renderer's context"),
+        WaylandSurfaceTexture::SolidColor(_) => return,
+    };
+    let src = element.src();
+    let size = src.size.to_i32_round();
+    let run =
+        superres::vulkan_run_cunny(&mut renderer, CunnyVariant::Fast, &client, src, size, None)
+            .expect("the network must run on the Vulkan renderer");
+
+    let element = SuperResElement::cunny_vulkan(element, run.residuals, context_id);
+    let size = element.geometry(Scale::from(1.)).size;
+
+    gpu::render_offscreen_audited(&mut renderer, size, 1., &[element])
+        .expect("error drawing the CuNNy element")
+        .assert_drew_texture(&["cunny-upscale"]);
 }
 
 /// Name of a resampling kernel, for assertions.

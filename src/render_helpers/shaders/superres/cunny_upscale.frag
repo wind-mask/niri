@@ -105,9 +105,18 @@ float niri_residual(vec2 p) {
 }
 
 void main() {
+#ifdef NIRI_UV_TRANSFORM
+    // The Vulkan renderer draws this as a custom quad, where `v_coords` spans the destination
+    // rectangle rather than the source rect in the client texture. Map it back before anything
+    // else reads it.
+    vec2 uv = niri_uv_offset + niri_v_coords * niri_uv_scale;
+#else
+#define uv v_coords
+#endif
+
     // Where this destination pixel lands in the client buffer, in its texel space, and then
     // relative to the source rect, which is where the doubled image starts.
-    vec2 in_rect = v_coords * niri_tex_size - niri_src_rect.xy;
+    vec2 in_rect = uv * niri_tex_size - niri_src_rect.xy;
 
     // Where it lands in the doubled image, in texel coordinates.
     vec2 p = clamp(in_rect * 2.0 - vec2(0.5), vec2(0.0), niri_src_rect.zw * 2.0 - vec2(1.0));
@@ -116,7 +125,7 @@ void main() {
 
     // The client buffer, sampled the way the renderer's own shader would: one bilinear fetch, on
     // the coordinates the vertex shader already put the crop and the transform into.
-    vec4 base = texture2D(tex, v_coords);
+    vec4 base = texture2D(tex, uv);
 
     // The network sees straight color: a window buffer is premultiplied, but a transparent window
     // is not what this effect is for, so the division is guarded.
