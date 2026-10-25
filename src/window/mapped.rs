@@ -34,7 +34,7 @@ use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::superres::{
-    MagnifiedGeometry, SuperResElement, SuperResKernel, SuperResolutionPipeline,
+    MagnifiedGeometry, SuperResElement, SuperResolutionPipeline,
 };
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
@@ -769,16 +769,9 @@ impl LayoutElement for Mapped {
             // display geometry, its input handling and everything else stays the same. It applies
             // to every render target, so that screen captures show what is on the screen.
             //
-            // 重采样内核与 CuNNy 在两种渲染器上都有实现；FSR1 的 EASU 仍然要跑 GLES 离屏，
-            // 没有 GLES 渲染器时退回渲染器自带采样。
-            let has_gles = ctx.renderer.as_gles_renderer().is_some();
-            let superres_kernel = self
-                .superres
-                .kernel(&self.rules.upscaling, self.id.get())
-                .filter(|kernel| {
-                    has_gles
-                        || matches!(kernel, SuperResKernel::Filter(_) | SuperResKernel::Cunny(_))
-                });
+            // 所有算法在两种渲染器上都有实现；FSR1 与 CuNNy 在 Vulkan 上不支持带变换或
+            // 上下翻转的缓冲区，那种情况由各自的判定回退到重采样内核。
+            let superres_kernel = self.superres.kernel(&self.rules.upscaling, self.id.get());
             match superres_kernel {
                 Some(kernel) => {
                     // Collect the surface elements first, because running the offscreen pass needs

@@ -718,6 +718,10 @@ pub struct VulkanSuperResPrograms {
     bicubic: Option<VulkanPixelProgram>,
     /// The draw that applies a network's residuals over the client buffer.
     cunny_upscale: Option<VulkanPixelProgram>,
+    /// The EASU pass, which upsamples the client buffer to the destination size.
+    easu: Option<VulkanPixelProgram>,
+    /// The sharpening pass, which runs 1:1 on an EASU result.
+    rcas: Option<VulkanPixelProgram>,
     /// The network's passes, compiled on demand and keyed by `(variant, pass, group)`.
     ///
     /// There are twenty-two of them across both networks, and most sessions never run the
@@ -731,6 +735,8 @@ impl VulkanSuperResPrograms {
             bilinear: Self::compile_filter(renderer, ResampleFilter::Bilinear),
             bicubic: Self::compile_filter(renderer, ResampleFilter::Bicubic),
             cunny_upscale: Self::compile_cunny_upscale(renderer),
+            easu: Self::compile_easu(renderer),
+            rcas: Self::compile_rcas(renderer),
             cunny_passes: RefCell::new(HashMap::new()),
         }
     }
@@ -752,6 +758,58 @@ impl VulkanSuperResPrograms {
             Ok(program) => Some(program),
             Err(err) => {
                 warn!("super resolution: error compiling the CuNNy upscale shader: {err:?}");
+                None
+            }
+        }
+    }
+
+    /// Compiles the EASU pass.
+    fn compile_easu(renderer: &mut VulkanRenderer) -> Option<VulkanPixelProgram> {
+        let source = format!(
+            "#define alpha niri_alpha\n#define tint niri_tint\n\
+             #define NIRI_UV_TRANSFORM 1\n{source}",
+            source = include_str!("shaders/superres/fsr1_easu.frag"),
+        );
+
+        match compile_vulkan_program(
+            renderer,
+            &source,
+            &[
+                UniformName::new("niri_tex_size", UniformType::_2f),
+                UniformName::new("niri_src_rect", UniformType::_4f),
+                UniformName::new("niri_uv_offset", UniformType::_2f),
+                UniformName::new("niri_uv_scale", UniformType::_2f),
+            ],
+            &["tex"],
+        ) {
+            Ok(program) => Some(program),
+            Err(err) => {
+                warn!("super resolution: error compiling the EASU shader for vulkan: {err:?}");
+                None
+            }
+        }
+    }
+
+    /// Compiles the sharpening pass.
+    fn compile_rcas(renderer: &mut VulkanRenderer) -> Option<VulkanPixelProgram> {
+        let source = format!(
+            "#define alpha niri_alpha\n#define tint niri_tint\n{source}",
+            source = include_str!("shaders/superres/fsr1_rcas.frag"),
+        );
+
+        match compile_vulkan_program(
+            renderer,
+            &source,
+            &[
+                UniformName::new("niri_tex_size", UniformType::_2f),
+                UniformName::new("niri_src_rect", UniformType::_4f),
+                UniformName::new("niri_rcas_sharpness", UniformType::_1f),
+            ],
+            &["tex"],
+        ) {
+            Ok(program) => Some(program),
+            Err(err) => {
+                warn!("super resolution: error compiling the RCAS shader for vulkan: {err:?}");
                 None
             }
         }
@@ -980,6 +1038,32 @@ pub(crate) enum ElementKernel {
         context_id: ContextId<VulkanTexture>,
     },
 
+    /// A cached EASU result, sharpened with RCAS on the Vulkan renderer.
+    Fsr1Vulkan {
+        /// The EASU result, at the destination size.
+        texture: VulkanTexture,
+        /// The renderer context that the texture belongs to.
+        context_id: ContextId<VulkanTexture>,
+        /// Sharpening scale for RCAS, `exp2(-sharpness)`.
+        sharpness_scale: f32,
+    },
+
+    /// An EASU pass that has to be recorded into the frame it is drawn in.
+    Fsr1VulkanRun {
+        /// The client commit the result is for.
+        commit: CommitCounter,
+        /// The source rect that the result is for.
+        src: Rectangle<f64, Buffer>,
+        /// The size of the result, in physical pixels.
+        dest_size: Size<i32, Physical>,
+        /// Sharpening scale for RCAS, `exp2(-sharpness)`.
+        sharpness_scale: f32,
+        /// The programs the run needs.
+        programs: Fsr1VulkanPrograms,
+        /// The result texture, shared with the pipeline.
+        cache: Arc<Mutex<Option<VulkanFsr1Cache>>>,
+    },
+
     /// A CuNNy run that has to be recorded into the frame it is drawn in.
     CunnyVulkanRun {
         /// Which network to run.
@@ -1003,7 +1087,7 @@ impl ElementKernel {
             Self::Plain => "renderer-default",
             Self::Filter(ResampleFilter::Bilinear) => "bilinear",
             Self::Filter(ResampleFilter::Bicubic) => "bicubic",
-            Self::Fsr1 { .. } => "rcas",
+            Self::Fsr1 { .. } | Self::Fsr1Vulkan { .. } | Self::Fsr1VulkanRun { .. } => "rcas",
             Self::Cunny { .. } | Self::CunnyVulkan { .. } | Self::CunnyVulkanRun { .. } => {
                 "cunny-upscale"
             }
@@ -1503,7 +1587,10 @@ impl RenderElement<GlesRenderer> for SuperResElement<GlesRenderer> {
                 }
             },
             // Vulkan-only kernels cannot be drawn here; draw the surface the normal way.
-            ElementKernel::CunnyVulkan { .. } | ElementKernel::CunnyVulkanRun { .. } => {
+            ElementKernel::CunnyVulkan { .. }
+            | ElementKernel::CunnyVulkanRun { .. }
+            | ElementKernel::Fsr1Vulkan { .. }
+            | ElementKernel::Fsr1VulkanRun { .. } => {
                 draw_inner_gles(&self.inner, frame, src, dst, damage, opaque_regions, cache)
             }
             ElementKernel::Cunny {
@@ -1669,6 +1756,50 @@ where
                 &client, residuals, &program, frame, src, dst, damage, alpha,
             ))
         }
+        ElementKernel::Fsr1Vulkan {
+            texture,
+            context_id,
+            sharpness_scale,
+        } => {
+            let client = texture.pass_vulkan_texture(context_id)?;
+            let program = frame
+                .user_data()
+                .get::<VulkanSuperResPrograms>()?
+                .rcas
+                .clone()?;
+            Some(draw_fsr1_vulkan(
+                &client,
+                &program,
+                *sharpness_scale,
+                frame,
+                dst,
+                damage,
+                alpha,
+            ))
+        }
+        ElementKernel::Fsr1VulkanRun {
+            commit,
+            src: run_src,
+            dest_size,
+            sharpness_scale,
+            programs,
+            cache,
+        } => {
+            let context_id = cache.lock().ok()?.as_ref()?.context_id.clone();
+            let client = texture.pass_vulkan_texture(&context_id)?;
+            let easu = record_fsr1_run(
+                frame, &client, *run_src, *dest_size, *commit, programs, cache,
+            )?;
+            Some(draw_fsr1_vulkan(
+                &easu,
+                &programs.rcas,
+                *sharpness_scale,
+                frame,
+                dst,
+                damage,
+                alpha,
+            ))
+        }
         ElementKernel::CunnyVulkanRun {
             variant,
             commit,
@@ -1789,7 +1920,10 @@ impl RenderElement<VulkanRenderer> for SuperResElement<VulkanRenderer> {
         // client's own texture. A stale run records its passes into this frame first.
         if matches!(
             &self.kernel,
-            ElementKernel::CunnyVulkan { .. } | ElementKernel::CunnyVulkanRun { .. }
+            ElementKernel::CunnyVulkan { .. }
+                | ElementKernel::CunnyVulkanRun { .. }
+                | ElementKernel::Fsr1Vulkan { .. }
+                | ElementKernel::Fsr1VulkanRun { .. }
         ) {
             if let Some(res) = draw_cunny_element(
                 &self.inner,
@@ -1891,17 +2025,18 @@ impl<'render> RenderElement<TtyRenderer<'render>> for SuperResElement<TtyRendere
         let res = match &self.kernel {
             ElementKernel::Plain => unreachable!(),
             // Not drawable through a GLES frame; the surface is drawn the normal way.
-            ElementKernel::CunnyVulkan { .. } | ElementKernel::CunnyVulkanRun { .. } => {
-                RenderElement::<TtyRenderer<'render>>::draw(
-                    &self.inner,
-                    frame,
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
-            }
+            ElementKernel::CunnyVulkan { .. }
+            | ElementKernel::CunnyVulkanRun { .. }
+            | ElementKernel::Fsr1Vulkan { .. }
+            | ElementKernel::Fsr1VulkanRun { .. } => RenderElement::<TtyRenderer<'render>>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
             ElementKernel::Filter(_) => {
                 match self.resample_program(
                     frame.as_gles_frame().expect("gles frame checked above"),
@@ -2064,7 +2199,10 @@ impl<'render> SuperResElement<TtyRenderer<'render>> {
         let mut installed = None;
 
         match &self.kernel {
-            ElementKernel::CunnyVulkan { .. } | ElementKernel::CunnyVulkanRun { .. } => {
+            ElementKernel::CunnyVulkan { .. }
+            | ElementKernel::CunnyVulkanRun { .. }
+            | ElementKernel::Fsr1Vulkan { .. }
+            | ElementKernel::Fsr1VulkanRun { .. } => {
                 if let TtyFrame::Vulkan(multi) = &mut *frame {
                     let vk_frame: &mut VulkanFrame<'_, '_> = multi.as_mut();
                     if let Some(res) = draw_cunny_element(
@@ -2350,6 +2488,194 @@ enum CacheReuse {
     NoDamage { made_for: CommitCounter },
     /// New [`CommitCounter`] with reported damage, but GPU [`SourceDigest`] matched.
     SameDigest { made_for: CommitCounter },
+}
+
+/// The programs a Vulkan FSR1 run needs.
+#[derive(Debug, Clone)]
+pub(crate) struct Fsr1VulkanPrograms {
+    /// The EASU pass, which upsamples the client buffer to the destination size.
+    easu: VulkanPixelProgram,
+    /// The sharpening pass, which runs 1:1 on the EASU result when the element is drawn.
+    rcas: VulkanPixelProgram,
+}
+
+impl Fsr1VulkanPrograms {
+    fn compile(renderer: &mut VulkanRenderer) -> Option<Self> {
+        let stored = renderer.user_data().get::<VulkanSuperResPrograms>()?;
+        Some(Self {
+            easu: stored.easu.clone()?,
+            rcas: stored.rcas.clone()?,
+        })
+    }
+}
+
+/// What a draw does about FSR1 on the Vulkan renderer.
+#[derive(Debug)]
+pub(crate) enum Fsr1Vulkan {
+    /// The cached EASU result is still valid, so the draw only sharpens it.
+    Reuse {
+        texture: VulkanTexture,
+        context_id: ContextId<VulkanTexture>,
+    },
+    /// The EASU pass has to be recorded into the draw's frame first.
+    Run {
+        /// The client commit the result is for.
+        commit: CommitCounter,
+        /// The source rect that the result is for.
+        src: Rectangle<f64, Buffer>,
+        /// The size of the result, in physical pixels.
+        dest_size: Size<i32, Physical>,
+        /// Sharpening scale for RCAS, `exp2(-sharpness)`.
+        sharpness_scale: f32,
+        programs: Fsr1VulkanPrograms,
+        /// The EASU result texture, shared with the pipeline.
+        cache: Arc<Mutex<Option<VulkanFsr1Cache>>>,
+    },
+}
+
+/// The Vulkan renderer's EASU result, kept across frames.
+#[derive(Debug)]
+pub(crate) struct VulkanFsr1Cache {
+    key: Fsr1Key,
+    /// The commit the result was made for; `None` while the texture is still fresh.
+    commit: Option<CommitCounter>,
+    context_id: ContextId<VulkanTexture>,
+    easu: VulkanTexture,
+}
+
+/// Allocates the EASU result texture for `key`, or keeps the one that already fits.
+fn ensure_fsr1_texture(
+    renderer: &mut VulkanRenderer,
+    cache: &mut Option<VulkanFsr1Cache>,
+    key: &Fsr1Key,
+    context_id: &ContextId<VulkanTexture>,
+) -> Option<()> {
+    let fits = cache
+        .as_ref()
+        .is_some_and(|entry| entry.key.size == key.size && entry.context_id == *context_id);
+    if fits {
+        return Some(());
+    }
+
+    let size = key.size.to_logical(1).to_buffer(1, Transform::Normal);
+    let easu = renderer.create_buffer(Fourcc::Abgr8888, size).ok()?;
+
+    *cache = Some(VulkanFsr1Cache {
+        key: key.clone(),
+        commit: None,
+        context_id: context_id.clone(),
+        easu,
+    });
+    Some(())
+}
+
+/// Records the EASU pass into `frame` and returns the result texture.
+///
+/// Like the CuNNy chain this happens inside the frame that draws the window, so there is no
+/// separate submission and no wait.
+fn record_fsr1_run(
+    frame: &mut VulkanFrame<'_, '_>,
+    client: &VulkanTexture,
+    src: Rectangle<f64, Buffer>,
+    dest_size: Size<i32, Physical>,
+    commit: CommitCounter,
+    programs: &Fsr1VulkanPrograms,
+    cache: &Mutex<Option<VulkanFsr1Cache>>,
+) -> Option<VulkanTexture> {
+    let mut cache = cache.lock().unwrap();
+    let entry = cache.as_ref()?;
+    if entry.key.size != dest_size {
+        return None;
+    }
+    // Another target of this frame may have run the pass already.
+    if entry.commit == Some(commit) {
+        return Some(entry.easu.clone());
+    }
+    let easu = entry.easu.clone();
+
+    let tex_size = client.size();
+    if tex_size.w <= 0 || tex_size.h <= 0 {
+        return None;
+    }
+
+    // The shader works in the client texture's space, while the quad interpolates `v_coords`
+    // across the destination, so it needs the transform between the two.
+    let uniforms = [
+        CustomUniform {
+            name: "niri_tex_size",
+            value: CustomUniformValue::Vec2([tex_size.w as f32, tex_size.h as f32]),
+        },
+        CustomUniform {
+            name: "niri_src_rect",
+            value: CustomUniformValue::Vec4([
+                src.loc.x as f32,
+                src.loc.y as f32,
+                src.size.w as f32,
+                src.size.h as f32,
+            ]),
+        },
+        CustomUniform {
+            name: "niri_uv_offset",
+            value: CustomUniformValue::Vec2([
+                (src.loc.x / f64::from(tex_size.w)) as f32,
+                (src.loc.y / f64::from(tex_size.h)) as f32,
+            ]),
+        },
+        CustomUniform {
+            name: "niri_uv_scale",
+            value: CustomUniformValue::Vec2([
+                (src.size.w / f64::from(tex_size.w)) as f32,
+                (src.size.h / f64::from(tex_size.h)) as f32,
+            ]),
+        },
+    ];
+    let textures = [("tex", client)];
+    let passes = [CustomPass {
+        dst: &easu,
+        program: &programs.easu,
+        uniforms: &uniforms,
+        textures: &textures,
+    }];
+    frame.render_custom_passes(&passes).ok()?;
+
+    let mut entry = cache.take()?;
+    entry.commit = Some(commit);
+    *cache = Some(entry);
+    Some(easu)
+}
+
+/// Sharpens an EASU result over the element's rectangle.
+fn draw_fsr1_vulkan(
+    easu: &VulkanTexture,
+    program: &VulkanPixelProgram,
+    sharpness_scale: f32,
+    frame: &mut VulkanFrame<'_, '_>,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+    alpha: f32,
+) -> Result<(), VulkanError> {
+    let size = easu.size();
+    assert!(size.w > 0 && size.h > 0, "empty EASU texture");
+
+    let uniforms = [
+        CustomUniform {
+            name: "niri_tex_size",
+            value: CustomUniformValue::Vec2([size.w as f32, size.h as f32]),
+        },
+        CustomUniform {
+            name: "niri_src_rect",
+            value: CustomUniformValue::Vec4([0., 0., size.w as f32, size.h as f32]),
+        },
+        CustomUniform {
+            name: "niri_rcas_sharpness",
+            value: CustomUniformValue::Float(sharpness_scale),
+        },
+    ];
+
+    frame.synchronize_texture_for_sampling(easu);
+    crate::audit_texture_program!("rcas");
+
+    frame.render_custom(program, dst, damage, &uniforms, &[("tex", easu)], alpha)
 }
 
 /// The programs a Vulkan CuNNy run needs.
@@ -2830,6 +3156,10 @@ pub struct SuperResolutionPipeline {
     fsr1: RefCell<PassCache<Fsr1Key, Fsr1Result>>,
     /// Cached result of a CuNNy run.
     cunny: RefCell<PassCache<CunnyKey, CunnyResult>>,
+    /// The Vulkan renderer's EASU result.
+    ///
+    /// Shared with the elements, which record the pass into whichever frame they draw in.
+    vulkan_fsr1: Arc<Mutex<Option<VulkanFsr1Cache>>>,
     /// The Vulkan renderer's CuNNy intermediates.
     ///
     /// Shared with the elements, which record the passes into whichever frame they draw in: the
@@ -3776,6 +4106,7 @@ impl SuperResolutionPipeline {
             logged: Cell::new(0),
             fsr1: RefCell::new(PassCache::default()),
             cunny: RefCell::new(PassCache::default()),
+            vulkan_fsr1: Arc::new(Mutex::new(None)),
             vulkan_cunny: Arc::new(Mutex::new(None)),
             digest: RefCell::new(DigestTarget::default()),
             magnify_target: Cell::new(None),
@@ -3875,6 +4206,121 @@ impl SuperResolutionPipeline {
     /// Returns the size that this window's content is magnified into, if it is being magnified.
     pub fn magnify_target(&self) -> Option<Size<i32, Logical>> {
         self.magnify_target.get()
+    }
+
+    /// Decides what to do about FSR1 for this element on the Vulkan renderer.
+    ///
+    /// The EASU pass needs the client buffer upright and untransformed, which is also what the
+    /// CuNNy networks require; other buffers keep the resampling kernels.
+    fn vulkan_fsr1_kernel<R: NiriRenderer>(
+        &self,
+        renderer: &mut VulkanRenderer,
+        elem: &WaylandSurfaceRenderElement<R>,
+        dest_size: Size<i32, Physical>,
+        scale: Scale<f64>,
+        id: u64,
+        sharpness_scale: f32,
+    ) -> Option<Fsr1Vulkan>
+    where
+        R::TextureId: PassSource,
+    {
+        let _span = debug_span!(
+            target: GPU_LOG_TARGET,
+            "easu-vulkan",
+            window = id,
+            element = ?elem.id(),
+        )
+        .entered();
+
+        if elem.transform() != Transform::Normal
+            || buffer_y_inverted(elem.buffer()).unwrap_or(false)
+        {
+            trace!(
+                target: GPU_LOG_TARGET,
+                buffer_transform = ?elem.transform(),
+                y_inverted = buffer_y_inverted(elem.buffer()).unwrap_or(false),
+                reason = "unsupported EASU buffer orientation",
+                "selecting resampling fallback",
+            );
+            return None;
+        }
+
+        if dest_size.w <= 0 || dest_size.h <= 0 {
+            return None;
+        }
+
+        let src = elem.src();
+        let src_size: Size<i32, Buffer> = src.size.to_i32_round();
+        if src_size.w <= 0 || src_size.h <= 0 {
+            return None;
+        }
+
+        let key = Fsr1Key {
+            src,
+            size: dest_size,
+        };
+        let context_id = renderer.context_id();
+        let commit = elem.current_commit();
+
+        // A result whose buffer has not changed since it was made is only sharpened.
+        let reusable = {
+            let cache = self.vulkan_fsr1.lock().unwrap();
+            cache.as_ref().and_then(|entry| {
+                if entry.key != key || entry.context_id != context_id {
+                    return None;
+                }
+                let made_for = entry.commit?;
+                if made_for == commit {
+                    return Some((entry.easu.clone(), true));
+                }
+                if damage_since(elem, scale, made_for).is_empty() {
+                    return Some((entry.easu.clone(), false));
+                }
+                None
+            })
+        };
+        if let Some((texture, same_commit)) = reusable {
+            if same_commit {
+                trace!("super resolution: reusing the EASU result for window {id}");
+            } else {
+                if let Some(entry) = self.vulkan_fsr1.lock().unwrap().as_mut() {
+                    entry.commit = Some(commit);
+                }
+                trace!(
+                    target: GPU_LOG_TARGET,
+                    cache = "unchanged",
+                    window = id,
+                    "the window has no damage since EASU ran; reusing its result",
+                );
+            }
+            return Some(Fsr1Vulkan::Reuse {
+                texture,
+                context_id,
+            });
+        }
+
+        // The pass samples the client texture, so it has to be in this renderer's context.
+        let WaylandSurfaceTexture::Texture(texture) = elem.texture() else {
+            return None;
+        };
+        texture.pass_vulkan_texture(&context_id)?;
+
+        let programs = Fsr1VulkanPrograms::compile(renderer)?;
+        ensure_fsr1_texture(
+            renderer,
+            &mut self.vulkan_fsr1.lock().unwrap(),
+            &key,
+            &context_id,
+        )?;
+
+        Some(Fsr1Vulkan::Run {
+            commit,
+            src,
+            dest_size,
+            sharpness_scale,
+            programs,
+            cache: self.vulkan_fsr1.clone(),
+        })
     }
 
     /// Decides what to do about a CuNNy run for this element on the Vulkan renderer.
@@ -4386,10 +4832,53 @@ impl SuperResolutionPipeline {
             SuperResKernel::Fsr1(params) => params,
         };
 
-        let Some(texture) = renderer
-            .as_gles_renderer()
-            .and_then(|gles| self.fsr1_result(gles, &elem, dest_size, scale, id))
-        else {
+        let built = if let Some(gles) = renderer.as_gles_renderer() {
+            self.fsr1_result(gles, &elem, dest_size, scale, id)
+                .map(|result| ElementKernel::Fsr1 {
+                    texture: result.texture,
+                    context_id: result.context_id,
+                    sharpness_scale: params.sharpness_scale(),
+                })
+        } else {
+            renderer
+                .as_vulkan_renderer()
+                .and_then(|vulkan| {
+                    self.vulkan_fsr1_kernel(
+                        vulkan,
+                        &elem,
+                        dest_size,
+                        scale,
+                        id,
+                        params.sharpness_scale(),
+                    )
+                })
+                .map(|fsr1| match fsr1 {
+                    Fsr1Vulkan::Reuse {
+                        texture,
+                        context_id,
+                    } => ElementKernel::Fsr1Vulkan {
+                        texture,
+                        context_id,
+                        sharpness_scale: params.sharpness_scale(),
+                    },
+                    Fsr1Vulkan::Run {
+                        commit,
+                        src,
+                        dest_size,
+                        sharpness_scale,
+                        programs,
+                        cache,
+                    } => ElementKernel::Fsr1VulkanRun {
+                        commit,
+                        src,
+                        dest_size,
+                        sharpness_scale,
+                        programs,
+                        cache,
+                    },
+                })
+        };
+        let Some(built) = built else {
             trace!(
                 target: GPU_LOG_TARGET,
                 requested_kernel = %kernel,
@@ -4413,12 +4902,12 @@ impl SuperResolutionPipeline {
             return element.with_timings(self.timings.clone());
         };
 
-        let mut element = SuperResElement::fsr1(
-            elem,
-            texture.texture.clone(),
-            texture.context_id.clone(),
-            params.sharpness_scale(),
-        );
+        let mut element = SuperResElement {
+            inner: elem,
+            kernel: built,
+            magnify: None,
+            timings: Timings::disabled(),
+        };
         if let Some(rect) = magnify {
             element = element.with_magnify(rect);
         }
@@ -4952,6 +5441,203 @@ mod tests {
         drop(target);
         assert_eq!(data.len(), (size.w * size.h * 4) as usize);
         data
+    }
+
+    /// The Vulkan FSR1 output matches the GLES one for the same input.
+    ///
+    /// EASU runs offscreen on both sides and RCAS sharpens the result; this runs both and compares
+    /// the pixels, which is the check the CuNNy parity test does for the networks.
+    #[test]
+    fn vulkan_fsr1_matches_gles() {
+        use smithay::backend::renderer::Offscreen as _;
+
+        let Some(mut gles) = surfaceless_renderer() else {
+            return;
+        };
+        crate::render_helpers::resources::init(&mut gles);
+        crate::render_helpers::shaders::init(&mut gles);
+        init(&mut gles, None);
+
+        let Some(mut vulkan) = vulkan_renderer() else {
+            return;
+        };
+
+        let size = Size::<i32, Buffer>::from((32, 18));
+        let out_size = Size::<i32, Physical>::from((size.w * 2, size.h * 2));
+        let src_rect = Rectangle::from_size(size.to_f64());
+        let pixels = source_pixels(size);
+        let sharpness_scale = Fsr1Params { sharpness: 0.2 }.sharpness_scale();
+
+        // GLES: EASU, then RCAS over the result.
+        let gles_bytes = {
+            let source = gles
+                .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+                .expect("error importing the source");
+            let easu_program = SuperResPrograms::get(&gles)
+                .and_then(|programs| programs.easu.clone())
+                .expect("the EASU shader must compile");
+            let uniforms =
+                resample_uniforms(&source, src_rect, false).expect("the source must have a size");
+            let easu = run_easu_pass(
+                &mut gles,
+                &source,
+                src_rect,
+                out_size,
+                Transform::Normal,
+                &easu_program,
+                &uniforms,
+                &Timings::disabled(),
+            )
+            .expect("the EASU pass must run on GLES");
+
+            let rcas = SuperResPrograms::get(&gles)
+                .and_then(|programs| programs.rcas.clone())
+                .expect("the RCAS shader must compile");
+
+            let out_buf = out_size.to_logical(1).to_buffer(1, Transform::Normal);
+            let mut out = gles
+                .create_buffer(Fourcc::Abgr8888, out_buf)
+                .expect("error creating the output texture");
+            {
+                let rect = Rectangle::from_size(out_size);
+                let mut target = gles.bind(&mut out).expect("error binding the output");
+                let mut frame = gles
+                    .render(&mut target, out_size, Transform::Normal)
+                    .expect("error starting the frame");
+                frame
+                    .clear(Color32F::TRANSPARENT, &[rect])
+                    .expect("error clearing the output");
+                frame
+                    .render_texture_from_to(
+                        &easu,
+                        Rectangle::from_size(easu.size().to_f64()),
+                        rect,
+                        &[rect],
+                        &[rect],
+                        Transform::Normal,
+                        1.0,
+                        Some(&rcas),
+                        &[
+                            Uniform::new("niri_tex_size", (out_size.w as f32, out_size.h as f32)),
+                            Uniform::new(
+                                "niri_src_rect",
+                                [0.0, 0.0, out_size.w as f32, out_size.h as f32],
+                            ),
+                            Uniform::new("niri_rcas_sharpness", sharpness_scale),
+                        ],
+                    )
+                    .expect("error drawing the sharpening pass");
+                let _ = frame.finish().expect("error finishing the frame");
+            }
+            read_back(&mut gles, &mut out, out_size)
+        };
+
+        // Vulkan: the same two passes through the custom-program path.
+        let vulkan_bytes = {
+            let client = vulkan
+                .import_memory(&pixels, Fourcc::Abgr8888, size, false)
+                .expect("error importing the source");
+            let programs = Fsr1VulkanPrograms::compile(&mut vulkan)
+                .expect("the FSR1 shaders must compile for Vulkan");
+
+            let easu = vulkan
+                .create_buffer(
+                    Fourcc::Abgr8888,
+                    out_size.to_logical(1).to_buffer(1, Transform::Normal),
+                )
+                .expect("error creating the EASU texture");
+
+            // The EASU pass, recorded into its own small frame like the compositor does.
+            {
+                // The pass writes a clone of the texture; binding needs a mutable handle.
+                let mut bound = easu.clone();
+                let mut target = vulkan
+                    .bind(&mut bound)
+                    .expect("error binding the EASU texture");
+                let mut frame = vulkan
+                    .render(&mut target, out_size, Transform::Normal)
+                    .expect("error starting the EASU frame");
+                let uniforms = [
+                    CustomUniform {
+                        name: "niri_tex_size",
+                        value: CustomUniformValue::Vec2([size.w as f32, size.h as f32]),
+                    },
+                    CustomUniform {
+                        name: "niri_src_rect",
+                        value: CustomUniformValue::Vec4([0., 0., size.w as f32, size.h as f32]),
+                    },
+                    CustomUniform {
+                        name: "niri_uv_offset",
+                        value: CustomUniformValue::Vec2([0., 0.]),
+                    },
+                    CustomUniform {
+                        name: "niri_uv_scale",
+                        value: CustomUniformValue::Vec2([1., 1.]),
+                    },
+                ];
+                let textures = [("tex", &client)];
+                let passes = [CustomPass {
+                    dst: &easu,
+                    program: &programs.easu,
+                    uniforms: &uniforms,
+                    textures: &textures,
+                }];
+                frame
+                    .render_custom_passes(&passes)
+                    .expect("error recording the EASU pass");
+                let sync = frame.finish().expect("error finishing the EASU frame");
+                vulkan
+                    .wait(&sync)
+                    .expect("error waiting for the EASU frame");
+            }
+
+            let out_buf = out_size.to_logical(1).to_buffer(1, Transform::Normal);
+            let mut out = vulkan
+                .create_buffer(Fourcc::Abgr8888, out_buf)
+                .expect("error creating the output texture");
+            {
+                let rect = Rectangle::from_size(out_size);
+                let mut target = vulkan.bind(&mut out).expect("error binding the output");
+                let mut frame = vulkan
+                    .render(&mut target, out_size, Transform::Normal)
+                    .expect("error starting the frame");
+                frame
+                    .clear(Color32F::TRANSPARENT, &[rect])
+                    .expect("error clearing the output");
+                draw_fsr1_vulkan(
+                    &easu,
+                    &programs.rcas,
+                    sharpness_scale,
+                    &mut frame,
+                    rect,
+                    &[rect],
+                    1.0,
+                )
+                .expect("error drawing the sharpening pass");
+                let sync = frame.finish().expect("error finishing the frame");
+                vulkan.wait(&sync).expect("error waiting for the frame");
+            }
+            read_back_vulkan(&mut vulkan, &out, out_size)
+        };
+
+        assert_eq!(gles_bytes.len(), vulkan_bytes.len());
+
+        let mut worst = 0u32;
+        let mut total = 0u64;
+        for (a, b) in gles_bytes.iter().zip(vulkan_bytes.iter()) {
+            let diff = u32::from(*a).abs_diff(u32::from(*b));
+            total += u64::from(diff);
+            worst = worst.max(diff);
+            assert!(
+                diff <= MAX_CUNNY_PIXEL_DIFF,
+                "the FSR1 outputs differ by {diff}/255 (gles {a}, vulkan {b})",
+            );
+        }
+        let mean = total as f64 / gles_bytes.len() as f64;
+        assert!(
+            mean <= MAX_CUNNY_MEAN_DIFF,
+            "the FSR1 outputs differ too much on average: {mean:.3}/255",
+        );
     }
 
     /// Renders `texture` into a texture of `dest_size` with one of our kernels (or with the

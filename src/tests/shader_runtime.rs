@@ -550,13 +550,13 @@ fn cunny_draws_vulkan() {
         .assert_drew_texture(&["cunny-upscale"]);
 }
 
-/// A stale CuNNy run is recorded into the draw's own frame, and the next draw reuses it.
+/// A stale run is recorded into the draw's own frame, and the next draw reuses it.
 ///
 /// This is the path the compositor takes: `element()` only decides, and the draw records the
-/// network's passes into the frame it draws in, so nothing is submitted on its own and nothing
-/// waits. The second draw finds the cached run and only composites.
+/// offscreen passes into the frame it draws in, so nothing is submitted on its own and nothing
+/// waits. The second draw finds the cached result and only draws with it.
 #[test]
-fn cunny_run_records_into_the_draw_frame() {
+fn superres_runs_are_recorded_into_the_draw_frame() {
     use niri_config::{Upscaling, UpscalingAlgorithm};
     use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
     use smithay::wayland::compositor::with_states;
@@ -585,38 +585,43 @@ fn cunny_run_records_into_the_draw_frame() {
 
     // At scale 2 the buffer is half the display area, which is what the effect is for.
     let scale = Scale::from(2.);
-    let rules = Upscaling {
-        algorithm: Some(UpscalingAlgorithm::Cunny2),
-        ..Default::default()
-    };
 
-    let pipeline = superres::SuperResolutionPipeline::new();
-    let kernel = pipeline
-        .kernel(&rules, 1)
-        .expect("the rule must select the network");
+    for (algorithm, expected) in [
+        (UpscalingAlgorithm::Cunny2, "cunny-upscale"),
+        (UpscalingAlgorithm::Fsr1, "rcas"),
+    ] {
+        let rules = Upscaling {
+            algorithm: Some(algorithm),
+            ..Default::default()
+        };
+        let pipeline = superres::SuperResolutionPipeline::new();
+        let kernel = pipeline
+            .kernel(&rules, 1)
+            .expect("the rule must select the algorithm");
 
-    for draw in ["stale", "cached"] {
-        // The element is not cloneable, so each draw builds its own from the surface.
-        let surface_element = with_states(&surface, |states| {
-            WaylandSurfaceRenderElement::from_surface(
-                &mut renderer,
-                &surface,
-                states,
-                Point::<f64, Physical>::from((0., 0.)),
-                1.,
-                Kind::Unspecified,
-            )
-        })
-        .expect("error importing the window surface")
-        .expect("the window surface should be mapped");
+        for draw in ["stale", "cached"] {
+            // The element is not cloneable, so each draw builds its own from the surface.
+            let surface_element = with_states(&surface, |states| {
+                WaylandSurfaceRenderElement::from_surface(
+                    &mut renderer,
+                    &surface,
+                    states,
+                    Point::<f64, Physical>::from((0., 0.)),
+                    1.,
+                    Kind::Unspecified,
+                )
+            })
+            .expect("error importing the window surface")
+            .expect("the window surface should be mapped");
 
-        let element =
-            pipeline.element(&mut renderer, surface_element, kernel, scale, 1, None, true);
-        let size = element.geometry(scale).size;
+            let element =
+                pipeline.element(&mut renderer, surface_element, kernel, scale, 1, None, true);
+            let size = element.geometry(scale).size;
 
-        gpu::render_offscreen_audited(&mut renderer, size, 2., &[element])
-            .unwrap_or_else(|err| panic!("error drawing the {draw} run: {err:?}"))
-            .assert_drew_texture(&["cunny-upscale"]);
+            gpu::render_offscreen_audited(&mut renderer, size, 2., &[element])
+                .unwrap_or_else(|err| panic!("error drawing the {draw} {algorithm:?} run: {err:?}"))
+                .assert_drew_texture(&[expected]);
+        }
     }
 }
 

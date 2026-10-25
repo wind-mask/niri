@@ -138,9 +138,17 @@ void niri_easu_tap(
 }
 
 void main() {
+#ifdef NIRI_UV_TRANSFORM
+    // The Vulkan renderer draws this pass as a custom quad, where `v_coords` spans the destination
+    // rectangle (the EASU output) rather than the source rect in the client texture.
+    vec2 uv = niri_uv_offset + niri_v_coords * niri_uv_scale;
+#else
+#define uv v_coords
+#endif
+
     // Position of this output pixel in the input viewport, in the space where texel centers are at
     // integer coordinates. The reference computes the same value as `ip * con0.xy + con0.zw`.
-    vec2 pos = v_coords * niri_tex_size - niri_src_rect.xy - vec2(0.5);
+    vec2 pos = uv * niri_tex_size - niri_src_rect.xy - vec2(0.5);
     vec2 fp = floor(pos);
     vec2 pp = pos - fp;
 
