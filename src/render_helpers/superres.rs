@@ -2342,15 +2342,10 @@ const DIGEST_BYTES: usize = (DIGEST_SIDE as usize) * (DIGEST_SIDE as usize) * 4;
 /// Minimum offscreen pass work (total output texels written across all offscreen passes) before
 /// computing a [`SourceDigest`] is worthwhile.
 ///
-/// Measured on `Mesa Intel(R) Iris(R) Xe Graphics (ADL GT2)` and `NVIDIA GeForce RTX 3050 Ti`:
-/// - Computing and reading back a 32×32 digest takes ~220 µs on Iris Xe and ~81 µs on RTX 3050 Ti,
-///   dominated by the single offscreen bind + `glReadPixels` synchronization round-trip.
-/// - A single-pass EASU run is faster than the digest below 640×360 destination pixels (~212 µs on
-///   Iris Xe, ~121 µs on RTX 3050 Ti) and reaches ~368 µs (Iris Xe) / ~108–205 µs (RTX 3050 Ti) at
-///   960×540 (518,400 destination texels).
-/// - CuNNy-Fast runs 9 offscreen passes and already takes ~534–701 µs on Iris Xe (~512–524 µs on
-///   RTX 3050 Ti) at 320×180 source texels (`9 * 57,600 = 518,400` pass texels), scaling up to
-///   ~6.17 ms (Iris Xe) / ~1.52 ms (RTX 3050 Ti) at 1280×720.
+/// A digest costs one offscreen bind plus a `glReadPixels` round-trip, which is on the order of a
+/// few hundred microseconds and does not grow with the pass that follows it. A single-pass EASU run
+/// stays below that until its destination reaches roughly 640×360; a network such as `CuNNy-Fast`
+/// writes nine offscreen passes and overtakes it at a few hundred thousand destination texels.
 ///
 /// Setting the threshold at 500,000 total pass texels (with at least `32 * 32` source texels)
 /// skips the digest for small surfaces where running the pass directly is cheaper or comparable,
